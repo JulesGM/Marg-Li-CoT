@@ -14,5 +14,5 @@
 
 - Jules:
     - Will work on step 2 or step 3.
-      Step 2 isn't anything. What I mean by that is that we can basically just use the command line version of the GPT2 language model trainer.
-      Step 3: similar, different schedule etc.
+            - Step 2 isn't anything. 
+            - Step 3: similar, different schedule etc.
