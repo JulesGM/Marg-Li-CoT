@@ -23,6 +23,8 @@ from transformers.generation_stopping_criteria import (
 from transformers.generation_utils import BeamSearchDecoderOnlyOutput
 from transformers.pytorch_utils import torch_int_div
 
+import multiprocessing.pool as mp_pool
+import tqdm
 
 def gpt3_one_step(context, num_lprobs=100):
     response = openai.Completion.create(
@@ -30,7 +32,7 @@ def gpt3_one_step(context, num_lprobs=100):
         prompt=context,
         suffix=None,
         max_tokens=1,
-        temperature=0.0,
+        temperature=1.0,
         logprobs=num_lprobs
     )
     
@@ -39,7 +41,7 @@ def gpt3_one_step(context, num_lprobs=100):
     return token, lprobs
 
 
-def gpt3_generate(input_ids, tokenizer):
+def gpt3_generate(input_ids, tokenizer, is_parallel: bool):
     """
     Args:
         input_ids ([batch_size * beam_size, seq_len])
@@ -52,13 +54,24 @@ def gpt3_generate(input_ids, tokenizer):
     batch_size, seq_len = input_ids.shape
 
     outputs = torch.zeros(batch_size, len(tokenizer)).to('cuda')
-    for i in range(batch_size):
-        input_text = tokenizer.decode(input_ids[i])
+    def fn(idx):
+        input_text = tokenizer.decode(input_ids[idx])
         _, lprobs = gpt3_one_step(input_text)
 
         for k, v in lprobs.items():
-            outputs[i, tokenizer.encode(k)[0]] = math.exp(v)
-    
+            outputs[idx, tokenizer.encode(k)[0]] = math.exp(v)
+
+    jobs = []
+    if is_parallel:
+        with mp_pool.ThreadPool(batch_size) as pool:
+            jobs.extend([pool.apply_async(fn, (i,)) for i in range(batch_size)])
+
+            # Join, essentially
+            # [job.get() for job in tqdm.tqdm(jobs, desc="Generating.")]
+            [job.get() for job in jobs]
+    else:
+        [fn(i) for i in range(batch_size)]
+
     outputs = outputs / outputs.sum(dim=-1, keepdim=True)
     return outputs
 
@@ -94,6 +107,7 @@ def group_beam_search(
     output_scores: Optional[bool] = None,
     return_dict_in_generate: Optional[bool] = None,
     synced_gpus: Optional[bool] = False,
+    parallel_generation: bool = False,
     **model_kwargs,
 ):
     r"""
@@ -213,7 +227,7 @@ def group_beam_search(
 
         # do one decoder step on all beams of all sentences in batch
         # model_inputs = prepare_inputs_for_generation(input_ids, **model_kwargs)
-        outputs = gpt3_generate(input_ids, tokenizer)
+        outputs = gpt3_generate(input_ids, tokenizer, parallel_generation)
 
         if synced_gpus and this_peer_finished:
             cur_len = cur_len + 1
