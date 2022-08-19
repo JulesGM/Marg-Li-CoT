@@ -7,8 +7,9 @@ A lot of stuff.
 ## To do
 ### High priority
  - Test checkpointing / state resuming
+ - Look at the data. Specifically, what the training_step sees, and what the generator sees, and what the validation sees.
+ - Fix the way the input and scratchpad are put together
  - Generation based validation
- - Look at the data
 
 ### Low priority
  - LR scheduler

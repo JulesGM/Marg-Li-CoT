@@ -7,8 +7,9 @@ import itertools
 import math
 from pathlib import Path
 import subprocess
-
+import types; 
 from typing import *
+
 import natsort
 import numpy as np
 import rich
@@ -92,6 +93,17 @@ def zip_dicts(*dicts):
             yield {k: next(iter_d[k]) for k in keys}
         except StopIteration:
             break
+
+
+def clean_locals(locals_, no_modules=True, no_classes=True, no_functions=True, no_caps=True):
+    print([
+        k for k, v in locals_.items() if 
+        not k.startswith("_") and 
+        (not no_modules or not isinstance(v, types.ModuleType)) and 
+        (not no_classes or not isinstance(v, type)) and 
+        (not no_functions or not callable(v)) and 
+        (not no_caps or k == k.lower())
+    ])
 
 
 def dict_unzip(list_of_dicts):
