@@ -7,6 +7,7 @@ from beartype.typing import *
 
 import collections
 import dataclasses
+import enum
 import itertools
 import logging
 import math
@@ -50,7 +51,7 @@ DATA_PATH = SCRIPT_DIR / "data"
 DETERMINISTIC = True
 NUM_GPUS = torch.cuda.device_count()
 EVAL_EVERY_N_EPOCHS = 1
-
+LIMIT_VAL_BATCHES = 1000
 
 
 class _RefineLM(pl.LightningModule):
@@ -73,10 +74,12 @@ class _RefineLM(pl.LightningModule):
         assert scheduler_type is None, "scheduler support is not yet implemented"
         assert scheduler_kwargs is None, "scheduler support is not yet implemented"
 
+
+        self._dataloader_num_workers = 0
         self._model: transformers.PreTrainedModel = model
         self._tokenizer: Final = tokenizer
-        self._batch_size: Final[int] = batch_sizes[general_shared_constants.CVSets.TRAINING]
-        self._eval_batch_size: Final[int] = batch_sizes[general_shared_constants.CVSets.VALIDATION]
+        self._batch_size: Final[int] = batch_sizes[general_shared_constants.CVSets.TRAINING.value]
+        self._eval_batch_size: Final[int] = batch_sizes[general_shared_constants.CVSets.VALIDATION.value]
         self._generation_kwargs: Final[dict[str, Any]] = generation_kwargs
         self._logging_conf: Final[dict[str, bool]] = dict(
             prog_bar=True, on_step=True, on_epoch=True, logger=True
@@ -88,8 +91,9 @@ class _RefineLM(pl.LightningModule):
         self._shuffle_train: Final[bool] = True
         self._shuffle_val: Final[bool] = False
         
-        train_ds = datasets[general_shared_constants.CVSets.TRAINING]
-        eval_ds = datasets[general_shared_constants.CVSets.VALIDATION]
+        train_ds = datasets[general_shared_constants.CVSets.TRAINING.value]
+        eval_ds = datasets[general_shared_constants.CVSets.VALIDATION.value]
+
         assert train_ds is not eval_ds, "train_ds and eval_ds must be different objects"
         self._train_ds: Final[torch.utils.data.Dataset] = train_ds
         self._eval_ds: Final[torch.utils.data.Dataset] = eval_ds
@@ -110,35 +114,47 @@ class _RefineLM(pl.LightningModule):
         self._scheduler_type =         scheduler_type
         self._scheduler_kwargs =       scheduler_kwargs
 
+
+    def forward(self, *args, **kwargs):
+        return self._model(*args, **kwargs)
+
+
     def training_step(self, batch, batch_idx):
         assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
 
+        batch = {k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
         outputs = self(**batch)
         self.log("train_loss", outputs.loss, **self._logging_conf)
 
         return outputs.loss
 
+
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx):  # type: ignore[override]
         assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
 
-        generation_inputs = batch["input_ids_for_generation"]
+        generation_inputs = batch["generation_input_ids"]
+        generation_attention_mask = batch["generation_attention_mask"]
         outputs = self._model.greedy_search(
-            inputs_ids=generation_inputs, 
-            attention_mask=generation_inputs != self._tokenizer.pad_token_id, 
+            input_ids=generation_inputs, 
+            attention_mask=generation_attention_mask, 
             **self._generation_kwargs
         )
+        if batch_idx == 0:
+            print("\n".join([self._tokenizer.decode(x) for x in outputs]))
         
-        generated = cast(torch.Tensor, outputs[:, generation_inputs.shape[1] - 1:])
-        label = cast(torch.Tensor, batch["scratchpad_with_value"])
-        accuracy = torch.mean(torch.all(generated == label, axis=-1)).item()
-        rich.print("accuracy", accuracy)
+        generated_decoded = [self._tokenizer.decode(x) for x in outputs]
+        label = [self._tokenizer.decode(x) for x in batch["scratchpad_with_value"]]
+        accuracy = np.mean([gen.strip() == l.strip() for gen, l in zip(generated_decoded, label)])
+        rich.print("\nAccuracy {accuracy: 0.2%}\n", accuracy)
+        
         self.log("val_em", accuracy, **self._logging_conf)
 
-        return self._model({k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]})
+        return self._model(**{k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]})
 
 
     def on_validation_epoch_end(self) -> None:
         pass
+
 
     def configure_optimizers(self):
         """
@@ -159,35 +175,26 @@ class _RefineLM(pl.LightningModule):
 
         return dict(optimizer=optimizer)
 
-    @beartype
-    def _make_regular_dataloader(
-        self,
-        ds: torch.utils.data.Dataset,
-        batch_size: int,
-        shuffle: bool,
-    ) -> torch.utils.data.DataLoader:
-        
-        return torch.utils.data.DataLoader(
-            ds,
-            collate_fn=collate,
-            batch_size=batch_size,
-            num_workers=os.cpu_count() - 1,
-            shuffle=shuffle,
-        )
 
     def train_dataloader(self):
-        return self._make_regular_dataloader(
-            ds=self._train_ds,
+        return torch.utils.data.DataLoader(
+            self._train_ds,
+            collate_fn=TrainingCollator(self._tokenizer),
             batch_size=self._batch_size,
+            num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_train,
         )
 
+
     def val_dataloader(self):
-        return self._make_regular_dataloader(
-            ds=self._eval_ds,
-            batch_size=self._batch_size,
+        return torch.utils.data.DataLoader(
+            self._eval_ds,
+            collate_fn=ValitationCollator(self._tokenizer),
+            batch_size=self._eval_batch_size,
+            num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_val,
         )
+
 
 def _get_last_checkpoint_path(checkpoints_folder, wandb_run_id: Optional[str]) -> Optional[Path]:
     if wandb_run_id is None:
@@ -307,9 +314,15 @@ def _build_meta_info(**kwargs):
     return kwargs
 
 
-def _text_mode_load_data(
+class DataModes(str, enum.Enum):
+    JSONL = "jsonl"
+    HDF5_PRETOK = "hdf5_pretok"
+
+
+def _load_data(
     dataset_path: Union[str, Path], 
-    tokenizer
+    tokenizer,
+    mode: DataModes,
 ):
     """Loads the textual entries, tokenizes them and returns a dict with the columns.
     The parallelization is done by the fast tokenizers, which are truely parallel with real Rust-based threads.
@@ -318,28 +331,77 @@ def _text_mode_load_data(
     dataset_path = Path(dataset_path)
     
     sets = [
-        general_shared_constants.CVSets.TRAINING, 
-        general_shared_constants.CVSets.VALIDATION
+        general_shared_constants.CVSets.TRAINING.value, 
+        general_shared_constants.CVSets.VALIDATION.value
     ]
     tokenized_data = {}
 
     for set_ in sets:
-        cv_path = dataset_path / f"{set_.value}.jsonl"
-        with jsonl.open(cv_path) as f:
-            rich.print(f"\n[bold]Loading the dataset: [/bold]", str(cv_path))
-            raw_data = list(f)
+        start = time.perf_counter()
+        if mode == DataModes.JSONL:
+            cv_path = dataset_path / f"{set_}.jsonl"
+            
+            with jsonl.open(cv_path) as f:
+                rich.print(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
+                raw_data = list(f)
+                rich.print(f"\n[bold]Done a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
 
-        # Not bad not great.
-        # Should really be pre-tokenized and put into an hdf5 file.
-        # TODO: Make it pre-tokenized, & think about the format.
-        joining_str = " => "
-        tokenized_data[set_] = {
-            "input": tokenizer([x["input"] + joining_str for x in raw_data], add_special_tokens=True,),
-            "input_and_scratchpad_with_value": tokenizer([x["input"] + " => " + x["scratchpad_with_value"] for x in raw_data], add_special_tokens=True),
-            "value": tokenizer([x["value"] for x in raw_data], add_special_tokens=True),
-            "scratchpad_with_value": tokenizer([x["scratchpad_with_value"] for x in raw_data], add_special_tokens=True),
-            "scratchpad": tokenizer([x["scratchpad"] for x in raw_data], add_special_tokens=True),
-        }
+
+            # Not bad not great.
+            # Should really be pre-tokenized and put into an hdf5 file.
+            # TODO: Make it pre-tokenized, & think about the format.
+            chainer = " => "
+            tokenized_data[set_] = {
+                "input": tokenizer([x["input"] + chainer for x in raw_data], add_special_tokens=False),
+                "input_and_scratchpad_with_value": tokenizer([x["input"] + chainer + x["scratchpad_with_value"] for x in raw_data], add_special_tokens=False),
+                "value_text": [x["value"] for x in raw_data],
+                "value": tokenizer([x["value"] for x in raw_data], add_special_tokens=False),
+                "scratchpad_with_value": tokenizer([x["scratchpad_with_value"] for x in raw_data], add_special_tokens=False),
+                "scratchpad": tokenizer([x["scratchpad"] for x in raw_data], add_special_tokens=False),
+            }
+
+        elif mode == DataModes.HDF5_PRETOK:
+            cv_path = dataset_path / f"{set_}.h5"
+            with h5py.File(cv_path, "r") as f:
+                cached = {k: v[:] for k, v in f.items()}
+
+            rich.print(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
+            
+            tokenized_data[set_] = {}
+            mask_keys = set()
+            ids_keys = set()
+            text_keys = set()
+
+            for key in cached.keys():
+                if "attention_mask" in key:
+                    mask_keys.add(key)
+                elif not key.endswith("_attention_mask") and not key.endswith("_text"):
+                    ids_keys.add(key)
+                else:
+                    text_keys.add(key)
+
+            for key in ids_keys:
+                assert (key + "_attention_mask") in mask_keys, (key, mask_keys)
+            
+            # Remove the padding
+            # Dynamic padding makes everything easier to deal with.
+            for key in tqdm(ids_keys, desc="Removing padding"):
+                mask_key = key + "_attention_mask"
+                tokenized_data[set_][key] = []
+                for sample_id in range(cached[key].shape[0]):
+                    vectorized_version = cached[key][sample_id][cached[mask_key][sample_id] == 1]
+                    tokenized_data[set_][key].append(vectorized_version)
+
+            for key in tqdm(text_keys, desc="Tokenizing"):
+                tokenized_data[set_][key] = cached[key][:]
+
+            rich.print(f"\n[bold]Done a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
+        
+        else:
+            raise ValueError(mode)
+
+        delta = time.perf_counter() - start
+        rich.print(f"\n[bold]Done preparing \"{cv_path.name}\". It took {delta:0.2f}s overall. ")
 
     return tokenized_data
 
@@ -357,67 +419,132 @@ class DictDataset(torch.utils.data.Dataset):
         self._data = data
 
     def __getitem__(self, index) -> dict[str, Sequence]:
-        {k: print(type(v[index])) for k, v in self._data.items()}
         return {k: torch.tensor(v[index]) for k, v in self._data.items()}
 
     def __len__(self) -> int:
         return self._len
 
 
-def pad(seq : Sequence, pad_token_id: int):
+def pad(seq : Sequence, pad_token_id: int, direction: str) -> Sequence:
+    
+
+    assert direction == "left"
     max_len = max(len(x) for x in seq)
     output = []
     for i, x in enumerate(seq):
-        output.append(x + [pad_token_id] * (max_len - len(x)))
+        if not isinstance(x, list):
+            x = x.tolist()
+
+        if direction == "left":
+            output.append([pad_token_id] * (max_len - len(x)) + x)
+
+        elif direction == "right":
+            output.append(x + [pad_token_id] * (max_len - len(x)))
+
+        else:
+            raise ValueError(direction)
+
     return torch.tensor(output)
 
+
+def generate_mask(list_of_list, direction: str):
+    mask = []
+    for x in list_of_list:
+        mask.append(torch.ones(len(x), dtype=torch.long))
+    attention_mask = pad(mask, 0, direction)
+    return attention_mask
+
+
+def prep_regular(examples, bos_token_id: int, eos_token_id: int) -> None:
+    for example in examples:
+        # Beginning checks
+        general_utils.check_not_equal(example["input_and_scratchpad_with_value"][0].item(), bos_token_id)
+        general_utils.check_not_equal(example["input_and_scratchpad_with_value"][-1].item(), eos_token_id)
+        general_utils.check_not_equal(example["scratchpad_with_value"][-1].item(), eos_token_id)
+
+        # Transormations
+        example["input_ids"] = [bos_token_id] + example["input_and_scratchpad_with_value"].tolist()
+        len_question = (len(example["input_and_scratchpad_with_value"]) - len(example["scratchpad_with_value"]))
+        example["labels"] = [-100] * len_question + example["scratchpad_with_value"].tolist() + [eos_token_id]
+        
+        # End checks
+        general_utils.check_equal(len(example["input_ids"]), len(example["labels"]))
+    
 
 @dataclasses.dataclass
 class TrainingCollator:
     _tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, examples):
-        assert False
-        examples_pt = {}
-        for k, v in examples.items():
-            examples_pt[k] = pad(v, self._tokenizer.pad_token_id)
-        
-        # Do the same thing as the training
-        # - Pad the sequences
-        # - Create an attention mask
-        # - Create a label with -100s for the non-scratchpad
+        """
+        - For perplexity evaluation:
+            (The chainer should already be in place for input_ids and input_ids_and_scratchpad_with_value)
+            - input_ids: question + chainer (e.g., " -> ") + scratchpad + value
+            - attention_mask: the same as above, but with 0s everywhere there is padding
+            - labels: -100 except scratchpad + value (so, for the question, the chainer and the padding.)
 
+        """
+        prep_regular(examples, self._tokenizer.bos_token_id, self._tokenizer.eos_token_id)
+
+        examples = general_utils.dict_unzip(examples)
+        examples["input_ids"] = pad(examples["input_ids"], self._tokenizer.pad_token_id, "left")
+        examples["attention_mask"] = generate_mask(examples["input_ids"], "left")
+        examples["labels"] = pad(examples["labels"], -100, "left")
+
+        return examples
 
 
 @dataclasses.dataclass
 class ValitationCollator:
     _tokenizer: transformers.PreTrainedTokenizer
 
-    def __call__(self, examples):
-        assert False
-        examples_pt = {}
-        for k, v in examples.items():
-            examples_pt[k] = pad(v, self._tokenizer.pad_token_id)
+    def __call__(self, raw_examples):
+        """
+        We need:
         
-        # Do the same thing as the training
-        # - Pad the sequences
-        # - Create an attention mask
-        # - Create a label with -100s for the non-scratchpad
+        - For perplexity evaluation:
+            (The chainer should already be in place for input_ids and input_ids_and_scratchpad_with_value)
+            - input_ids: question + chainer (e.g., " -> ") + scratchpad + value
+            - attention_mask: the same as above, but with 0s everywhere there is padding
+            - labels: -100 except scratchpad + value (so, for the question, the chainer and the padding.)
 
-        # Also tokenize the input alone, and 
+        - For generation evaluation:
+            (The chainer should already be in place for input_ids and input_ids_and_scratchpad_with_value)
+            - generation_input_ids: question + chainer
+            - generation_attention_mask: the same as above, but with 0s everywhere there is padding
+        
+        - To verify the generation:
+            - value text 
+
+        """
+        
+        prep_regular(raw_examples, self._tokenizer.bos_token_id, self._tokenizer.eos_token_id)
+        examples = general_utils.dict_unzip(raw_examples)
+        examples["input_ids"] = pad(examples["input_ids"], self._tokenizer.pad_token_id, "left")
+        examples["attention_mask"] = generate_mask(examples["input_ids"], "left")
+        examples["labels"] = pad(examples["labels"], -100, "left")
+        examples["generation_input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
+        examples["generation_attention_mask"] = generate_mask(examples["input"], "left")
+        examples["value_text"] = examples["value_text"]
+    
+        return examples
+
 
 
 def _text_mode_build_dataset(dataset_path, tokenizer):
-    tokenized_data = _text_mode_load_data(dataset_path, tokenizer)
+    tokenized_data = _load_data(dataset_path, tokenizer, DataModes.HDF5_PRETOK)
+    assert tokenized_data    
+    assert len(tokenized_data) == 2, tokenized_data.keys()
+    
 
     output_datasets = {}
     key_filter = {
-        general_shared_constants.CVSets.TRAINING: {
+        general_shared_constants.CVSets.TRAINING.value: {
             "input_and_scratchpad_with_value",
-            "input",
+            "scratchpad_with_value",
         },
-        general_shared_constants.CVSets.VALIDATION: {
-            "input",
+        general_shared_constants.CVSets.VALIDATION.value: {
+            "scratchpad_with_value",
             "input_and_scratchpad_with_value",
             "input",
             "value",
@@ -479,6 +606,9 @@ def main(
         scheduler_type=scheduler_type,
         scheduler_kwargs=scheduler_kwargs,
         max_epochs=max_epochs,
+        generation_kwargs={
+            "max_length": 80,
+        },
     )
     
     # Load the pretrained model. If a checkpoint is used, it will be loaded with the trainer.fit call, further in the code.
@@ -511,12 +641,14 @@ def main(
         rich.print("\n[bold ]Setting the initial state.")
         meta_info, logger = _set_initial_state(checkpoints_folder, arg_meta_info)
 
-    rich.print(f"[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"\n")
+    rich.print(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"\n")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         meta_info["transformers_model_name"], 
         padding_side="left",  # This is important for batched generation.
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
+    random_model.config.pad_token_id = tokenizer.eos_token_id
+
     datasets = _text_mode_build_dataset(dataset_path, tokenizer)
     
 
@@ -528,7 +660,7 @@ def main(
         tokenizer=tokenizer,
         datasets=datasets,
         batch_sizes=meta_info["batch_sizes"],
-        generation_kwargs=meta_info["batch_sizes"],
+        generation_kwargs=meta_info["generation_kwargs"],
         learning_rate=meta_info["learning_rate"],
         path_log_results=meta_info["path_log_results"],
         is_adamw=meta_info["is_adamw"],
@@ -554,6 +686,7 @@ def main(
         gpus=NUM_GPUS,
         check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
         accumulate_grad_batches=meta_info.get("accumulate_grad_batches", 1),
+        limit_val_batches=LIMIT_VAL_BATCHES,
     )
     
     if resuming:

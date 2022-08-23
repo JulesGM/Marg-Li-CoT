@@ -16,6 +16,15 @@ import rich
 
 SCRIPT_DIR = Path(__file__).absolute().parent
 
+
+def check_not_equal(a, b):
+    assert a != b, f"{a} == {b}"
+    
+    
+def check_equal(a, b):
+    assert a == b, f"{a} != {b}"
+
+
 def check_and_print_args(all_arguments, function):
     check_args(all_arguments, function)
     rich.print("[bold]Arguments:")
@@ -105,6 +114,24 @@ def clean_locals(locals_, no_modules=True, no_classes=True, no_functions=True, n
         (not no_caps or k == k.lower())
     ])
 
+def dict_zip(dict_of_lists: dict[str, Sequence[Any]], check_lengths=True) -> Generator[dict[str, Any], None, None]:
+    """
+    Takes a dict of sequences of the same length and returns a generator of dicts with the same keys and values at each iteration.
+    """
+
+    if check_lengths:
+        l0 = len(next(iter(dict_of_lists.values())))
+        assert all(l0 == len(v) for v in dict_of_lists.values()), {k: len(v) for k, v in dict_of_lists.items()}
+
+    iters = {k: iter(v) for k, v in dict_of_lists.items()}
+    
+    while True:
+        try:
+            yield {k: next(iters[k]) for k in dict_of_lists.keys()}
+
+        except StopIteration:
+            break
+
 
 def dict_unzip(list_of_dicts):
     """
@@ -143,6 +170,7 @@ def find_last(seq: Sequence[Any], item: Any) -> int:
 
 def cmd(command: list[str]) -> list[str]:
     return subprocess.check_output(command).decode("utf-8").strip().split("\n")
+
 
 def only_one(it: Iterable):
     iterated = iter(it)
