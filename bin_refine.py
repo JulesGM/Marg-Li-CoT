@@ -34,8 +34,8 @@ import wandb
 import pretty_traceback  # type: ignore
 pretty_traceback.install()
 
-import general_shared_constants
-import general_utils
+import general_shared_constants as constants
+import general_utils as utils
 print("Done loading modules.\n")
 
 
@@ -54,7 +54,11 @@ LIMIT_VAL_BATCHES = 50
 LIMIT_TRAIN_BATCHES = None
 SHUFFLE_TRAINING_DATA = True
 SHUFFLE_VALIDATION_DATA = True
-DEFAULT_BATCH_SIZES = {"training": 256, "validation": 256}  #384
+DEFAULT_BATCH_SIZES = {
+    constants.PipelineModes.MLE_TRAINING: 256, 
+    constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 256, 
+    constants.PipelineModes.VALIDATION: 256
+}  #384
 DATALOADER_NUM_WORKERS = 0 # int(os.environ.get("SLURM_CPUS_PER_TASK", 6)) - 1
 
 
@@ -82,7 +86,7 @@ class _RefineLM(pl.LightningModule):
         self._dataloader_num_workers = DATALOADER_NUM_WORKERS
         self._model: transformers.PreTrainedModel = model
         self._tokenizer: Final = tokenizer
-        self._batch_size: Final[int] = batch_sizes
+        self._batch_size: Final[dict[str, int]] = batch_sizes
         self._generation_kwargs: Final[dict[str, Any]] = generation_kwargs
         self._logging_conf: Final[dict[str, bool]] = dict(
             prog_bar=True, on_step=True, on_epoch=True, logger=True
@@ -94,9 +98,9 @@ class _RefineLM(pl.LightningModule):
         self._shuffle_train: Final[bool] = SHUFFLE_TRAINING_DATA
         self._shuffle_val: Final[bool] = SHUFFLE_VALIDATION_DATA
         self._datasets: Final[dict[str, torch.utils.data.Dataset]] = datasets
-        self._active_training_mode: Final[str] = general_shared_constants.PipelineModes.MLE_TRAINING.value
-        self._training_data_collators = {
-            general_shared_constants.PipelineModes.MLE_TRAINING.value: MLETrainingCollator(self._tokenizer),
+        self._active_training_mode: Final[str] = constants.PipelineModes.MLE_TRAINING.value
+        self._training_collators = {
+            constants.PipelineModes.MLE_TRAINING.value: MLETrainingCollator(self._tokenizer),
 
         }
 
@@ -122,7 +126,12 @@ class _RefineLM(pl.LightningModule):
         return self._model(*args, **kwargs)
 
 
-    def training_step(self, batch, batch_idx):
+    def _training_step_mle(self, batch, batch_idx):
+        utils.check_equal(
+            self._active_training_mode, 
+            constants.PipelineModes.MLE_TRAINING.value,
+        )
+
         assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
 
         batch = {k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
@@ -131,8 +140,72 @@ class _RefineLM(pl.LightningModule):
 
         return outputs.loss
 
+    def _training_step_marginal_likelihood(self, batch, batch_idx):
+        """
+        
+        p(z|x): <generation>
+            input_ids: masked, question, chainer
+            keep the logits. 
+
+        p(z|x): <after generation>
+            input_ids: masked, question, chainer
+            Labels: whatever the model has generated, value.
+            Notes: 
+                - We could keep the logits in generation and extract from that.
+                - We need to add the value at the end so that we don't need to recompute everything.
+                - We will need scratchpad masks and value masks, to extract the logits.
+        
+        p(y|z, x):
+            input_ids: masked, question, chainer, scratchpad, value
+            labels: value
+            Note: I think we need to recompute over everything. This is not optimal clearly.
+
+
+        """
+        mode: Final = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value
+        utils.check_equal(self._active_training_mode, mode)
+
+        # Generate Scratchpads
+        batch = {k: v for k, v in batch.items() if k in ["input_ids", "attention_mask"]}
+        # TODO: Not sure about the options in these
+        outputs = self._model.group_beam_search(
+            **batch, 
+            **self._generation_kwargs[mode],
+        )
+
+        utils.check_equal(outputs.shape, (
+            self._batch_size[self._active_training_mode], 
+            self._generation_kwargs[mode]["beam_size"], 
+            self._generation_kwargs[mode]["max_length"]
+        ))
+
+        ## Concatenate final value
+        # [input, generated_scratchpad, answer]
+        z_knowing_x_val, z_knowing_x_mask = unpadded_concatenation([batch["input_ids"], outputs], self._tokenizer.pad_token_id)
+        
+
+        label_mask = torch.ones_like(z_knowing_x_mask) * -100
+        assert label_mask.dtype == torch.long, label_mask.dtype
+        y_knowing_x_z_val, y_knowing_x_z_mask = unpadded_concatenation([label_mask, batch["value"]], -100)
+        
+        # Compute loss
+        prob = self._model(input_ids=y_knowing_x_z_val)
+
+        pass
+
+
+    def training_step(self, batch, batch_idx):
+        if self._active_training_mode == constants.PipelineModes.MLE_TRAINING.value:
+            return self._training_step_mle(batch, batch_idx)
+        elif self._active_training_mode == constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value:
+            return self._training_step_marginal_likelihood(batch, batch_idx)
+        else:
+            raise ValueError(f"Unknown training mode: {self._active_training_mode}")
+
+
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx):  # type: ignore[override]
         assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
+        mode: Final = constants.PipelineModes.VALIDATION.value
 
         generation_inputs = batch["generation_input_ids"]
         generation_attention_mask = batch["generation_attention_mask"]
@@ -140,7 +213,7 @@ class _RefineLM(pl.LightningModule):
         outputs = self._model.greedy_search(
             input_ids=generation_inputs, 
             attention_mask=generation_attention_mask, 
-            **self._generation_kwargs
+            **self._generation_kwargs[mode]
         )
         
         generated_decoded = [clean_for_accuracy_computation(self._tokenizer.decode(x), self._tokenizer) for x in outputs]
@@ -155,8 +228,8 @@ class _RefineLM(pl.LightningModule):
         rich.print(f"\nAccuracy {accuracy: 0.2%}\n", accuracy)
         
         ppl_outputs = self._model(**{k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]})
-        self.log("val_em", accuracy, batch_size=self._batch_size[general_shared_constants.PipelineModes.VALIDATION], **self._logging_conf)
-        self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[general_shared_constants.PipelineModes.VALIDATION], **self._logging_conf)
+        self.log("val_em", accuracy, batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[mode], **self._logging_conf)
 
         return ppl_outputs
 
@@ -185,24 +258,33 @@ class _RefineLM(pl.LightningModule):
         return dict(optimizer=optimizer)
 
 
-    def train_dataloader(self):
+    def train_dataloader(self):        
         return torch.utils.data.DataLoader(
             self._datasets[self._active_training_mode],
-            collate_fn=self._training_collators[self._activa_training_mode],
-            batch_size=self._batch_size,
+            collate_fn=self._training_collators[self._active_training_mode],
+            batch_size=self._batch_size[self._active_training_mode],
             num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_train,
         )
 
 
     def val_dataloader(self):
+        mode: Final = constants.PipelineModes.VALIDATION.value
         return torch.utils.data.DataLoader(
-            self._datasets[general_shared_constants.PipelineModes.VALIDATION.value],
+            self._datasets[mode],
             collate_fn=ValitationCollator(self._tokenizer),
-            batch_size=self._eval_batch_size,
+            batch_size=self._batch_size[mode],
             num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_val,
         )
+
+
+def unpadded_concatenation(tensors, pad_token_id):
+    lists_of_lists = [semi_vectorized_masked_2d_to_lol(x, x==pad_token_id) for x in tensors]
+    concatenated = [list(itertools.chain(*list_of_lists)) for list_of_lists in zip(*lists_of_lists)]
+    mask = generate_mask(concatenated, pad_token_id)
+    padded = pad(concatenated, pad_token_id)
+    return padded, mask
 
 
 def clean_for_accuracy_computation(text, tokenizer):
@@ -334,7 +416,6 @@ class DataModes(str, enum.Enum):
     HDF5_PRETOK = "hdf5_pretok"
 
 
-
 def semi_vectorized_masked_2d_to_lol(array: np.ndarray, mask: np.ndarray) -> List[List[Any]]:
     if isinstance(mask, np.ndarray):
         assert mask.dtype == np.bool, mask.dtype
@@ -343,15 +424,13 @@ def semi_vectorized_masked_2d_to_lol(array: np.ndarray, mask: np.ndarray) -> Lis
     else:
         raise ValueError(type(mask))
 
-    general_utils.check_equal(array.shape, mask.shape)
+    utils.check_equal(array.shape, mask.shape)
     output = []
     for i in range(mask.shape[0]):
         vectorized_version = array[i][mask[i]]
         output.append(vectorized_version)
 
     return output
-
-
 
 
 def _load_data(
@@ -366,8 +445,8 @@ def _load_data(
     dataset_path = Path(dataset_path)
     
     sets = [
-        general_shared_constants.CVSets.TRAINING.value, 
-        general_shared_constants.CVSets.VALIDATION.value
+        constants.CVSets.TRAINING.value, 
+        constants.CVSets.VALIDATION.value
     ]
     tokenized_data = {}
 
@@ -381,10 +460,6 @@ def _load_data(
                 raw_data = list(f)
                 rich.print(f"\n[bold]Done a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
 
-
-            # Not bad not great.
-            # Should really be pre-tokenized and put into an hdf5 file.
-            # TODO: Make it pre-tokenized, & think about the format.
             chainer = " => "
             tokenized_data[set_] = {
                 "input": tokenizer([x["input"] + chainer for x in raw_data], add_special_tokens=False),
@@ -481,6 +556,8 @@ def pad(seq : Sequence, pad_token_id: int, direction: str) -> Sequence:
 
 
 def generate_mask(list_of_list, direction: str):
+    assert isinstance(list_of_list, list), type(list_of_list)
+
     mask = []
     for x in list_of_list:
         mask.append(torch.ones(len(x), dtype=torch.long))
@@ -488,11 +565,8 @@ def generate_mask(list_of_list, direction: str):
     return attention_mask
 
 
-def prep_regular(examples, bos_token_id: int, eos_token_id: int) -> None:
+def prep_mle_train_and_valid(examples, bos_token_id: int, eos_token_id: int) -> None:
     
-    # This feels like a mistake. Anything that iterates over all examples
-    # should be done inside of the dataset class, not in the collator.
-
     for example in examples:
         # Transormations
         example["input_ids"] = [bos_token_id] + example["input_and_scratchpad_with_value"].tolist()
@@ -500,8 +574,7 @@ def prep_regular(examples, bos_token_id: int, eos_token_id: int) -> None:
         example["labels"] = [-100] * len_question + example["scratchpad_with_value"].tolist() + [eos_token_id]
         
         # End checks
-        general_utils.check_equal(len(example["input_ids"]), len(example["labels"]))
-    
+        utils.check_equal(len(example["input_ids"]), len(example["labels"]))
 
 
 @dataclasses.dataclass
@@ -518,11 +591,10 @@ class MarginalLikelihoodTrainingCollator:
         loss: likelihoodOf[question, chainer, Generate(question), answer]
 
         """
-        
-        examples = general_utils.dict_unzip(examples, ["input", ])
-        examples["input_ids"] = pad(examples["input_ids"], self._tokenizer.pad_token_id, "left")
-        examples["attention_mask"] = generate_mask(examples["input_ids"], "left")
-        examples["labels"] = pad(examples["labels"], -100, "left")
+
+        examples = utils.dict_unzip(examples)
+        examples["attention_mask"] = generate_mask(examples["input"], "left")
+        examples["input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
 
         return examples
 
@@ -540,11 +612,11 @@ class MLETrainingCollator:
             - labels: -100 except scratchpad + value (so, for the question, the chainer and the padding.)
 
         """
-        prep_regular(examples, self._tokenizer.bos_token_id, self._tokenizer.eos_token_id)
+        prep_mle_train_and_valid(examples, self._tokenizer.bos_token_id, self._tokenizer.eos_token_id)
 
-        examples = general_utils.dict_unzip(examples)
+        examples = utils.dict_unzip(examples)
+        examples["attention_mask"] = generate_mask(examples["input_ids"], "left")  # NEEDS TO BE BEFORE PAD
         examples["input_ids"] = pad(examples["input_ids"], self._tokenizer.pad_token_id, "left")
-        examples["attention_mask"] = generate_mask(examples["input_ids"], "left")
         examples["labels"] = pad(examples["labels"], -100, "left")
 
         return examples
@@ -574,14 +646,15 @@ class ValitationCollator:
 
         """
         
-        prep_regular(raw_examples, self._tokenizer.bos_token_id, self._tokenizer.eos_token_id)
-        examples = general_utils.dict_unzip(raw_examples)
+        prep_mle_train_and_valid(raw_examples, self._tokenizer.bos_token_id, self._tokenizer.eos_token_id)
+
+        examples = utils.dict_unzip(raw_examples)
+        examples["attention_mask"] = generate_mask(examples["input_ids"], "left")  # NEEDS TO BE BEFORE PAD
         examples["input_ids"] = pad(examples["input_ids"], self._tokenizer.pad_token_id, "left")
-        examples["attention_mask"] = generate_mask(examples["input_ids"], "left")
         examples["labels"] = pad(examples["labels"], -100, "left")
+
         examples["generation_input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
         examples["generation_attention_mask"] = generate_mask(examples["input"], "left")
-        examples["value_text"] = examples["value_text"]
     
         return examples
 
@@ -594,17 +667,17 @@ def _text_mode_build_dataset(dataset_path, tokenizer):
     
     output_datasets = {}
     key_filter = {
-        general_shared_constants.PipelineModes.MLE_TRAINING.value: {
+        constants.PipelineModes.MLE_TRAINING.value: {
             "input_and_scratchpad_with_value",
             "scratchpad_with_value",
         },
         
-        general_shared_constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value: {
+        constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value: {
             "input",
             "value",
         },
 
-        general_shared_constants.PipelineModes.VALIDATION.value: {
+        constants.PipelineModes.VALIDATION.value: {
             "scratchpad_with_value",
             "input_and_scratchpad_with_value",
             "input",
@@ -612,9 +685,10 @@ def _text_mode_build_dataset(dataset_path, tokenizer):
         },
     }
 
-    for mode, keys in key_filter:
-        columns = {k: tokenized_data[general_shared_constants.PIPELINES_MODES_TO_CV_SETS[mode]][k] for k in keys}
-        output_datasets[mode] = DictDataset(columns)
+    for pipeline_mode, keys in key_filter.items():
+        dataset_mode = constants.PIPELINES_MODES_TO_CV_SETS[pipeline_mode]
+        columns = {k: tokenized_data[dataset_mode][k] for k in keys}
+        output_datasets[pipeline_mode] = DictDataset(columns)
 
     return output_datasets
 
@@ -640,11 +714,14 @@ def main(
     scheduler_kwargs=None,
     max_epochs=100,
     switch_to_maginal_after=False,
-    generation_kwargs={"max_length": 80,},
+    generation_kwargs={
+        constants.PipelineModes.VALIDATION.value: {"max_length": 80,},
+        constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value: {"max_length": 80, "num_beams": 4},
+    },
     distribute_strategy=None,
 ):
     all_arguments = locals().copy()
-    general_utils.check_and_print_args(all_arguments, main)
+    utils.check_and_print_args(all_arguments, main)
 
     dataset_path = Path(dataset_path)
     assert dataset_path.exists(), dataset_path
@@ -662,21 +739,21 @@ def main(
         rich.print(f"[bold green]Not resuming: Will start from scratch.")
     
     arg_meta_info = _build_meta_info(
-        seed=seed, 
-        dataset_path=dataset_path,
-        checkpoints_folder=checkpoints_folder,
-        wandb_run_id=wandb_run_id,
-        run_name=dataset_path.name,
-        transformers_model_name=transformers_model_name,
         batch_sizes=batch_sizes,
-        learning_rate=learning_rate,
-        is_adamw=is_adamw,
-        weight_decay=weight_decay,
-        path_log_results=path_log_results,
-        scheduler_type=scheduler_type,
-        scheduler_kwargs=scheduler_kwargs,
-        max_epochs=max_epochs,
+        checkpoints_folder=checkpoints_folder,
+        dataset_path=dataset_path,
         generation_kwargs=generation_kwargs,
+        is_adamw=is_adamw,
+        learning_rate=learning_rate,
+        max_epochs=max_epochs,
+        path_log_results=path_log_results,
+        run_name=dataset_path.name,
+        scheduler_kwargs=scheduler_kwargs,
+        scheduler_type=scheduler_type,
+        seed=seed, 
+        transformers_model_name=transformers_model_name,
+        wandb_run_id=wandb_run_id,
+        weight_decay=weight_decay,
     )
     
     # Load the pretrained model. If a checkpoint is used, it will be loaded with the trainer.fit call, further in the code.

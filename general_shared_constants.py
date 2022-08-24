@@ -13,15 +13,15 @@ class PipelineModes(str, enum.Enum):
     TEST = "test"
 
 
-class CVSet(str, enum.Enum):
+class CVSets(str, enum.Enum):
     TRAINING = "training"
     VALIDATION = "validation"
     TEST = "test"
 
 
 PIPELINES_MODES_TO_CV_SETS = {
-    PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: {CVSet.TRAINING},
-    PipelineModes.MLE_TRAINING: {CVSet.TRAINING},
-    PipelineModes.VALIDATION: {CVSet.VALIDATION},
-    PipelineModes.TEST: {CVSet.TEST},
+    PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: CVSets.TRAINING,
+    PipelineModes.MLE_TRAINING: CVSets.TRAINING,
+    PipelineModes.VALIDATION: CVSets.VALIDATION,
+    PipelineModes.TEST: CVSets.TEST,
 }
