@@ -40,7 +40,6 @@ print("Done loading modules.\n")
 
 
 SCRIPT_DIR = Path(__file__).absolute().parent
-
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 0
 GRADIENT_CLIP_VAL = 0.1
@@ -51,7 +50,12 @@ DATA_PATH = SCRIPT_DIR / "data"
 DETERMINISTIC = True
 NUM_GPUS = torch.cuda.device_count()
 EVAL_EVERY_N_EPOCHS = 1
-LIMIT_VAL_BATCHES = 1000
+LIMIT_VAL_BATCHES = 50
+LIMIT_TRAIN_BATCHES = None
+SHUFFLE_TRAINING_DATA = True
+SHUFFLE_VALIDATION_DATA = True
+DEFAULT_BATCH_SIZES = {"training": 256, "validation": 256}  #384
+DATALOADER_NUM_WORKERS = 0 # int(os.environ.get("SLURM_CPUS_PER_TASK", 6)) - 1
 
 
 class _RefineLM(pl.LightningModule):
@@ -75,11 +79,10 @@ class _RefineLM(pl.LightningModule):
         assert scheduler_kwargs is None, "scheduler support is not yet implemented"
 
 
-        self._dataloader_num_workers = 0
+        self._dataloader_num_workers = DATALOADER_NUM_WORKERS
         self._model: transformers.PreTrainedModel = model
         self._tokenizer: Final = tokenizer
-        self._batch_size: Final[int] = batch_sizes[general_shared_constants.CVSets.TRAINING.value]
-        self._eval_batch_size: Final[int] = batch_sizes[general_shared_constants.CVSets.VALIDATION.value]
+        self._batch_size: Final[int] = batch_sizes
         self._generation_kwargs: Final[dict[str, Any]] = generation_kwargs
         self._logging_conf: Final[dict[str, bool]] = dict(
             prog_bar=True, on_step=True, on_epoch=True, logger=True
@@ -88,16 +91,16 @@ class _RefineLM(pl.LightningModule):
         ################################################################################
         # Related to datasets
         ################################################################################
-        self._shuffle_train: Final[bool] = True
-        self._shuffle_val: Final[bool] = False
-        
-        train_ds = datasets[general_shared_constants.CVSets.TRAINING.value]
-        eval_ds = datasets[general_shared_constants.CVSets.VALIDATION.value]
+        self._shuffle_train: Final[bool] = SHUFFLE_TRAINING_DATA
+        self._shuffle_val: Final[bool] = SHUFFLE_VALIDATION_DATA
+        self._datasets: Final[dict[str, torch.utils.data.Dataset]] = datasets
+        self._active_training_mode: Final[str] = general_shared_constants.PipelineModes.MLE_TRAINING.value
+        self._training_data_collators = {
+            general_shared_constants.PipelineModes.MLE_TRAINING.value: MLETrainingCollator(self._tokenizer),
 
-        assert train_ds is not eval_ds, "train_ds and eval_ds must be different objects"
-        self._train_ds: Final[torch.utils.data.Dataset] = train_ds
-        self._eval_ds: Final[torch.utils.data.Dataset] = eval_ds
-        
+        }
+
+
         ################################################################################
         # Rel. to logging results for answer overlap estim.
         ################################################################################
@@ -124,32 +127,38 @@ class _RefineLM(pl.LightningModule):
 
         batch = {k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
         outputs = self(**batch)
-        self.log("train_loss", outputs.loss, **self._logging_conf)
+        self.log("train_loss", outputs.loss, batch_size=self._batch_size[self._active_training_mode], **self._logging_conf)
 
         return outputs.loss
-
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx):  # type: ignore[override]
         assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
 
         generation_inputs = batch["generation_input_ids"]
         generation_attention_mask = batch["generation_attention_mask"]
+
         outputs = self._model.greedy_search(
             input_ids=generation_inputs, 
             attention_mask=generation_attention_mask, 
             **self._generation_kwargs
         )
+        
+        generated_decoded = [clean_for_accuracy_computation(self._tokenizer.decode(x), self._tokenizer) for x in outputs]
+        label = [clean_for_accuracy_computation(self._tokenizer.decode(x), self._tokenizer) for x in batch["input_and_scratchpad_with_value"]]
+        
         if batch_idx == 0:
-            print("\n".join([self._tokenizer.decode(x) for x in outputs]))
-        
-        generated_decoded = [self._tokenizer.decode(x) for x in outputs]
-        label = [self._tokenizer.decode(x) for x in batch["scratchpad_with_value"]]
-        accuracy = np.mean([gen.strip() == l.strip() for gen, l in zip(generated_decoded, label)])
-        rich.print("\nAccuracy {accuracy: 0.2%}\n", accuracy)
-        
-        self.log("val_em", accuracy, **self._logging_conf)
+            for gen, ref in zip(generated_decoded, label):
+                rich.print(f"generated: {gen}")
+                rich.print(f"reference: {ref}")
 
-        return self._model(**{k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]})
+        accuracy = np.mean([gen == l for gen, l in zip(generated_decoded, label)])
+        rich.print(f"\nAccuracy {accuracy: 0.2%}\n", accuracy)
+        
+        ppl_outputs = self._model(**{k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]})
+        self.log("val_em", accuracy, batch_size=self._batch_size[general_shared_constants.PipelineModes.VALIDATION], **self._logging_conf)
+        self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[general_shared_constants.PipelineModes.VALIDATION], **self._logging_conf)
+
+        return ppl_outputs
 
 
     def on_validation_epoch_end(self) -> None:
@@ -178,8 +187,8 @@ class _RefineLM(pl.LightningModule):
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(
-            self._train_ds,
-            collate_fn=TrainingCollator(self._tokenizer),
+            self._datasets[self._active_training_mode],
+            collate_fn=self._training_collators[self._activa_training_mode],
             batch_size=self._batch_size,
             num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_train,
@@ -188,12 +197,17 @@ class _RefineLM(pl.LightningModule):
 
     def val_dataloader(self):
         return torch.utils.data.DataLoader(
-            self._eval_ds,
+            self._datasets[general_shared_constants.PipelineModes.VALIDATION.value],
             collate_fn=ValitationCollator(self._tokenizer),
             batch_size=self._eval_batch_size,
             num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_val,
         )
+
+
+def clean_for_accuracy_computation(text, tokenizer):
+    return text.replace(tokenizer.eos_token, "").strip()
+
 
 
 def _get_last_checkpoint_path(checkpoints_folder, wandb_run_id: Optional[str]) -> Optional[Path]:
@@ -289,7 +303,8 @@ def _set_initial_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str
         log_model=False,
         config=dict(
             meta_info=arg_meta_info,
-            num_gpus=NUM_GPUS,
+            accelerator="gpu",
+            devices=NUM_GPUS,
             precision=PRECISION,
             arguments=arg_meta_info,
         ),
@@ -317,6 +332,26 @@ def _build_meta_info(**kwargs):
 class DataModes(str, enum.Enum):
     JSONL = "jsonl"
     HDF5_PRETOK = "hdf5_pretok"
+
+
+
+def semi_vectorized_masked_2d_to_lol(array: np.ndarray, mask: np.ndarray) -> List[List[Any]]:
+    if isinstance(mask, np.ndarray):
+        assert mask.dtype == np.bool, mask.dtype
+    elif isinstance(mask, torch.Tensor):
+        assert mask.dtype == torch.bool, mask.dtype
+    else:
+        raise ValueError(type(mask))
+
+    general_utils.check_equal(array.shape, mask.shape)
+    output = []
+    for i in range(mask.shape[0]):
+        vectorized_version = array[i][mask[i]]
+        output.append(vectorized_version)
+
+    return output
+
+
 
 
 def _load_data(
@@ -388,9 +423,10 @@ def _load_data(
             for key in tqdm(ids_keys, desc="Removing padding"):
                 mask_key = key + "_attention_mask"
                 tokenized_data[set_][key] = []
-                for sample_id in range(cached[key].shape[0]):
-                    vectorized_version = cached[key][sample_id][cached[mask_key][sample_id] == 1]
-                    tokenized_data[set_][key].append(vectorized_version)
+
+                start_norm_vec = time.perf_counter()                
+                tokenized_data[set_][key] = semi_vectorized_masked_2d_to_lol(cached[key], cached[mask_key] == 1)
+                print(f"Normal {time.perf_counter() - start_norm_vec:0.2f}s")
 
             for key in tqdm(text_keys, desc="Tokenizing"):
                 tokenized_data[set_][key] = cached[key][:]
@@ -412,7 +448,6 @@ class DictDataset(torch.utils.data.Dataset):
     The first dimension of the sequences needs to be of the same size.
     """
     def __init__(self, data: dict[str, Sequence]):
-        
         lens = {k: len(v) for k, v in data.items()}
         assert len(set(lens.values())) == 1, lens
         self._len = lens[list(lens.keys())[0]]
@@ -426,8 +461,6 @@ class DictDataset(torch.utils.data.Dataset):
 
 
 def pad(seq : Sequence, pad_token_id: int, direction: str) -> Sequence:
-    
-
     assert direction == "left"
     max_len = max(len(x) for x in seq)
     output = []
@@ -456,12 +489,11 @@ def generate_mask(list_of_list, direction: str):
 
 
 def prep_regular(examples, bos_token_id: int, eos_token_id: int) -> None:
-    for example in examples:
-        # Beginning checks
-        general_utils.check_not_equal(example["input_and_scratchpad_with_value"][0].item(), bos_token_id)
-        general_utils.check_not_equal(example["input_and_scratchpad_with_value"][-1].item(), eos_token_id)
-        general_utils.check_not_equal(example["scratchpad_with_value"][-1].item(), eos_token_id)
+    
+    # This feels like a mistake. Anything that iterates over all examples
+    # should be done inside of the dataset class, not in the collator.
 
+    for example in examples:
         # Transormations
         example["input_ids"] = [bos_token_id] + example["input_and_scratchpad_with_value"].tolist()
         len_question = (len(example["input_and_scratchpad_with_value"]) - len(example["scratchpad_with_value"]))
@@ -471,8 +503,32 @@ def prep_regular(examples, bos_token_id: int, eos_token_id: int) -> None:
         general_utils.check_equal(len(example["input_ids"]), len(example["labels"]))
     
 
+
 @dataclasses.dataclass
-class TrainingCollator:
+class MarginalLikelihoodTrainingCollator:
+    _tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, examples):
+        """
+        - We have the questions, we have the answers. Nothing else.
+
+        Input ids: [question, chainer]
+        Labels: [answer]
+
+        loss: likelihoodOf[question, chainer, Generate(question), answer]
+
+        """
+        
+        examples = general_utils.dict_unzip(examples, ["input", ])
+        examples["input_ids"] = pad(examples["input_ids"], self._tokenizer.pad_token_id, "left")
+        examples["attention_mask"] = generate_mask(examples["input_ids"], "left")
+        examples["labels"] = pad(examples["labels"], -100, "left")
+
+        return examples
+
+
+@dataclasses.dataclass
+class MLETrainingCollator:
     _tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, examples):
@@ -536,14 +592,19 @@ def _text_mode_build_dataset(dataset_path, tokenizer):
     assert tokenized_data    
     assert len(tokenized_data) == 2, tokenized_data.keys()
     
-
     output_datasets = {}
     key_filter = {
-        general_shared_constants.CVSets.TRAINING.value: {
+        general_shared_constants.PipelineModes.MLE_TRAINING.value: {
             "input_and_scratchpad_with_value",
             "scratchpad_with_value",
         },
-        general_shared_constants.CVSets.VALIDATION.value: {
+        
+        general_shared_constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value: {
+            "input",
+            "value",
+        },
+
+        general_shared_constants.PipelineModes.VALIDATION.value: {
             "scratchpad_with_value",
             "input_and_scratchpad_with_value",
             "input",
@@ -551,9 +612,9 @@ def _text_mode_build_dataset(dataset_path, tokenizer):
         },
     }
 
-    for set_, set_columns in tokenized_data.items():
-        columns = {k: set_columns[k] for k in key_filter[set_]}
-        output_datasets[set_] = DictDataset(columns)
+    for mode, keys in key_filter:
+        columns = {k: tokenized_data[general_shared_constants.PIPELINES_MODES_TO_CV_SETS[mode]][k] for k in keys}
+        output_datasets[mode] = DictDataset(columns)
 
     return output_datasets
 
@@ -570,7 +631,7 @@ def main(
     dataset_path: Union[Path, str] = DATA_DIR / "basic_arithmetic/80_3_6_200000",
     # dataset_path: Union[Path, str] = DATA_DIR / "basic_arithmetic/349_6_6_200000",
     transformers_model_name: str = "distilgpt2",
-    batch_sizes = {"training": 32, "validation": 64},
+    batch_sizes = DEFAULT_BATCH_SIZES,
     learning_rate = 1e-3,
     is_adamw = True,
     weight_decay=0.1,
@@ -578,6 +639,9 @@ def main(
     scheduler_type=None,
     scheduler_kwargs=None,
     max_epochs=100,
+    switch_to_maginal_after=False,
+    generation_kwargs={"max_length": 80,},
+    distribute_strategy=None,
 ):
     all_arguments = locals().copy()
     general_utils.check_and_print_args(all_arguments, main)
@@ -590,7 +654,13 @@ def main(
     assert checkpoints_folder.is_dir(), checkpoints_folder
 
     torch.use_deterministic_algorithms(mode=DETERMINISTIC)
-
+    latest_checkpoint = _get_last_checkpoint_path(checkpoints_folder, wandb_run_id)
+    resuming = latest_checkpoint is not None
+    if resuming:
+        rich.print(f"[bold red] Will resume from \"{latest_checkpoint}\"")
+    else:
+        rich.print(f"[bold green]Not resuming: Will start from scratch.")
+    
     arg_meta_info = _build_meta_info(
         seed=seed, 
         dataset_path=dataset_path,
@@ -606,9 +676,7 @@ def main(
         scheduler_type=scheduler_type,
         scheduler_kwargs=scheduler_kwargs,
         max_epochs=max_epochs,
-        generation_kwargs={
-            "max_length": 80,
-        },
+        generation_kwargs=generation_kwargs,
     )
     
     # Load the pretrained model. If a checkpoint is used, it will be loaded with the trainer.fit call, further in the code.
@@ -617,12 +685,9 @@ def main(
     random_model = transformers.AutoModelForCausalLM.from_pretrained(
         arg_meta_info["transformers_model_name"])
     rich.print(f"Loaded model in {time.perf_counter() - start:.2f}s")
-    
-    latest_checkpoint = _get_last_checkpoint_path(checkpoints_folder, wandb_run_id)
-    resuming = latest_checkpoint is not None
-        
+
     if resuming:
-        rich.print("\n[bold green]Resuming from checkpoint:[/bold]", latest_checkpoint)
+        rich.print("\n[bold red]Resuming from checkpoint:[/bold]", latest_checkpoint)
         meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info)
         logger = pl.loggers.WandbLogger(
         project=WANDB_PROJECT,
@@ -638,7 +703,7 @@ def main(
         )
         wandb.run.log_code(SCRIPT_DIR)
     else:
-        rich.print("\n[bold ]Setting the initial state.")
+        rich.print("\n[bold green]Not Resuming: Setting the initial state.")
         meta_info, logger = _set_initial_state(checkpoints_folder, arg_meta_info)
 
     rich.print(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"\n")
@@ -648,9 +713,7 @@ def main(
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
     random_model.config.pad_token_id = tokenizer.eos_token_id
-
     datasets = _text_mode_build_dataset(dataset_path, tokenizer)
-    
 
     ###############################################################
     # Build the pt-lightning dataloader
@@ -669,7 +732,6 @@ def main(
         scheduler_kwargs=meta_info["scheduler_kwargs"],
     )
 
-
     trainer = pl.Trainer(
         enable_checkpointing=pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
             dirpath=checkpoints_folder,
@@ -683,10 +745,12 @@ def main(
         gradient_clip_val=GRADIENT_CLIP_VAL,
         precision=PRECISION,
         max_epochs=meta_info["max_epochs"],
-        gpus=NUM_GPUS,
+        accelerator="gpu",
         check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
         accumulate_grad_batches=meta_info.get("accumulate_grad_batches", 1),
         limit_val_batches=LIMIT_VAL_BATCHES,
+        limit_train_batches=LIMIT_TRAIN_BATCHES,
+        strategy=distribute_strategy,
     )
     
     if resuming:

@@ -78,48 +78,15 @@ def print_dict(_dict: dict[str, Any]) -> None:
     if not at_least_one:
         rich.print("\t[bright_black]<empty dict>")
 
-def zip_dicts(*dicts):
+
+def dict_zip(dict_of_lists: dict[Any, Iterable[Any]], check_lengths=True) -> Generator[dict[Any, Any], None, None]:
     """
-    Zips the iterables in the values of the dicts by returning a dict with
-    the same keys and a set of value at each iteration.
-    """
-    d = {}
-    for d_ in dicts:
-        for k in d_.keys():
-            assert k not in d, f"Duplicate key {k} in dicts. {d.keys()}"
-        d.update(d_)
-
-    keys = d.keys()
-    length = None
-    for k, v in d.items():
-        if length is None:
-            length = len(v)
-        assert len(v) == length, f"{k} has length {len(v)} != {length}"
-
-    iter_d = {k: iter(v) for k, v in d.items()}
-    while True:
-        try:
-            yield {k: next(iter_d[k]) for k in keys}
-        except StopIteration:
-            break
-
-
-def clean_locals(locals_, no_modules=True, no_classes=True, no_functions=True, no_caps=True):
-    print([
-        k for k, v in locals_.items() if 
-        not k.startswith("_") and 
-        (not no_modules or not isinstance(v, types.ModuleType)) and 
-        (not no_classes or not isinstance(v, type)) and 
-        (not no_functions or not callable(v)) and 
-        (not no_caps or k == k.lower())
-    ])
-
-def dict_zip(dict_of_lists: dict[str, Sequence[Any]], check_lengths=True) -> Generator[dict[str, Any], None, None]:
-    """
-    Takes a dict of sequences of the same length and returns a generator of dicts with the same keys and values at each iteration.
+    Takes a dict of iterables and returns a generator of dicts with the same keys and a value of the lists at each iteration.
     """
 
     if check_lengths:
+        # Requires all lists to have the same length.
+        # Could do some iterator stuff to keep track of the length. Haven't done that yet.
         l0 = len(next(iter(dict_of_lists.values())))
         assert all(l0 == len(v) for v in dict_of_lists.values()), {k: len(v) for k, v in dict_of_lists.items()}
 
@@ -133,17 +100,35 @@ def dict_zip(dict_of_lists: dict[str, Sequence[Any]], check_lengths=True) -> Gen
             break
 
 
-def dict_unzip(list_of_dicts):
+def dict_unzip(list_of_dicts: list[dict[Any, Any]], key_subset=None) -> dict[Any, list[Any]]:
     """
-    Unzips a list of dicts into a dict of lists
+    Unzips a list of dicts with the same keys into a dict of lists.
     """
-    keys = list_of_dicts[0].keys()
+    if key_subset is None:
+        keys = list_of_dicts[0].keys()
+    else:
+        keys = key_subset
+
     dict_of_lists = collections.defaultdict(list)
-    for i, ld in enumerate(list_of_dicts):
+    
+    for ld in list_of_dicts:
         assert ld.keys() == keys, f"{ld.keys()} != {keys}"
         for k in keys:
             dict_of_lists[k].append(ld[k])
+
     return dict_of_lists
+
+
+
+def clean_locals(locals_, no_modules=True, no_classes=True, no_functions=True, no_caps=True):
+    print([
+        k for k, v in locals_.items() if 
+        not k.startswith("_") and 
+        (not no_modules or not isinstance(v, types.ModuleType)) and 
+        (not no_classes or not isinstance(v, type)) and 
+        (not no_functions or not callable(v)) and 
+        (not no_caps or k == k.lower())
+    ])
 
 
 def concat_lists(lists):

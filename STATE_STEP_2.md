@@ -3,13 +3,16 @@ A lot of stuff.
  - Text data mode 
  - State load / state init & checkpointing
  - Pytorch lightning model
+ - Fix the way the input and scratchpad are put together
+ - Generation based validation
+ - Pre-tokenized hdf5 mode
 
 ## To do
 ### High priority
+ - Test Horovod
  - Test checkpointing / state resuming
  - Look at the data. Specifically, what the training_step sees, and what the generator sees, and what the validation sees.
- - Fix the way the input and scratchpad are put together
- - Generation based validation
+ - Verify generation based validation
 
 ### Low priority
  - LR scheduler
