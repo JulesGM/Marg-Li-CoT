@@ -413,16 +413,16 @@ def _set_initial_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str
 
     if global_rank == 0:
         wandb.run.log_code(SCRIPT_DIR)
-    arg_meta_info["wandb_run_id"] = wandb.run.id
+        arg_meta_info["wandb_run_id"] = wandb.run.id
 
-    # Deal with random seeds and states
-    seed = arg_meta_info["seed"]
-    torch.cuda.manual_seed_all(seed)
-    random.seed(seed)
-    np.random.seed(seed)
+        # Deal with random seeds and states
+        seed = arg_meta_info["seed"]
+        torch.cuda.manual_seed_all(seed)
+        random.seed(seed)
+        np.random.seed(seed)
 
-    with open(checkpoint_dir / "meta_info.json", "w") as f:
-        json.dump(arg_meta_info, f, default=_json_default_paths)
+        with open(checkpoint_dir / "meta_info.json", "w") as f:
+            json.dump(arg_meta_info, f, default=_json_default_paths)
 
     return arg_meta_info, logger
 
@@ -823,7 +823,8 @@ def main(
                 arguments=all_arguments,
             ),
         )
-        wandb.run.log_code(SCRIPT_DIR)
+        if global_rank == 0:
+            wandb.run.log_code(SCRIPT_DIR)
     else:
         rich.print("\n[bold green]Not Resuming: Setting the initial state.")
         meta_info, logger = _set_initial_state(checkpoints_folder, arg_meta_info, global_rank)
