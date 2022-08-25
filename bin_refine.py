@@ -168,7 +168,7 @@ class _RefineLM(pl.LightningModule):
         # Generate Scratchpads
         batch = {k: v for k, v in batch.items() if k in ["input_ids", "attention_mask"]}
         # TODO: Not sure about the options in these
-        outputs = self._model.group_beam_search(
+        outputs = self._model.generate(
             **batch, 
             **self._generation_kwargs[mode],
         )
@@ -225,9 +225,8 @@ class _RefineLM(pl.LightningModule):
                 rich.print(f"reference: {ref}")
 
         accuracy = np.mean([gen == l for gen, l in zip(generated_decoded, label)])
-        rich.print(f"\nAccuracy {accuracy: 0.2%}\n", accuracy)
-        
         ppl_outputs = self._model(**{k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]})
+
         self.log("val_em", accuracy, batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[mode], **self._logging_conf)
 
@@ -235,6 +234,9 @@ class _RefineLM(pl.LightningModule):
 
 
     def on_validation_epoch_end(self) -> None:
+        pass
+
+    def on_train_epoch_end(self) -> None:
         pass
 
 
@@ -292,14 +294,12 @@ def clean_for_accuracy_computation(text, tokenizer):
 
 
 
-def _get_last_checkpoint_path(checkpoints_folder, wandb_run_id: Optional[str]) -> Optional[Path]:
+def _get_last_checkpoint_path(checkpoints_folder, run_name: str, wandb_run_id: Optional[str]) -> Optional[Path]:
     if wandb_run_id is None:
         return None
 
     rich.print(f"[red bold]{wandb_run_id = }")
-    checkpoint_files = list(checkpoints_folder.glob("**/*.ckpt"))
-    assert len(checkpoint_files) == 1, checkpoint_files
-    checkpoints = list((checkpoints_folder / WANDB_PROJECT / wandb_run_id / "checkpoints").glob("*.ckpt"))
+    checkpoints = list((checkpoints_folder / run_name / wandb_run_id / "checkpoints").glob("*.ckpt"))
     
     if not checkpoints:
         return None
@@ -339,28 +339,30 @@ def _set_resumed_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str
             assert arg_val is None, arg_val
     
     # We should have no remaining keys
-    assert not arg_meta_info, arg_meta_info
+    # assert not arg_meta_info, arg_meta_info
 
     # Load the variables
     wandb_run_id = meta_info["wandb_run_id"]
     seed = meta_info["seed"]
-    torch_rng_state = meta_info["torch_rng_state"]
-    numpy_rng_state = meta_info["numpy_rng_state"]
-    python_rng_state = meta_info["python_rng_state"]
-    # run_name = meta_info["run_name"]
-    # transformers_model_name = meta_info["transformers_model_name"]
 
-    # Deal with random seeds and states
-    torch.cuda.manual_seed_all(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.random.set_rng_state(torch.ByteTensor(torch_rng_state))
-    np.random.set_state(numpy_rng_state)
-    for i, v in enumerate(python_rng_state):
-        if isinstance(v, list):
-            python_rng_state[i] = tuple(
-                python_rng_state[i])
-    random.setstate(tuple(python_rng_state))
+    # TODO: save the random states
+    # torch_rng_state = meta_info["torch_rng_state"]
+    # numpy_rng_state = meta_info["numpy_rng_state"]
+    # python_rng_state = meta_info["python_rng_state"]
+    # # run_name = meta_info["run_name"]
+    # # transformers_model_name = meta_info["transformers_model_name"]
+
+    # # Deal with random seeds and states
+    # torch.cuda.manual_seed_all(seed)
+    # random.seed(seed)
+    # np.random.seed(seed)
+    # torch.random.set_rng_state(torch.ByteTensor(torch_rng_state))
+    # np.random.set_state(numpy_rng_state)
+    # for i, v in enumerate(python_rng_state):
+    #     if isinstance(v, list):
+    #         python_rng_state[i] = tuple(
+    #             python_rng_state[i])
+    # random.setstate(tuple(python_rng_state))
 
     # Resume the wandb run
     rich.print("\n[red bold]Resuming Wandb run:", wandb_run_id)
@@ -699,7 +701,7 @@ CHECKPOINTS_DIR = SCRIPT_DIR / "checkpoints"
 
 def main(
     *, 
-    wandb_run_id: Optional[str] = None,
+    wandb_run_id: Optional[str] = "qkn87wqv",
     seed: int = 453345,
     checkpoints_folder: Union[Path, str] = CHECKPOINTS_DIR,
     dataset_path: Union[Path, str] = DATA_DIR / "basic_arithmetic/80_3_6_200000",
@@ -716,7 +718,13 @@ def main(
     switch_to_maginal_after=False,
     generation_kwargs={
         constants.PipelineModes.VALIDATION.value: {"max_length": 80,},
-        constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value: {"max_length": 80, "num_beams": 4},
+        constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value: dict(
+            num_beams=5, 
+            num_beam_groups=5,
+            num_return_sequences=5, 
+            max_length=100,
+            diversity_penalty=0.25,
+        ),
     },
     distribute_strategy=None,
 ):
@@ -731,7 +739,8 @@ def main(
     assert checkpoints_folder.is_dir(), checkpoints_folder
 
     torch.use_deterministic_algorithms(mode=DETERMINISTIC)
-    latest_checkpoint = _get_last_checkpoint_path(checkpoints_folder, wandb_run_id)
+    run_name = dataset_path.name
+    latest_checkpoint = _get_last_checkpoint_path(checkpoints_folder, run_name, wandb_run_id)
     resuming = latest_checkpoint is not None
     if resuming:
         rich.print(f"[bold red] Will resume from \"{latest_checkpoint}\"")
@@ -747,7 +756,7 @@ def main(
         learning_rate=learning_rate,
         max_epochs=max_epochs,
         path_log_results=path_log_results,
-        run_name=dataset_path.name,
+        run_name=run_name,
         scheduler_kwargs=scheduler_kwargs,
         scheduler_type=scheduler_type,
         seed=seed, 
@@ -764,7 +773,7 @@ def main(
     rich.print(f"Loaded model in {time.perf_counter() - start:.2f}s")
 
     if resuming:
-        rich.print("\n[bold red]Resuming from checkpoint:[/bold]", latest_checkpoint)
+        rich.print("\n[bold red]Resuming from checkpoint:[/]", latest_checkpoint)
         meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info)
         logger = pl.loggers.WandbLogger(
         project=WANDB_PROJECT,
