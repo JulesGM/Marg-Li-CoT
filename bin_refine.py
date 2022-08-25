@@ -332,7 +332,7 @@ def _json_default_paths(entry: Any):
     return entry
 
 
-def _set_resumed_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str, Any]) -> dict[str, Any]:
+def _set_resumed_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str, Any], global_rank: int) -> dict[str, Any]:
     """Resumes things that are in the global state, ie. the wandb run and the random seeds and states.
     """
     checkpoint_dir = Path(checkpoint_dir)
@@ -382,15 +382,17 @@ def _set_resumed_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str
 
     # Resume the wandb run
     rich.print("\n[red bold]Resuming Wandb run:", wandb_run_id)
-    wandb.init(project=WANDB_PROJECT, resume="must", id=wandb_run_id)
-    assert wandb.run.resumed, wandb.run.resumed
-    assert wandb.run.project == WANDB_PROJECT, (wandb.run.project, WANDB_PROJECT)
-    assert wandb.run.id == wandb_run_id, (wandb.run.id, wandb_run_id)
+
+    if global_rank == 0:
+        wandb.init(project=WANDB_PROJECT, resume="must", id=wandb_run_id)
+        assert wandb.run.resumed, wandb.run.resumed
+        assert wandb.run.project == WANDB_PROJECT, (wandb.run.project, WANDB_PROJECT)
+        assert wandb.run.id == wandb_run_id, (wandb.run.id, wandb_run_id)
 
     return meta_info
 
 
-def _set_initial_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str, Any]) -> tuple[dict[str, Any], pl.loggers.WandbLogger]:
+def _set_initial_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str, Any], global_rank: int) -> tuple[dict[str, Any], pl.loggers.WandbLogger]:
     """Sets the initial state of the global state, ie. the wandb run and the random seeds and states.
     """
     checkpoint_dir = Path(checkpoint_dir)
@@ -409,7 +411,8 @@ def _set_initial_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str
         ),
     )
 
-    wandb.run.log_code(SCRIPT_DIR)
+    if global_rank == 0:
+        wandb.run.log_code(SCRIPT_DIR)
     arg_meta_info["wandb_run_id"] = wandb.run.id
 
     # Deal with random seeds and states
@@ -767,12 +770,14 @@ def main(
         assert distribute_strategy == "ddp", "Only ddp is supported for now."
         num_nodes = int(os.environ["SLURM_JOB_NUM_NODES"])
         num_devices = int(os.environ["SLURM_NTASKS_PER_NODE"])
+        global_rank = int(os.environ["SLURM_PROCID"])
         rich.print("[bold green]Distributed Data Parallel (DDP) enabled.")
         rich.print(f"[bold green]\t- NUM_NODES:   {num_nodes}")
         rich.print(f"[bold green]\t- NUM_DEVICES: {num_devices}")
     else:
         num_nodes = None
         num_devices = None
+        global_rank = 0
 
 
     arg_meta_info = _build_meta_info(
@@ -804,7 +809,7 @@ def main(
 
     if resuming:
         rich.print("\n[bold red]Resuming from checkpoint:[/]", latest_checkpoint)
-        meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info)
+        meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, global_rank)
         logger = pl.loggers.WandbLogger(
         project=WANDB_PROJECT,
             name=meta_info["run_name"],
@@ -821,7 +826,7 @@ def main(
         wandb.run.log_code(SCRIPT_DIR)
     else:
         rich.print("\n[bold green]Not Resuming: Setting the initial state.")
-        meta_info, logger = _set_initial_state(checkpoints_folder, arg_meta_info)
+        meta_info, logger = _set_initial_state(checkpoints_folder, arg_meta_info, global_rank)
 
     rich.print(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"\n")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
