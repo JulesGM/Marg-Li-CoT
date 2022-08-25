@@ -53,11 +53,8 @@ LIMIT_VAL_BATCHES = 50
 LIMIT_TRAIN_BATCHES = None
 SHUFFLE_TRAINING_DATA = True
 SHUFFLE_VALIDATION_DATA = True
-DEFAULT_BATCH_SIZES = {
-    constants.PipelineModes.MLE_TRAINING: 256, 
-    constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 256, 
-    constants.PipelineModes.VALIDATION: 256
-}  #384
+
+
 DATALOADER_NUM_WORKERS = 0 # int(os.environ.get("SLURM_CPUS_PER_TASK", 6)) - 1
 
 
@@ -725,7 +722,6 @@ def main(
     dataset_path: Union[Path, str] = DATA_DIR / "basic_arithmetic/80_3_6_200000",
     # dataset_path: Union[Path, str] = DATA_DIR / "basic_arithmetic/349_6_6_200000",
     transformers_model_name: str = "distilgpt2",
-    batch_sizes = DEFAULT_BATCH_SIZES,
     learning_rate = 1e-3,
     is_adamw = True,
     weight_decay=0.1,
@@ -745,6 +741,7 @@ def main(
         ),
     },
     distribute_strategy=None,
+    batch_size=None,
 ):
     all_arguments = locals().copy()
     utils.check_and_print_args(all_arguments, main)
@@ -771,6 +768,7 @@ def main(
         num_nodes = int(os.environ["SLURM_JOB_NUM_NODES"])
         num_devices = int(os.environ["SLURM_NTASKS_PER_NODE"])
         global_rank = int(os.environ["SLURM_PROCID"])
+        local_rank = int(os.environ["SLURM_LOCALID"])
         rich.print("[bold green]Distributed Data Parallel (DDP) enabled.")
         rich.print(f"[bold green]\t- NUM_NODES:   {num_nodes}")
         rich.print(f"[bold green]\t- NUM_DEVICES: {num_devices}")
@@ -778,7 +776,25 @@ def main(
         num_nodes = None
         num_devices = None
         global_rank = 0
+        local_rank = 0
 
+
+    gpu_mem_gb = torch.cuda.get_device_properties(local_rank).total_memory / 1024 **3
+
+    if batch_sizes is None and transformers_model_name == "distilgpt2" and gpu_mem_gb > 44:
+        batch_sizes = {
+            constants.PipelineModes.MLE_TRAINING: 256, 
+            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 256, 
+            constants.PipelineModes.VALIDATION: 256
+        }  #384
+    elif batch_sizes is None and transformers_model_name == "distilgpt2" and gpu_mem_gb > 14:
+        batch_sizes = {
+            constants.PipelineModes.MLE_TRAINING: 128, 
+            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 128, 
+            constants.PipelineModes.VALIDATION: 128
+        }
+    else:
+        raise ValueError("We don't know what batch size to use for this GPU.")
 
     arg_meta_info = _build_meta_info(
         batch_sizes=batch_sizes,
