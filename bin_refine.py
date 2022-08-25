@@ -762,6 +762,19 @@ def main(
     else:
         rich.print(f"[bold green]Not resuming: Will start from scratch.")
     
+
+    if distribute_strategy is not None:
+        assert distribute_strategy == "ddp", "Only ddp is supported for now."
+        num_nodes = int(os.environ["SLURM_JOB_NUM_NODES"])
+        num_devices = int(os.environ["SLURM_TASKS_PER_NODE"])
+        rich.print("[bold green]Distributed Data Parallel (DDP) enabled.")
+        rich.print(f"[bold green]\t- NUM_NODES:   {num_nodes}")
+        rich.print(f"[bold green]\t- NUM_DEVICES: {num_devices}")
+    else:
+        num_nodes = None
+        num_devices = None
+
+
     arg_meta_info = _build_meta_info(
         batch_sizes=batch_sizes,
         checkpoints_folder=checkpoints_folder,
@@ -778,6 +791,8 @@ def main(
         transformers_model_name=transformers_model_name,
         wandb_run_id=wandb_run_id,
         weight_decay=weight_decay,
+        num_devices=num_devices,
+        num_nodes=num_nodes,
     )
     
     # Load the pretrained model. If a checkpoint is used, it will be loaded with the trainer.fit call, further in the code.
@@ -795,6 +810,8 @@ def main(
             name=meta_info["run_name"],
             entity=WANDB_ENTITY,
             log_model=False,
+            num_devices=num_devices,
+            num_nodes=num_nodes,
             config=dict(
                 meta_info=meta_info,
                 precision=PRECISION,
@@ -831,17 +848,6 @@ def main(
         scheduler_type=meta_info["scheduler_type"],
         scheduler_kwargs=meta_info["scheduler_kwargs"],
     )
-
-    if distribute_strategy is not None:
-        assert distribute_strategy == "ddp", "Only ddp is supported for now."
-        num_nodes = int(os.environ["SLURM_JOB_NUM_NODES"])
-        num_devices = int(os.environ["SLURM_NTASKS_PER_NODE"])
-        rich.print("[bold green]Distributed Data Parallel (DDP) enabled.")
-        rich.print("[bold green]\t- NUM_NODES:   {num_nodes}")
-        rich.print("[bold green]\t- NUM_DEVICES: {num_devices}")
-    else:
-        num_nodes = None
-        num_devices = None
 
 
     trainer = pl.Trainer(
