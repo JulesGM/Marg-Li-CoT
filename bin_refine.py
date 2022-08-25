@@ -89,7 +89,7 @@ class _RefineLM(pl.LightningModule):
         self._batch_size: Final[dict[str, int]] = batch_sizes
         self._generation_kwargs: Final[dict[str, Any]] = generation_kwargs
         self._logging_conf: Final[dict[str, bool]] = dict(
-            prog_bar=True, on_step=True, on_epoch=True, logger=True
+            prog_bar=True, on_step=True, on_epoch=True, logger=True, sync_dist=True
         )
 
         ################################################################################
@@ -166,7 +166,8 @@ class _RefineLM(pl.LightningModule):
         utils.check_equal(self._active_training_mode, mode)
 
         # Generate Scratchpads
-        batch = {k: v for k, v in batch.items() if k in ["input_ids", "attention_mask"]}
+        batch = {k: batch[k] for k in ["input_ids", "attention_mask"]}
+
         # TODO: Not sure about the options in these
         outputs = self._model.generate(
             **batch, 
@@ -181,12 +182,17 @@ class _RefineLM(pl.LightningModule):
 
         ## Concatenate final value
         # [input, generated_scratchpad, answer]
-        z_knowing_x_val, z_knowing_x_mask = unpadded_concatenation([batch["input_ids"], outputs], self._tokenizer.pad_token_id)
+        z_knowing_x_val, z_knowing_x_mask = unpadded_concatenation(
+            [batch["input_ids"], outputs], 
+            self._tokenizer.pad_token_id
+        )
         
 
         label_mask = torch.ones_like(z_knowing_x_mask) * -100
         assert label_mask.dtype == torch.long, label_mask.dtype
-        y_knowing_x_z_val, y_knowing_x_z_mask = unpadded_concatenation([label_mask, batch["value"]], -100)
+        y_knowing_x_z_val, y_knowing_x_z_mask = unpadded_concatenation(
+            [label_mask, batch["value"]], -100
+        )
         
         # Compute loss
         prob = self._model(input_ids=y_knowing_x_z_val)
@@ -207,6 +213,17 @@ class _RefineLM(pl.LightningModule):
         assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
         mode: Final = constants.PipelineModes.VALIDATION.value
 
+        """
+
+        for i, a in enumerate(batch["generation_input_ids"][0]):
+            print(f"{i} `{self._tokenizer.decode(a)}`")
+        
+        
+        for i, (a, b) in enumerate(zip(batch["input_ids"][0], batch["labels"][0])):
+            print(f"{i} `{self._tokenizer.decode(a)}` `{self._tokenizer.decode(b) if b != -100 else -100}`")
+
+        """
+
         generation_inputs = batch["generation_input_ids"]
         generation_attention_mask = batch["generation_attention_mask"]
 
@@ -225,7 +242,7 @@ class _RefineLM(pl.LightningModule):
                 rich.print(f"reference: {ref}")
 
         accuracy = np.mean([gen == l for gen, l in zip(generated_decoded, label)])
-        ppl_outputs = self._model(**{k: v for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]})
+        ppl_outputs = self._model(**{k: batch[k]for k in ["input_ids", "attention_mask", "labels"]})
 
         self.log("val_em", accuracy, batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[mode], **self._logging_conf)
