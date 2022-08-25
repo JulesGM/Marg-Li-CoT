@@ -741,7 +741,7 @@ def main(
         ),
     },
     distribute_strategy=None,
-    batch_size=None,
+    batch_sizes=None,
 ):
     all_arguments = locals().copy()
     utils.check_and_print_args(all_arguments, main)
