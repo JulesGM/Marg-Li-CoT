@@ -9,6 +9,7 @@ import collections
 import dataclasses
 import enum
 import itertools
+import json  # type: ignore[import]
 import logging
 import math
 from pathlib import Path
@@ -19,7 +20,6 @@ import time
 from beartype import beartype
 import h5py  # type: ignore[import]
 import fire  # type: ignore[import]
-import json  # type: ignore[import]
 import jsonlines as jsonl  # type: ignore
 import more_itertools
 import numpy as np
@@ -766,7 +766,7 @@ def main(
     if distribute_strategy is not None:
         assert distribute_strategy == "ddp", "Only ddp is supported for now."
         num_nodes = int(os.environ["SLURM_JOB_NUM_NODES"])
-        num_devices = int(os.environ["SLURM_TASKS_PER_NODE"])
+        num_devices = int(os.environ["SLURM_NTASKS_PER_NODE"])
         rich.print("[bold green]Distributed Data Parallel (DDP) enabled.")
         rich.print(f"[bold green]\t- NUM_NODES:   {num_nodes}")
         rich.print(f"[bold green]\t- NUM_DEVICES: {num_devices}")
