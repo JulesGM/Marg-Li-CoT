@@ -48,7 +48,6 @@ WANDB_PROJECT = "SAG"
 PRECISION = 16
 DATA_PATH = SCRIPT_DIR / "data"
 DETERMINISTIC = True
-NUM_GPUS = torch.cuda.device_count()
 EVAL_EVERY_N_EPOCHS = 1
 LIMIT_VAL_BATCHES = 50
 LIMIT_TRAIN_BATCHES = None
@@ -405,7 +404,6 @@ def _set_initial_state(checkpoint_dir: Union[Path, str], arg_meta_info: dict[str
         config=dict(
             meta_info=arg_meta_info,
             accelerator="gpu",
-            devices=NUM_GPUS,
             precision=PRECISION,
             arguments=arg_meta_info,
         ),
@@ -799,7 +797,6 @@ def main(
             log_model=False,
             config=dict(
                 meta_info=meta_info,
-                num_gpus=NUM_GPUS,
                 precision=PRECISION,
                 arguments=all_arguments,
             ),
@@ -835,6 +832,18 @@ def main(
         scheduler_kwargs=meta_info["scheduler_kwargs"],
     )
 
+    if distribute_strategy is not None:
+        assert distribute_strategy == "ddp", "Only ddp is supported for now."
+        num_nodes = int(os.environ["SLURM_JOB_NUM_NODES"])
+        num_devices = int(os.environ["SLURM_NTASKS_PER_NODE"])
+        rich.print("[bold green]Distributed Data Parallel (DDP) enabled.")
+        rich.print("[bold green]\t- NUM_NODES:   {num_nodes}")
+        rich.print("[bold green]\t- NUM_DEVICES: {num_devices}")
+    else:
+        num_nodes = None
+        num_devices = None
+
+
     trainer = pl.Trainer(
         enable_checkpointing=pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
             dirpath=checkpoints_folder,
@@ -854,6 +863,8 @@ def main(
         limit_val_batches=LIMIT_VAL_BATCHES,
         limit_train_batches=LIMIT_TRAIN_BATCHES,
         strategy=distribute_strategy,
+        num_nodes=num_nodes,
+        devices=num_devices,
     )
     
     if resuming:
