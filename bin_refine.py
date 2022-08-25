@@ -789,9 +789,9 @@ def main(
         }  #384
     elif batch_sizes is None and transformers_model_name == "distilgpt2" and gpu_mem_gb > 14:
         batch_sizes = {
-            constants.PipelineModes.MLE_TRAINING: 128, 
-            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 128, 
-            constants.PipelineModes.VALIDATION: 128
+            constants.PipelineModes.MLE_TRAINING: 96, 
+            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 96, 
+            constants.PipelineModes.VALIDATION: 96
         }
     else:
         raise ValueError("We don't know what batch size to use for this GPU.")
