@@ -55,7 +55,7 @@ SHUFFLE_TRAINING_DATA = True
 SHUFFLE_VALIDATION_DATA = True
 
 
-DATALOADER_NUM_WORKERS = 0 # int(os.environ.get("SLURM_CPUS_PER_TASK", 6)) - 1
+DATALOADER_NUM_WORKERS = 1 # int(os.environ.get("SLURM_CPUS_PER_TASK", 6)) - 1
 
 
 class _RefineLM(pl.LightningModule):
@@ -435,7 +435,7 @@ class DataModes(str, enum.Enum):
 
 def semi_vectorized_masked_2d_to_lol(array: np.ndarray, mask: np.ndarray) -> List[List[Any]]:
     if isinstance(mask, np.ndarray):
-        assert mask.dtype == np.bool, mask.dtype
+        assert mask.dtype == bool, mask.dtype
     elif isinstance(mask, torch.Tensor):
         assert mask.dtype == torch.bool, mask.dtype
     else:
@@ -704,7 +704,7 @@ def _text_mode_build_dataset(dataset_path, tokenizer):
 
     for pipeline_mode, keys in key_filter.items():
         dataset_mode = constants.PIPELINES_MODES_TO_CV_SETS[pipeline_mode]
-        columns = {k: tokenized_data[dataset_mode][k] for k in keys}
+        columns = {k: tokenized_data[dataset_mode][k][:] for k in keys}
         output_datasets[pipeline_mode] = DictDataset(columns)
 
     return output_datasets
@@ -761,7 +761,6 @@ def main(
         rich.print(f"[bold red] Will resume from \"{latest_checkpoint}\"")
     else:
         rich.print(f"[bold green]Not resuming: Will start from scratch.")
-    
 
     if distribute_strategy is not None:
         assert distribute_strategy == "ddp", "Only ddp is supported for now."
@@ -778,21 +777,23 @@ def main(
         global_rank = 0
         local_rank = 0
 
-
-    gpu_mem_gb = torch.cuda.get_device_properties(local_rank).total_memory / 1024 **3
+    gpu_mem_gb = torch.cuda.get_device_properties(local_rank).total_memory / 1024 ** 3
 
     if batch_sizes is None and transformers_model_name == "distilgpt2" and gpu_mem_gb > 44:
+        base = 256 + 32
         batch_sizes = {
-            constants.PipelineModes.MLE_TRAINING: 256, 
-            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 256, 
-            constants.PipelineModes.VALIDATION: 256
+            constants.PipelineModes.MLE_TRAINING: base,
+            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: base,
+            constants.PipelineModes.VALIDATION: base,
         }  #384
+
     elif batch_sizes is None and transformers_model_name == "distilgpt2" and gpu_mem_gb > 14:
         batch_sizes = {
             constants.PipelineModes.MLE_TRAINING: 80, 
             constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 80, 
             constants.PipelineModes.VALIDATION: 80,
         }
+
     else:
         raise ValueError("We don't know what batch size to use for this GPU.")
 
@@ -861,7 +862,7 @@ def main(
         model=random_model,
         tokenizer=tokenizer,
         datasets=datasets,
-        batch_sizes=meta_info["batch_sizes"],
+        batch_sizes=batch_sizes, #meta_info["batch_sizes"],
         generation_kwargs=meta_info["generation_kwargs"],
         learning_rate=meta_info["learning_rate"],
         path_log_results=meta_info["path_log_results"],
