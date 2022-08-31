@@ -1,3 +1,4 @@
+import collections
 import enum
 
 
@@ -20,8 +21,12 @@ class CVSets(str, enum.Enum):
 
 
 PIPELINES_MODES_TO_CV_SETS = {
-    PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: CVSets.TRAINING,
+    PipelineModes.MARGINAL_LIKELIHOOD_TRAINING.value: CVSets.TRAINING,
     PipelineModes.MLE_TRAINING: CVSets.TRAINING,
     PipelineModes.VALIDATION: CVSets.VALIDATION,
     PipelineModes.TEST: CVSets.TEST,
 }
+
+CV_SETS_TO_PILELINES_MODES = collections.defaultdict(set)
+for k, v in PIPELINES_MODES_TO_CV_SETS.items():
+    CV_SETS_TO_PILELINES_MODES[v].add(k)

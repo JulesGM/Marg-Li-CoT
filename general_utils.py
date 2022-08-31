@@ -4,6 +4,7 @@ import h5py  # type: ignore[import]
 import functools
 import inspect
 import itertools
+import json
 import math
 from pathlib import Path
 import subprocess
@@ -25,21 +26,35 @@ def check_equal(a, b):
     assert a == b, f"{a} != {b}"
 
 
-def check_and_print_args(all_arguments, function):
-    check_args(all_arguments, function)
+def check_and_print_args(all_arguments, function, has_classmethod_cls=False):
+    check_args(all_arguments, function, has_classmethod_cls)
     rich.print("[bold]Arguments:")
     print_dict(all_arguments)
     print()
 
 
-def check_args(all_arguments, function):
-    # We get the arguments by calling `locals`. This makes sure that we
-    # really called locals at the very beginning of the function, otherwise
-    # we have supplementary keys.
-    assert all_arguments.keys() == inspect.signature(function).parameters.keys(), (
+def check_args(all_arguments, function, has_classmethod_cls=False):
+    """
+    We get the arguments by calling `locals`. This makes sure that we
+    really called locals at the very beginning of the function, otherwise
+    we have supplementary keys.
+
+    There is a weird edge-case that classmethods' `cls` argument is
+    not returned by inspect.signature, so we have to add it.
+    """
+
+    inspect_args = set(inspect.signature(function).parameters.keys())
+    if has_classmethod_cls:
+        if isinstance(has_classmethod_cls, str):
+            inspect_args.add(has_classmethod_cls)
+        else:
+            inspect_args.add("cls")
+
+    assert (all_arguments.keys() == inspect_args), (
         f"\n{sorted(all_arguments.keys())} != "
         f"{sorted(inspect.signature(function).parameters.keys())}"
     )
+
 
 @beartype
 def shorten_path(path: Union[Path, str]) -> str:
@@ -118,6 +133,24 @@ def dict_unzip(list_of_dicts: list[dict[Any, Any]], key_subset=None) -> dict[Any
 
     return dict_of_lists
 
+
+def read_json(path: Path) -> dict:
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+load_json = read_json
+
+
+def write_json(data: dict, path: Path, exists_ok=True, **kwargs) -> None:
+    if not exists_ok and path.exists():
+        raise FileExistsError(f"{path} already exists")
+
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4, **kwargs)
+
+
+dump_json = write_json
 
 
 def clean_locals(locals_, no_modules=True, no_classes=True, no_functions=True, no_caps=True):
