@@ -30,3 +30,7 @@ PIPELINES_MODES_TO_CV_SETS = {
 CV_SETS_TO_PILELINES_MODES = collections.defaultdict(set)
 for k, v in PIPELINES_MODES_TO_CV_SETS.items():
     CV_SETS_TO_PILELINES_MODES[v].add(k)
+
+class DataModes(str, enum.Enum):
+    JSONL = "jsonl"
+    HDF5_PRETOK = "hdf5_pretok"

@@ -141,6 +141,15 @@ def read_json(path: Path) -> dict:
 
 load_json = read_json
 
+def setattr_must_exist(obj, key, value):
+    assert hasattr(obj, key), f"Key `{key}` does not exist."
+    setattr(obj, key, value)
+
+
+def dict_assign_must_exist(d, key, value):
+    assert key in d, f"Key `{key}` does not exist."
+    d[key] = value
+
 
 def write_json(data: dict, path: Path, exists_ok=True, **kwargs) -> None:
     if not exists_ok and path.exists():

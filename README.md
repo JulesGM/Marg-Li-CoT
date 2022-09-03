@@ -16,3 +16,10 @@
     - Will work on step 2 or step 3.
             - Step 2 isn't anything. 
             - Step 3: similar, different schedule etc.
+
+# Jules: 
+    WTF is happening: 
+    ---> The inputs and outputs seem ok
+    ---> The outputs seem long
+    ---> Doesn't understand parenthesises at all
+    ---> Does the model automatically delay the inputs?
