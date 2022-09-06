@@ -51,13 +51,13 @@ class TokenizerModes(str, enum.Enum):
 ACCELERATOR = "cuda"
 DEFAULT_WANDB_ID = None  # "336o97pe"
 DEFAULT_LEARNING_RATE = 0.001
-DEFAULT_DISTRIBUTE_STRATEGIES = None # "ddp_find_unused_parameters_false"  # "ddp"
-DATA_MODE = constants.DataModes.JSONL
-TOKENIZER_MODE =  TokenizerModes.PRETRAINED
+DEFAULT_DISTRIBUTE_STRATEGIES = "ddp_find_unused_parameters_false"  # "ddp"
+DATA_MODE = constants.DataModes.HDF5_PRETOK # constants.DataModes.JSONL
+TOKENIZER_MODE = TokenizerModes.PRETRAINED
 CUSTOM_MODEL_CONFIG = dict(
     n_embd=64,
     hidden_size=64,
-    num_hidden_layers=2,
+    num_hidden_layers=4,
     num_attention_heads=4,
 )
 DEFAULT_GENERATION_KWARGS = {
@@ -105,6 +105,7 @@ DEFAULT_CHECKPOINTS_DIR = SCRIPT_DIR / "checkpoints"
 # Gradients and optimization
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 GRADIENT_CLIP_VAL = 0.1
+GRADIENT_CLIP_ALGORITHM = "value"
 DEFAULT_WEIGHT_DECAY = 0
 DEFAULT_USE_ADAMW = False
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -120,8 +121,8 @@ DATA_PATH = SCRIPT_DIR / "data"
 PRECISION = 16
 DEFAULT_HUGGING_FACE = "distilgpt2"
 
-def _print_predictions(*, inputs, masks, generated_decoded, labels):
-    for in_, mask, gen, ref in zip(inputs, masks, generated_decoded, labels):
+def _print_predictions(*, inputs, masks, generated_decoded, labels, all_generated, all_labels):
+    for in_, mask, gen, ref, all_g, all_l in zip(inputs, masks, generated_decoded, labels, all_generated, all_labels):
         if gen == ref:
             color == "green"
         else:
@@ -130,6 +131,8 @@ def _print_predictions(*, inputs, masks, generated_decoded, labels):
         rich.print(f"[bold {color}]\[gen-mask][/] {mask}")
         rich.print(f"[bold blue]\[gen-reference][/] {ref}")
         rich.print(f"[bold {color}]\[gen-generated][/] {gen}")
+        rich.print(f"[bold]\[gen-all-labels] {all_l}")
+        rich.print(f"[bold]\[gen-all-gen] {all_g}")
         rich.print(f"[bold]" + "=" * 80)
 
 
@@ -227,7 +230,7 @@ class _RefineLM(pl.LightningModule):
                 sent_masks = []
                 for input_, mask_ in zip(input_entry, mask_entry):
                     sent_masks.append((
-                        self._tokenizer.decode([input_.item()], ignore_special_symbols=False), 
+                        self._tokenizer.decode([input_.item()], skip_special_tokens=False), 
                         mask_.item()
                     ))
                 all_masks.append(sent_masks)
@@ -237,8 +240,8 @@ class _RefineLM(pl.LightningModule):
                 sent_labels = []
                 for input_, label in zip(input_entry, label_entry):
                     sent_labels.append((
-                        self._tokenizer.decode([input_.item()], ignore_special_symbols=False), 
-                        self._tokenizer.decode([label.item()], ignore_special_symbols=False) if label.item() != -100 else "-100", 
+                        self._tokenizer.decode([input_.item()], skip_special_tokens=False), 
+                        self._tokenizer.decode([label.item()], skip_special_tokens=False) if label.item() != -100 else "-100", 
                     ))
                 all_labels.append(sent_labels)
             print("asdasd")
@@ -337,24 +340,41 @@ class _RefineLM(pl.LightningModule):
         )
         
         generated_decoded = [
-            self._tokenizer.decode(x, ignore_special_symbols=False)
+            self._tokenizer.decode(x, skip_special_tokens=False)
             for x in outputs]
-        label = [
-            self._tokenizer.decode(x, ignore_special_symbols=False)
+        output_label = [
+            self._tokenizer.decode(x, skip_special_tokens=False)
             for x in batch["input_and_scratchpad_with_value"]]
         inputs = [
-            self._tokenizer.decode(x, ignore_special_symbols=False)
+            self._tokenizer.decode(x, skip_special_tokens=False)
             for x in generation_inputs
         ]
 
         all_masks = []
-        for mask_entry, input_entry in zip(batch["generation_attention_mask"], generation_inputs):
+        for mask_entry, input_entry in zip(batch["generation_attention_mask"], generation_inputs, ):
             partial = []
             for mask, input_ in zip(mask_entry, input_entry.tolist()):
-                partial.append((mask.item(), self._tokenizer.decode([input_], ignore_special_symbols=False)))
+                partial.append((mask.item(), self._tokenizer.decode([input_], skip_special_tokens=False)))
             all_masks.append(partial)
 
-        return inputs, all_masks, generated_decoded, label
+        all_labels = []
+        for label_entry, input_entry in itertools.zip_longest(batch["labels"], generation_inputs, fillvalue="<FILL_VALUE>"):
+            partial = []
+            for label in label_entry.tolist():
+                decoded_label = self._tokenizer.decode([label], skip_special_tokens=False) if label > 0 else "<-100>"
+                partial.append(decoded_label)
+            all_labels.append(partial)
+
+        all_generated = []
+        for label_entry, gen_entry in itertools.zip_longest(batch["labels"], outputs, fillvalue="<FILL_VALUE>"):
+            partial = []
+            for label, gen_ in zip(label_entry.tolist(), gen_entry.tolist()):
+                decoded_label = self._tokenizer.decode([label], skip_special_tokens=False) if label > 0 else "<-100>"
+                decoded_gen = self._tokenizer.decode([gen_], skip_special_tokens=False)
+                partial.append((decoded_label, decoded_gen))
+            all_generated.append(partial)
+
+        return inputs, all_masks, generated_decoded, output_label, all_generated, all_labels
 
 
     def validation_step(self, batch: Dict[str, torch.LongTensor], batch_idx):  # type: ignore[override]
@@ -363,9 +383,12 @@ class _RefineLM(pl.LightningModule):
         )
         mode: Final[str] = constants.PipelineModes.VALIDATION
 
-        inputs, masks, generated_decoded, labels = self._generate(batch, self._generation_kwargs[mode])
+        inputs, masks, generated_decoded, labels, all_generated, all_labels = self._generate(batch, self._generation_kwargs[mode])
         # if batch_idx == 0:
-        #     _print_predictions(inputs=inputs, masks=masks, generated_decoded=generated_decoded, labels=labels)
+        #     _print_predictions(
+        #         inputs=inputs, masks=masks, generated_decoded=generated_decoded, 
+        #         labels=labels, all_generated=all_generated, all_labels=all_labels,
+        #     )
             
         #     ###################################################################
         #     # Log Generated Text in Wandb.
@@ -384,7 +407,7 @@ class _RefineLM(pl.LightningModule):
         #     ###################################################################
 
         for_comparison = [(_clean_for_accuracy_computation(gen, self._tokenizer), _clean_for_accuracy_computation(l, self._tokenizer)) for gen, l in zip(generated_decoded, labels)]
-        if batch_idx == 0:
+        if batch_idx == 0 and os.environ["SLURM_PROCID"] == "0":
             for gen, ref in for_comparison:
                 rich.print(f"[bold yellow]\[ref] {ref}")
                 rich.print(f"[bold blue]\[gen] {gen}")
@@ -485,7 +508,7 @@ def unpadded_concatenation(tensors, pad_token_id):
 
 
 def _clean_for_accuracy_computation(text, tokenizer):
-    return text.replace(tokenizer.eos_token, "").strip()
+    return re.sub(r"\s+", " ", text.replace(tokenizer.eos_token, "").strip())
 
 
 @dataclasses.dataclass
@@ -1066,13 +1089,15 @@ def _setup_base_model(
     assert config.n_inner is None, config.n_inner
 
     base_model = transformers.AutoModelForCausalLM.from_config(config)
+    utils.setattr_must_exist(base_model.config, "early_stopping", True)
 
-    if base_model.config.model_type == "gpt2" and isinstance(tokenizer, (transformers.PreTrainedTokenizer, transformers.PreTrainedTokenizerFast)):
-        assert TOKENIZER_MODE == TokenizerModes.PRETRAINED
+    if base_model.config.model_type == "gpt2" and isinstance(
+        tokenizer, (transformers.PreTrainedTokenizer, transformers.PreTrainedTokenizerFast)):
+        utils.check_equal(TOKENIZER_MODE, TokenizerModes.PRETRAINED)
         utils.setattr_must_exist(base_model.config, "pad_token_id", base_model.config.eos_token_id)
     else:
-        assert TOKENIZER_MODE == TokenizerModes.ARITHMETIC
-        assert isinstance(tokenizer, data_tokenizer.ArithmeticTokenizer), type(tokenizer)
+        utils.check_equal(TOKENIZER_MODE, TokenizerModes.ARITHMETIC)
+        utils.check_isinstance(tokenizer, data_tokenizer.ArithmeticTokenizer)
         utils.setattr_must_exist(base_model.config, "pad_token_id", tokenizer.pad_token_id)
         utils.setattr_must_exist(base_model.config, "bos_token_id", tokenizer.bos_token_id)
         utils.setattr_must_exist(base_model.config, "eos_token_id", tokenizer.eos_token_id)
@@ -1081,6 +1106,7 @@ def _setup_base_model(
     utils.check_equal(base_model.config.bos_token_id, tokenizer.bos_token_id)
     utils.check_equal(base_model.config.eos_token_id, tokenizer.eos_token_id)
     utils.check_equal(base_model.config.vocab_size, len(tokenizer.vocab))
+
     return base_model
 
 
@@ -1154,7 +1180,7 @@ class EntryPoints:
         custom_model_config=CUSTOM_MODEL_CONFIG,
     ):
         all_arguments = locals().copy()
-        utils.check_and_print_args(all_arguments, cls.main, True)
+        utils.check_and_print_args(all_arguments, cls.main, True, SCRIPT_DIR)
 
         if TOKENIZER_MODE == TokenizerModes.ARITHMETIC:
             assert DATA_MODE == constants.DataModes.JSONL, (

@@ -1,4 +1,5 @@
 # Marg-Li-CoT
+Note: Uses http://www.github.com/julesgm/general_utils/
 
 ## Steps
 1. Generate default scratch pads with GPT3
@@ -18,8 +19,6 @@
             - Step 3: similar, different schedule etc.
 
 # Jules: 
-    WTF is happening: 
-    ---> The inputs and outputs seem ok
-    ---> The outputs seem long
-    ---> Doesn't understand parenthesises at all
-    ---> Does the model automatically delay the inputs?
+    ---> Sentences are too long. 
+        - No length penalties ?
+        - No early stopping ?

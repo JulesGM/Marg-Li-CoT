@@ -101,7 +101,7 @@ class Tokenizer:
         else:
             raise ValueError(f"Unknown return_tensors value '{return_tensors}'")
 
-    def decode(self, input_tokens: List[int], ignore_special_symbols: bool) -> str:
+    def decode(self, input_tokens: List[int], skip_special_tokens: bool) -> str:
 
         if isinstance(input_tokens, (torch.Tensor,np. ndarray)):
             input_tokens = input_tokens.tolist()
@@ -109,7 +109,7 @@ class Tokenizer:
         output = []
         ignore_set = set([self.bos_token_id, self.eos_token_id, self.pad_token_id])
         for token_index in input_tokens:
-            if ignore_special_symbols and token_index in ignore_set:
+            if skip_special_tokens and token_index in ignore_set:
                 continue
             if token_index == -100:
                 output.append("<-100>")
