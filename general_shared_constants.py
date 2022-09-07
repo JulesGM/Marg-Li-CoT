@@ -34,3 +34,7 @@ for k, v in PIPELINES_MODES_TO_CV_SETS.items():
 class DataModes(str, enum.Enum):
     JSONL = "jsonl"
     HDF5_PRETOK = "hdf5_pretok"
+
+class ModelModes(str, enum.Enum):
+    PRETRAINED = "pretrained"
+    RANDOM = "random"

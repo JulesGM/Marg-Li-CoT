@@ -25,3 +25,6 @@ A lot of stuff.
      - Saving multiple checkpoints and then launching the job would be a lot more simple, would maybe keep the complexity of each script down.
      - Putting both in the same script would reduce repetition? 
      - Putting both in the same script would would reduce the need for an overarching coordination script.
+    
+
+   

@@ -20,5 +20,10 @@ Note: Uses http://www.github.com/julesgm/general_utils/
 
 # Jules: 
     ---> Sentences are too long. 
-        - No length penalties ?
-        - No early stopping ?
+        - No length penalties ? Length penalty is = 1, same as bart.
+        - No early stopping ? Early stopping only affects the beam search, not greedy search. We still turned it on.
+        - Can't predict EOS? Do we even predict EOS? 
+            We're pretty sure that we're indeed *training* on EOS.
+            Is it possible that the model is somehow deleting it?
+            
+        

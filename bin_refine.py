@@ -21,7 +21,9 @@ from beartype import beartype
 import fire  # type: ignore[import]
 import h5py  # type: ignore[import]
 import jsonlines as jsonl  # type: ignore
+import more_itertools
 import numpy as np
+import plotext
 import pretty_traceback  # type: ignore
 import pytorch_lightning as pl
 import rich
@@ -49,17 +51,24 @@ class TokenizerModes(str, enum.Enum):
 
 
 ACCELERATOR = "cuda"
-DEFAULT_WANDB_ID = None  # "336o97pe"
+DEFAULT_WANDB_ID: Optional[str] = None  # "336o97pe"
 DEFAULT_LEARNING_RATE = 0.001
-DEFAULT_DISTRIBUTE_STRATEGIES = "ddp_find_unused_parameters_false"  # "ddp"
+DEFAULT_DISTRIBUTE_STRATEGIES = None # "ddp_find_unused_parameters_false"  # "ddp"
 DATA_MODE = constants.DataModes.HDF5_PRETOK # constants.DataModes.JSONL
 TOKENIZER_MODE = TokenizerModes.PRETRAINED
+DEFAULT_HUGGING_FACE = "distilgpt2"
+
+# DEFAULT_MODEL_MODE = constants.ModelModes.PRETRAINED
+# CUSTOM_MODEL_CONFIG: Optional[dict[str, Any]] = None
+
+DEFAULT_MODEL_MODE = constants.ModelModes.RANDOM
 CUSTOM_MODEL_CONFIG = dict(
     n_embd=64,
     hidden_size=64,
     num_hidden_layers=4,
     num_attention_heads=4,
 )
+
 DEFAULT_GENERATION_KWARGS = {
     constants.PipelineModes.VALIDATION: 
     dict(
@@ -119,7 +128,14 @@ DATA_PATH = SCRIPT_DIR / "data"
 # Varia
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 PRECISION = 16
-DEFAULT_HUGGING_FACE = "distilgpt2"
+
+
+def _get_final_number(s: str) -> str:
+    maybe_minus = r"(?:\-\s?)?"
+    maybe_decimal = r"(?:\.\d+)?"
+    core = r"\d+"
+    return re.findall(maybe_minus + core + maybe_decimal, s)[-1]
+
 
 def _print_predictions(*, inputs, masks, generated_decoded, labels, all_generated, all_labels):
     for in_, mask, gen, ref, all_g, all_l in zip(inputs, masks, generated_decoded, labels, all_generated, all_labels):
@@ -224,27 +240,26 @@ class _RefineLM(pl.LightningModule):
         # batch["input_ids"] = torch.concat([batch["input_ids"], input_ids_eos], axis=1)
         # batch["attention_mask"] = torch.concat([batch["attention_mask"], attention_mask_eos], axis=1)
 
-        if batch_idx == 0:
-            all_masks = []
-            for input_entry, mask_entry in zip(batch["input_ids"], batch["attention_mask"]):
-                sent_masks = []
-                for input_, mask_ in zip(input_entry, mask_entry):
-                    sent_masks.append((
-                        self._tokenizer.decode([input_.item()], skip_special_tokens=False), 
-                        mask_.item()
-                    ))
-                all_masks.append(sent_masks)
+        # if batch_idx == 0:
+        #     all_masks = []
+        #     for input_entry, mask_entry in zip(batch["input_ids"], batch["attention_mask"]):
+        #         sent_masks = []
+        #         for input_, mask_ in zip(input_entry, mask_entry):
+        #             sent_masks.append((
+        #                 self._tokenizer.decode([input_.item()], skip_special_tokens=False), 
+        #                 mask_.item()
+        #             ))
+        #         all_masks.append(sent_masks)
 
-            all_labels = []            
-            for input_entry, label_entry in zip(batch["input_ids"], batch["labels"]):
-                sent_labels = []
-                for input_, label in zip(input_entry, label_entry):
-                    sent_labels.append((
-                        self._tokenizer.decode([input_.item()], skip_special_tokens=False), 
-                        self._tokenizer.decode([label.item()], skip_special_tokens=False) if label.item() != -100 else "-100", 
-                    ))
-                all_labels.append(sent_labels)
-            print("asdasd")
+        #     all_labels = []            
+        #     for input_entry, label_entry in zip(batch["input_ids"], batch["labels"]):
+        #         sent_labels = []
+        #         for input_, label in zip(input_entry, label_entry):
+        #             sent_labels.append((
+        #                 self._tokenizer.decode([input_.item()], skip_special_tokens=False), 
+        #                 self._tokenizer.decode([label.item()], skip_special_tokens=False) if label.item() != -100 else "-100", 
+        #             ))
+        #         all_labels.append(sent_labels)
 
         outputs = self(**batch)
 
@@ -327,54 +342,54 @@ class _RefineLM(pl.LightningModule):
             raise ValueError(f"Unknown training mode: {self._active_training_mode}")
 
 
+    def _decode_per_token(self, batch):
+        dps = []
+        for entry in batch:
+            per_entry = []
+            for token in entry:
+                per_entry.append(self._tokenizer.decode([token], skip_special_tokens=False))
+            dps.append(per_entry)
+        return dps
+
+
+    def _decode_per_sample(self, batch):
+        dps = []
+        for entry in batch:
+            dps.append(self._tokenizer.decode(entry, skip_special_tokens=False))
+        return dps
+
+
     def _generate(self, batch, generation_kwargs):
         assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
 
         generation_inputs = batch["generation_input_ids"]
         generation_attention_mask = batch["generation_attention_mask"]
 
-        outputs = self._model.generate(
+        raw_generation_outputs = self._model.generate(
             input_ids=generation_inputs, 
             attention_mask=generation_attention_mask, 
             **generation_kwargs,
         )
         
-        generated_decoded = [
-            self._tokenizer.decode(x, skip_special_tokens=False)
-            for x in outputs]
-        output_label = [
-            self._tokenizer.decode(x, skip_special_tokens=False)
-            for x in batch["input_and_scratchpad_with_value"]]
-        inputs = [
-            self._tokenizer.decode(x, skip_special_tokens=False)
-            for x in generation_inputs
-        ]
+        # Decoded Per Token == dpt
+        dpt_inputs = self._decode_per_token(generation_inputs)
+        dpt_labels = self._decode_per_token(batch["input_and_scratchpad_with_value"])
+        dpt_generation = self._decode_per_token(raw_generation_outputs)
 
-        all_masks = []
-        for mask_entry, input_entry in zip(batch["generation_attention_mask"], generation_inputs, ):
-            partial = []
-            for mask, input_ in zip(mask_entry, input_entry.tolist()):
-                partial.append((mask.item(), self._tokenizer.decode([input_], skip_special_tokens=False)))
-            all_masks.append(partial)
+        # Decoded Per Sample == dps
+        dps_inputs = self._decode_per_sample(generation_inputs)
+        dps_labels = self._decode_per_sample(batch["input_and_scratchpad_with_value"])
+        dps_generation = self._decode_per_sample(raw_generation_outputs)
 
-        all_labels = []
-        for label_entry, input_entry in itertools.zip_longest(batch["labels"], generation_inputs, fillvalue="<FILL_VALUE>"):
-            partial = []
-            for label in label_entry.tolist():
-                decoded_label = self._tokenizer.decode([label], skip_special_tokens=False) if label > 0 else "<-100>"
-                partial.append(decoded_label)
-            all_labels.append(partial)
-
-        all_generated = []
-        for label_entry, gen_entry in itertools.zip_longest(batch["labels"], outputs, fillvalue="<FILL_VALUE>"):
-            partial = []
-            for label, gen_ in zip(label_entry.tolist(), gen_entry.tolist()):
-                decoded_label = self._tokenizer.decode([label], skip_special_tokens=False) if label > 0 else "<-100>"
-                decoded_gen = self._tokenizer.decode([gen_], skip_special_tokens=False)
-                partial.append((decoded_label, decoded_gen))
-            all_generated.append(partial)
-
-        return inputs, all_masks, generated_decoded, output_label, all_generated, all_labels
+        return dict(
+            raw_generation_outputs=raw_generation_outputs,
+            dpt_inputs=dpt_inputs,
+            dpt_labels=dpt_labels,
+            dpt_generation=dpt_generation,
+            dps_inputs=dps_inputs,
+            dps_labels=dps_labels,
+            dps_generation=dps_generation,
+        )
 
 
     def validation_step(self, batch: Dict[str, torch.LongTensor], batch_idx):  # type: ignore[override]
@@ -383,42 +398,65 @@ class _RefineLM(pl.LightningModule):
         )
         mode: Final[str] = constants.PipelineModes.VALIDATION
 
-        inputs, masks, generated_decoded, labels, all_generated, all_labels = self._generate(batch, self._generation_kwargs[mode])
-        # if batch_idx == 0:
-        #     _print_predictions(
-        #         inputs=inputs, masks=masks, generated_decoded=generated_decoded, 
-        #         labels=labels, all_generated=all_generated, all_labels=all_labels,
-        #     )
+        gen_outputs = self._generate(batch, self._generation_kwargs[mode])
+
+        for_comparison = [(
+            _clean_for_accuracy_computation(gen, self._tokenizer), 
+            _clean_for_accuracy_computation(l, self._tokenizer)
+            ) for gen, l in zip(gen_outputs["dps_generation"], gen_outputs["dps_labels"]
+        )]
+
+        if batch_idx == 0 and os.environ.get("SLURM_PROCID", "0") == "0":
+            ###################################################################
+            # Log Generated Text in Wandb.
+            # Logging side by side makes the table unreadable.
+            ###################################################################
+            table_entry = []
+            for index, (gen, lab) in enumerate(zip(
+                gen_outputs["dps_generation"], gen_outputs["dps_labels"]
+            )):
+                table_entry.append([self.current_epoch, index, "generation", gen])
+                table_entry.append([self.current_epoch, index, "label", lab])
+
+            self._wandb_logger.log_text(
+                key="samples",
+                columns=["epoch", "idx_in_batch", "type", "text"], 
+                data=table_entry,
+            )
+
+            input_seq_len = batch["generation_input_ids"].shape[1]
+            new_tokens = gen_outputs["raw_generation_outputs"][:, input_seq_len:]
+            gen_max_len = new_tokens.shape[1]
+
+            gen_len = collections.Counter(torch.sum(new_tokens != self._tokenizer.pad_token_id, dim=1).tolist())
+            gen_len = {k: v for k, v in sorted(gen_len.items(), key=lambda x: -x[0])}
             
-        #     ###################################################################
-        #     # Log Generated Text in Wandb.
-        #     # Logging side by side makes the table unreadable.
-        #     ###################################################################
-        #     table_entry = []
-        #     for index, (gen, lab) in enumerate(zip(generated_decoded, labels)):
-        #         table_entry.append([self.current_epoch, index, "generation", gen])
-        #         table_entry.append([self.current_epoch, index, "label", lab])
+            lab_tokens = batch["labels"]
+            lab_len = collections.Counter(torch.sum(lab_tokens != -100, dim=1).tolist())
+            lab_len = {k: v for k, v in sorted(lab_len.items(), key=lambda x: -x[0])}
 
-        #     self._wandb_logger.log_text(
-        #         key="samples",
-        #         columns=["epoch", "idx_in_batch", "type", "text"], 
-        #         data=table_entry,
-        #     )
-        #     ###################################################################
-
-        for_comparison = [(_clean_for_accuracy_computation(gen, self._tokenizer), _clean_for_accuracy_computation(l, self._tokenizer)) for gen, l in zip(generated_decoded, labels)]
-        if batch_idx == 0 and os.environ["SLURM_PROCID"] == "0":
             for gen, ref in for_comparison:
                 rich.print(f"[bold yellow]\[ref] {ref}")
                 rich.print(f"[bold blue]\[gen] {gen}")
                 rich.print("=" * 80)
+            
+            rich.print("[bold]Gen lengths:[/]", gen_len)
+            rich.print("[bold]Lab lengths:[/]", lab_len)
+            
+            length, qty = zip(*gen_len.items())
+            plotext.simple_bar(length, qty, title="Generated Lengths")
+            plotext.show()
 
-        accuracy = np.mean([x == y for x, y in for_comparison])
+            length, qty = zip(*lab_len.items())
+            plotext.simple_bar(length, qty, title="Label Lengths")
+            plotext.show()
 
-        ppl_outputs = self._model(**{k: batch[k]for k in 
-            ["input_ids", "attention_mask", "labels"]})
+        em_accuracy = np.mean([x == y for x, y in for_comparison])
+        final_answer_acc = np.mean([_get_final_number(x) == _get_final_number(y) for x, y in for_comparison])
+        ppl_outputs = self._model(**{k: batch[k]for k in ["input_ids", "attention_mask", "labels"]})
 
-        self.log("val_em", accuracy, batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val_em", em_accuracy, batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val_answer_acc", final_answer_acc, batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[mode], **self._logging_conf)
         
 
@@ -875,8 +913,8 @@ def prep_mle_train_and_valid(examples, bos_token_id: int, eos_token_id: int) -> 
     
     for example in examples:
         # Transormations
-        example["input_ids"] = example["input_and_scratchpad_with_value"].tolist() + [eos_token_id]
         len_question = (len(example["input_and_scratchpad_with_value"]) - len(example["scratchpad_with_value"]))
+        example["input_ids"] = example["input_and_scratchpad_with_value"].tolist() + [eos_token_id]
         example["labels"] = [-100] * len_question + example["scratchpad_with_value"].tolist() + [eos_token_id]
         
         # End checks
@@ -1072,25 +1110,68 @@ def _setup_tokenizer(hf_name: str) -> transformers.PreTrainedTokenizer:
 
 
 def _setup_base_model(
+    *,
     hf_name: str, 
     custom_model_config: Optional[dict[str, int]], 
     tokenizer: transformers.PreTrainedTokenizer,
+    model_mode: str,
     verbose: bool = True
 ) -> transformers.PreTrainedModel:
-    
-    config = transformers.AutoConfig.from_pretrained(hf_name)
-    
-    if custom_model_config is not None:
-        for k, v in custom_model_config.items():
-            utils.setattr_must_exist(config, k, v)
-    
-        utils.setattr_must_exist(config, "vocab_size", len(tokenizer.vocab))
+    """
 
-    assert config.n_inner is None, config.n_inner
+    ------------------------------------------
+    Structure:
+    ------------------------------------------
+    - Random Model
+    --- Random Model with custom config
+    - Pretrained Model
+    ------------------------------------------
+    - Shared modifications
+    - GPT2 model specific changes
+    - Shared checks
+    ------------------------------------------
 
-    base_model = transformers.AutoModelForCausalLM.from_config(config)
+    """
+
+    ###########################################################################
+    # Random Model
+    ###########################################################################
+    if model_mode == constants.ModelModes.RANDOM :
+        rich.print(f"[bold red]USING A NON PRETRAINED MODEL.")
+        config = transformers.AutoConfig.from_pretrained(hf_name)
+        utils.setattr_must_exist(config, "vocab_size", len(tokenizer.vocab))  # type: ignore[attr-defined]
+
+        ###########################################################################
+        # Random model with custom config
+        ###########################################################################
+        if custom_model_config is not None:
+            rich.print(f"[bold red]USING CUSTOM MODEL CONFIGURATION.")
+            for k, v in custom_model_config.items():
+                utils.setattr_must_exist(config, k, v)
+
+        base_model = transformers.AutoModelForCausalLM.from_config(config)
+        assert config.n_inner is None, config.n_inner
+
+    ###########################################################################
+    # Pretrained model
+    ###########################################################################
+    elif model_mode == constants.ModelModes.PRETRAINED:
+        rich.print(f"[bold GREEN]USING A PRETRAINED MODEL.")
+        base_model = transformers.AutoModelForCausalLM.from_pretrained(hf_name)
+        utils.check_equal(base_model.config.vocab_size, len(tokenizer.vocab))  # type: ignore[attr-defined]
+    else:
+        raise ValueError(f"Unsupported model mode: {model_mode}")
+
+    ###########################################################################
+    # Shared modifications
+    ###########################################################################
     utils.setattr_must_exist(base_model.config, "early_stopping", True)
+    del base_model.config.task_specific_params
 
+
+    ###########################################################################
+    # GPT2 model type specific modifications, invariant to the config of the model
+    ###########################################################################
     if base_model.config.model_type == "gpt2" and isinstance(
         tokenizer, (transformers.PreTrainedTokenizer, transformers.PreTrainedTokenizerFast)):
         utils.check_equal(TOKENIZER_MODE, TokenizerModes.PRETRAINED)
@@ -1102,10 +1183,14 @@ def _setup_base_model(
         utils.setattr_must_exist(base_model.config, "bos_token_id", tokenizer.bos_token_id)
         utils.setattr_must_exist(base_model.config, "eos_token_id", tokenizer.eos_token_id)
 
+
+    ###########################################################################
+    # Shared checks
+    ###########################################################################
     utils.check_equal(base_model.config.pad_token_id, tokenizer.pad_token_id)
     utils.check_equal(base_model.config.bos_token_id, tokenizer.bos_token_id)
     utils.check_equal(base_model.config.eos_token_id, tokenizer.eos_token_id)
-    utils.check_equal(base_model.config.vocab_size, len(tokenizer.vocab))
+    utils.check_equal(base_model.config.vocab_size, len(tokenizer.vocab))  # type: ignore[attr-defined]
 
     return base_model
 
@@ -1124,7 +1209,6 @@ def _compute_batch_size_defaults(
             constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: base,
             constants.PipelineModes.VALIDATION: base * 2,
         }  
-
     
     assert isinstance(local_rank, int)
     gpu_mem_gb = torch.cuda.get_device_properties(local_rank).total_memory / 1024 ** 3
@@ -1178,6 +1262,7 @@ class EntryPoints:
         generation_kwargs=DEFAULT_GENERATION_KWARGS,
         distribute_strategy=DEFAULT_DISTRIBUTE_STRATEGIES,  # "ddp_find_unused_parameters_false",
         custom_model_config=CUSTOM_MODEL_CONFIG,
+        model_mode=DEFAULT_MODEL_MODE,
     ):
         all_arguments = locals().copy()
         utils.check_and_print_args(all_arguments, cls.main, True, SCRIPT_DIR)
@@ -1194,6 +1279,10 @@ class EntryPoints:
         checkpoints_folder = Path(checkpoints_folder)
         assert checkpoints_folder.exists(), checkpoints_folder
         assert checkpoints_folder.is_dir(), checkpoints_folder
+
+        assert not (model_mode == constants.ModelModes.PRETRAINED and custom_model_config), (
+            "If you are not using a pretrained model, you can't use a custom model config."
+        )
 
         torch.use_deterministic_algorithms(mode=DETERMINISTIC)
         run_name = dataset_path.name + "_0.01_wd"   
@@ -1235,6 +1324,7 @@ class EntryPoints:
             wandb_run_id=wandb_run_id,
             weight_decay=weight_decay,
             custom_model_config=custom_model_config,
+            model_mode=model_mode,
         )
         
         # Load the pretrained model. If a checkpoint is used, it will
@@ -1272,7 +1362,12 @@ class EntryPoints:
             del arg_meta_info
 
         tokenizer = _setup_tokenizer(meta_info["transformers_model_name"])
-        base_model = _setup_base_model(meta_info["transformers_model_name"], meta_info["custom_model_config"], tokenizer)
+        base_model = _setup_base_model(
+            hf_name=meta_info["transformers_model_name"], 
+            custom_model_config=meta_info["custom_model_config"], 
+            model_mode=meta_info["model_mode"], 
+            tokenizer=tokenizer,
+        )
         rich.print(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"\n")
         datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
             [constants.CVSets.TRAINING, constants.CVSets.VALIDATION]
