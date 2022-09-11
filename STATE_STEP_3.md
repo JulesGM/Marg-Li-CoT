@@ -21,3 +21,8 @@
          - We would need a new train dataloader
          - We would need a new training step
          - We would need a different config file
+
+## Sep 11:
+ - Setup the two phases training
+ - Should be able to resume from the checkpoint without resuming wandb, 
+   & without overwriting the checkpoint

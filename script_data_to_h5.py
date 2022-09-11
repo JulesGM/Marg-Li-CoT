@@ -25,7 +25,7 @@ import general_utils as gu
 
 DATA_URI = "./data"
 INT_DTYPE = np.int64
-
+CHAINER = " => "
 
 # In[4]:
 
@@ -43,13 +43,22 @@ def pad_and_mask(arr: list[int], pad_token_id: int):
     return padded, attention_mask
 
 
-def convert_jsonl_data_to_h5py(*, tokenizer: transformers.PreTrainedTokenizer, tokenizer_name: str, path_h5: Path, path_jsonl: Path, chainer, md5_jsonl, verbose=True):
+def convert_jsonl_data_to_h5py(
+    *, 
+    tokenizer: transformers.PreTrainedTokenizer, 
+    tokenizer_name: str, 
+    path_h5: Path, 
+    path_jsonl: Path, 
+    md5_jsonl: str, 
+    verbose=True
+    ):
 
     with h5py.File(path_h5, "w") as h5:
         h5.attrs["tokenizer_name"] = tokenizer_name
 
         if verbose:
             rich.print(f"Reading h5py from {path_jsonl}")
+
         with jsonl.open(path_jsonl) as reader:
             h5.attrs["md5"] = md5_jsonl
             raw_data = list(reader)
@@ -57,11 +66,9 @@ def convert_jsonl_data_to_h5py(*, tokenizer: transformers.PreTrainedTokenizer, t
         if verbose:
             rich.print(f"Converting {len(raw_data)} lines")
         text = {
-            "input": [x["input"] + chainer for x in raw_data],
-            "input_and_scratchpad_with_value": [x["input"] + chainer + x["scratchpad_with_value"] for x in raw_data],
+            "input": [x["input"] + CHAINER for x in raw_data],
             "value": [x["value"] for x in raw_data],
             "scratchpad": [x["scratchpad"] for x in raw_data],
-            "scratchpad_with_value": [x["scratchpad_with_value"] for x in raw_data],
         }
 
         if verbose:
@@ -122,7 +129,6 @@ POOL_TYPE_MAPPING = {
 @beartype
 def main(
     hf_name: str = "gpt2-medium", 
-    chainer: str = " => ",
     pool_type: str = PoolType.FAKE,
     verbose: bool = False,
 ):
@@ -142,7 +148,6 @@ def main(
             tokenizer=tokenizer, 
             path_h5=path_h5, 
             path_jsonl=path_jsonl, 
-            chainer=chainer, 
             md5_jsonl=md5_jsonl, 
             verbose=verbose,
             tokenizer_name=hf_name,
