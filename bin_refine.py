@@ -19,6 +19,7 @@ from typing import *
 
 from beartype import beartype
 import fire  # type: ignore[import]
+import functorch
 import h5py  # type: ignore[import]
 import jsonlines as jsonl  # type: ignore
 import more_itertools
@@ -42,6 +43,7 @@ pretty_traceback.install()
 print("Done loading modules.\n")
 
 CHAINER = " => "
+ANSWER_CHAINER = "\nThe final answer is "
 
 ###############################################################################################
 # Constants that should be changed from time to time
@@ -352,26 +354,16 @@ class _RefineLM(pl.LightningModule):
     def _training_step_marginal_likelihood(self, batch, batch_idx):
         """
         
-        
-
-
         p(z|x): <generation>
-            generation_input_ids: masked, question, chainer. Padded left.
+            generation_input_ids: masked, question, chainer. *Padded left*.
             generation_attention_mask
 
-        p(z|x): <after generation>
-            input_ids: masked, question, chainer
-            Labels: whatever the model has generated, value.
-            Notes: 
-                - We could keep the logits in generation and extract from that.
-                - We need to add the value at the end so that we don't need to recompute everything.
-                - We will need scratchpad masks and value masks, to extract the logits.
-        
-        p(y|z, x):
-            input_ids: masked, question, chainer, scratchpad, value
-            labels: value
-            Note: I think we need to recompute over everything. This is not optimal clearly.
+        p(y, z| x): 
+            input_ids: input, 
+            labels:
+        ---
 
+        p(y, z | x) = p(y | z, x) * p(z | x)
 
         """
 
@@ -379,36 +371,91 @@ class _RefineLM(pl.LightningModule):
         utils.check_equal(self._active_training_mode, mode)
 
         # TODO: Not sure about the options in these
-        outputs = self._model.generate(
+        inputs_outputs = self._model.generate(
             input_ids=batch["generation_input_ids"],
             attention_mask=batch["generation_attention_mask"], 
             **self._generation_kwargs[mode],
         )
 
-        utils.check_equal(outputs.shape, (
+        utils.check_equal(inputs_outputs.shape, (
             self._batch_size[self._active_training_mode], 
             self._generation_kwargs[mode]["beam_size"], 
             self._generation_kwargs[mode]["max_length"]
         ))
 
         ## Concatenate final value
-        # [input, generated_scratchpad, answer]
-        z_knowing_x_val, z_knowing_x_mask = unpadded_concatenation(
-            [batch["input_ids"], outputs], 
-            self._tokenizer.pad_token_id
-        )
         
+        marginal_model = "joint"
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # p(y | z, x) * p(z | x), Allows to normalize p(z | x) over the top-k z.
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if marginal_model == "separate":
+            assert False, "code under development"
+            z_knowing_x_val, z_knowing_x_mask = unpad_concatenate_repad(
+                tensors=[
+                    batch["input_ids"], 
+                    outputs,
+                ], 
+                attention_masks=[
+                    batch["input_ids"] != self._tokenizer.pad_token_id, 
+                    outputs != self._tokenizer.pad_token_id
+                ],
+                pad_token_id=self._tokenizer.pad_token_id,
+                new_padding_direction="right",
+            )
+            
+            label_mask = torch.ones_like(z_knowing_x_mask) * -100
+            assert label_mask.dtype == torch.long, label_mask.dtype
+            y_knowing_x_z_val, y_knowing_x_z_mask = unpad_concatenate_repad(
+                tensors=[label_mask, batch["value"]],
+                attention_masks=[
+                    label_mask,
+                    batch["value"] != self._tokenizer.pad_token_id,
+                ],
+                pad_token_id=-100,
+                new_padding_direction="right",
+            )
+            loss = self._model(input_ids=y_z_knowing_x).loss
 
-        label_mask = torch.ones_like(z_knowing_x_mask) * -100
-        assert label_mask.dtype == torch.long, label_mask.dtype
-        y_knowing_x_z_val, y_knowing_x_z_mask = unpadded_concatenation(
-            [label_mask, batch["value"]], -100
-        )
-        
-        # Compute loss
-        prob = self._model(input_ids=y_knowing_x_z_val)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # p(y, z | x)
+        # 
+        # We need to remove the padding from the generations, add the final answer,
+        # and then pad to the 
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        elif marginal_model == "joint":
+            # TODO: slow but does what it needs to for the moment
+            utils.assert_equal(inputs_outputs.ndim, 4)
+            assert self._tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN, self._tokenizer_padding_mode
 
-        pass
+            # Outputs include the inputs as well
+            unpadded_inputs_outputs = remove_padding(inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id)
+            unpadded_values = remove_padding(batch["value"], batch["value"] != self._tokenizer.pad_token_id)
+
+            # Reproduce the structure of the multiple beams per input tensor
+            unpadded_repeated_values = utils.repeat_interleave(
+                unpadded_values, self._generation_kwargs[mode]["beam_size"]) 
+
+            final_input_ids = []
+            final_labels = []
+
+            for io, value  in zip(unpadded_inputs_outputs, unpadded_repeated_values):
+                final_input_ids.append(io + value)
+                final_labels.append(len(io) * [-100] + value)
+                
+            # Not generation = pad right
+            padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right")
+            padded_final_attention_mask = generate_mask(final_input_ids, "right")
+            padded_final_labels = pad(final_labels, -100, "right")
+
+            loss = self._model(
+                input_ids=padded_final_input_ids,
+                attention_mask=padded_final_attention_mask,
+                labels=padded_final_labels,
+            ).loss
+
+        # sum probs
+        return loss
 
 
     def training_step(self, batch, batch_idx):
@@ -687,11 +734,18 @@ class _RefineLM(pl.LightningModule):
         return 
 
 
-def unpadded_concatenation(tensors, pad_token_id):
-    lists_of_lists = [semi_vectorized_masked_2d_to_lol(x, x==pad_token_id) for x in tensors]
-    concatenated = [list(itertools.chain(*list_of_lists)) for list_of_lists in zip(*lists_of_lists)]
-    mask = generate_mask(concatenated, pad_token_id)
-    padded = pad(concatenated, pad_token_id,)
+def unpad_concatenate_repad(*, 
+    tensors: list[torch.LongTensor], 
+    attention_masks: list[torch.LongTensor],
+    new_padding_direction: str, 
+    pad_token_id: int
+):
+    for tensor in tensors:
+        utils.check_equal(tensor.ndims, 2), tensor.shape
+    lists_of_lists = [remove_padding(x, mask) for x, mask in more_itertools.zip_equal(tensors, attention_masks)]
+    concatenated = [list(itertools.chain.from_iterable(list_of_lists)) for list_of_lists in zip(*lists_of_lists)]
+    mask = generate_mask(concatenated, pad_token_id, new_padding_direction)
+    padded = pad(concatenated, pad_token_id, new_padding_direction)
     return padded, mask
 
 
@@ -894,8 +948,13 @@ def _build_meta_info(**kwargs):
     return kwargs
 
 
-def semi_vectorized_masked_2d_to_lol(
+def remove_padding(
     array: np.ndarray, mask: np.ndarray) -> List[List[Any]]:
+    """
+    Removes padding.
+    """
+
+
     if isinstance(mask, np.ndarray):
         assert mask.dtype == bool, mask.dtype
     elif isinstance(mask, torch.Tensor):
@@ -944,7 +1003,7 @@ def _load_data(
 
             tokenized_data[set_] = {
                 "input":      tokenizer([x["input"] + CHAINER for x in raw_data], add_special_tokens=False)["input_ids"],
-                "value":      tokenizer([x["value"]           for x in raw_data], add_special_tokens=False)["input_ids"],
+                "value":      tokenizer([x["value"] for x in raw_data], add_special_tokens=False)["input_ids"],
                 "scratchpad": tokenizer([x["scratchpad"]      for x in raw_data], add_special_tokens=False)["input_ids"],
             }
 
@@ -982,7 +1041,7 @@ def _load_data(
                 mask_key = key + "_attention_mask"
                 tokenized_data[set_][key] = []
 
-                tokenized_data[set_][key] = semi_vectorized_masked_2d_to_lol(cached[key], cached[mask_key] == 1)
+                tokenized_data[set_][key] = remove_padding(cached[key], cached[mask_key] == 1)
 
             for key in tqdm(text_keys, desc="Tokenizing"):
                 tokenized_data[set_][key] = cached[key]
