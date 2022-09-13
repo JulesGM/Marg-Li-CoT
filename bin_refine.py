@@ -48,7 +48,7 @@ ANSWER_CHAINER = "\nThe final answer is "
 ###############################################################################################
 # Constants that should be changed from time to time
 ###############################################################################################
-DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=1)
+DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=2)
 LIMIT_VAL_BATCHES = 5
 VAL_CHECK_INTERVAL = 0.05
 
@@ -85,8 +85,8 @@ SCHEDULER_FN = {
 }
 
 
-DEFAULT_WANDB_ID: Optional[str] = "103uy4nu"
-DEFAULT_DISTRIBUTE_STRATEGIES = "ddp_find_unused_parameters_false"  # "ddp"
+DEFAULT_WANDB_ID: Optional[str] = None  # "103uy4nu"
+DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
 DEFAULT_USE_SCRATCHPADS = False
 
 DATA_MODE = constants.DataModes.HDF5_PRETOK
@@ -306,6 +306,9 @@ class _RefineLM(pl.LightningModule):
         self._scheduler = None
 
 
+    def on_epoch_start(self) -> None:
+        self.trainer.reset_train_dataloader()
+
     def forward(self, *args, **kwargs):
         return self._model(*args, **kwargs)
 
@@ -351,8 +354,9 @@ class _RefineLM(pl.LightningModule):
         mode: Final[str] = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
         disable_timing = True  # not utils.is_rank_zero()
 
-        rich.print(f"batch size:           {self._batch_size[mode]}")
-        rich.print(f"num return sequences: {self._generation_kwargs[mode]['num_return_sequences']}")
+        if not disable_timing:
+            utils.rich_print_zero_rank(f"batch size:           {self._batch_size[mode]}")
+            utils.rich_print_zero_rank(f"num return sequences: {self._generation_kwargs[mode]['num_return_sequences']}")
 
         with utils.cuda_timeit("bin_refine.py::Generation", disable=disable_timing):
             inputs_outputs = self._model.generate(
@@ -496,6 +500,7 @@ class _RefineLM(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         mode = self._decide_training_mode()
+        
 
         if mode == constants.PipelineModes.MLE_TRAINING:
             return self._training_step_mle(batch, batch_idx)
@@ -581,7 +586,7 @@ class _RefineLM(pl.LightningModule):
             ) for gen, l in zip(dps_generation, dps_labels)
         ]
 
-        if batch_idx == 0 and utils.is_rank_zero():
+        if False and (batch_idx == 0 and utils.is_rank_zero()):
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Log Generated Text in Wandb.  
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -680,6 +685,7 @@ class _RefineLM(pl.LightningModule):
 
     def train_dataloader(self):        
         mode = self._decide_training_mode()
+        
         assert mode in {
             constants.PipelineModes.MLE_TRAINING, 
             constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
@@ -1113,6 +1119,9 @@ def prep_mle_train_and_valid(*, examples, eos_token_id: int, scratchpad_eos_toke
 class MarginalLikelihoodTrainingCollator:
     _tokenizer: transformers.PreTrainedTokenizer
 
+    def __post_init__(self):
+        rich.print("[bold red]Initializing MLETrainingCollator")
+
     def __call__(self, examples):
         """
         - We have the questions, we have the answers. Nothing else.
@@ -1127,6 +1136,7 @@ class MarginalLikelihoodTrainingCollator:
         # We can only prepare the inputs for generation. 
         # These need to be padded to the left.
         examples = utils.dict_unzip(examples)
+        
         examples["generation_attention_mask"] = generate_mask(examples["input"], "left")
         examples["generation_input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
 
@@ -1137,6 +1147,9 @@ class MarginalLikelihoodTrainingCollator:
 class MLETrainingCollator:
     _tokenizer: transformers.PreTrainedTokenizer
     _lm_masking_mode: str
+
+    def __post_init__(self):
+        rich.print("[bold red]Initializing MLETrainingCollator")
 
     def __call__(self, raw_examples):
         """
@@ -1155,6 +1168,9 @@ class MLETrainingCollator:
             pad_token_id=self._tokenizer.pad_token_id,
             lm_masking_mode=self._lm_masking_mode,
         )
+
+        examples["generation_attention_mask"] = generate_mask(examples["input"], "left")
+        examples["generation_input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
         
         return examples
 
@@ -1163,6 +1179,9 @@ class MLETrainingCollator:
 class ValitationCollator:
     _tokenizer: transformers.PreTrainedTokenizer
     _lm_masking_mode: str
+
+    def __post_init__(self):
+        rich.print("[bold red]Initializing ValidationCollator")
 
     def __call__(self, raw_examples):
         """
@@ -1645,19 +1664,23 @@ class EntryPoints:
                 save_on_train_epoch_end=True, 
                 save_last=True
             ),
-            default_root_dir=str(checkpoints_folder),
-            max_epochs=MAX_EPOCHS,
             logger=logger,
             num_nodes=ddp_info.num_nodes,
             devices=ddp_info.num_devices,
-            strategy=strategy,
-            deterministic=DETERMINISTIC,
             gradient_clip_val=GRADIENT_CLIP_VAL,
-            precision=PRECISION,
+            default_root_dir=str(checkpoints_folder),
+            
+            # Accelerators 
+            deterministic=DETERMINISTIC,
+            strategy=strategy,
             accelerator=ACCELERATOR,
-            check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
-            limit_val_batches=LIMIT_VAL_BATCHES,
+            precision=PRECISION,
+
+            # Looping stuff
+            max_epochs=MAX_EPOCHS,
             limit_train_batches=LIMIT_TRAIN_BATCHES,
+            limit_val_batches=LIMIT_VAL_BATCHES,
+
             callbacks=[
                 pl.callbacks.LearningRateMonitor(logging_interval="step"),
             ]
@@ -1758,9 +1781,8 @@ class EntryPoints:
             devices=ddp_info.num_devices,
             num_nodes=ddp_info.num_nodes,
             strategy=distribute_strategy,
-            limit_val_batches=LIMIT_VAL_BATCHES,
-            val_check_interval=VAL_CHECK_INTERVAL,
             default_root_dir=str(checkpoints_root_dir),
+
             limit_predict_batches=math.ceil(qty / batch_sizes[mode]),
         )
 
