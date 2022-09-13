@@ -17,21 +17,21 @@ import sys
 import time
 from typing import *
 
-from beartype import beartype
+from beartype import beartype  # type: ignore[import]
 import fire  # type: ignore[import]
-import functorch
+import functorch  # type: ignore[import]
 import h5py  # type: ignore[import]
 import jsonlines as jsonl  # type: ignore
-import more_itertools
+import more_itertools  # type: ignore[import]
 import numpy as np
-import plotext
+import plotext  # type: ignore[import]
 import pretty_traceback  # type: ignore
-import pytorch_lightning as pl
-import rich
+import pytorch_lightning as pl  # type: ignore[import]
+import rich  # type: ignore[import]
 import torch
 import torch.utils
 import torch.utils.data
-from tqdm import tqdm  # type: ignore
+from tqdm import tqdm  # type: ignore[import]
 import transformers  # type: ignore[import]
 import wandb
 
@@ -48,8 +48,11 @@ ANSWER_CHAINER = "\nThe final answer is "
 ###############################################################################################
 # Constants that should be changed from time to time
 ###############################################################################################
-DEFAULT_SWITCH_TO_MARGINAL_AFTER = 1
+DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=1)
 LIMIT_VAL_BATCHES = 5
+
+DEFAULT_NUM_BEAMS = 5
+MARGINAL_LIKELIHOOD_BS = (64 * 2) // 5
 
 DEFAULT_LM_MASKING_MODE = constants.LMMaskingMode.MASK_INPUT
 DEFAULT_LEARNING_RATE = 0.001
@@ -81,13 +84,12 @@ SCHEDULER_FN = {
 }
 
 
-DEFAULT_WANDB_ID: Optional[str] = None  # "336o97pe"
+DEFAULT_WANDB_ID: Optional[str] = "103uy4nu"
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp_find_unused_parameters_false"  # "ddp"
 DEFAULT_USE_SCRATCHPADS = False
 
 DATA_MODE = constants.DataModes.HDF5_PRETOK
 TOKENIZER_MODE = constants.TokenizerModes.PRETRAINED
-DEFAULT_TOKENIZER_PADDING_MODE = constants.TokenizerPaddingModes.NEW_TOKEN
 
 
 DEFAULT_HUGGING_FACE = "distilgpt2"
@@ -118,11 +120,18 @@ DEFAULT_GENERATION_KWARGS = {
     ),
     constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 
     dict(
-        diversity_penalty=0.25,
-        max_new_tokens=122,
-        num_beams=5, 
-        num_beam_groups=5,
-        num_return_sequences=5, 
+        min_length=0,
+        do_sample=False,
+        max_new_tokens=80, # This is a very important knob
+        
+        # Not changing
+        constraints=None,
+        diversity_penalty=0.25, # This needs to be tuned
+        num_beams=DEFAULT_NUM_BEAMS, 
+        num_beam_groups=DEFAULT_NUM_BEAMS,
+        num_return_sequences=DEFAULT_NUM_BEAMS, 
+        repetition_penalty=None,
+        use_cache=True,
     ),
 }
 
@@ -240,7 +249,6 @@ class _RefineLM(pl.LightningModule):
         scheduler_type: str,
         switch_to_maginal_after: dict[str, int],
         tokenizer: transformers.PreTrainedTokenizer,
-        tokenizer_padding_mode: str,
         wandb_logger: Optional[pl.loggers.WandbLogger],
         weight_decay: Optional[float],
         use_scratchpads: bool,
@@ -253,7 +261,6 @@ class _RefineLM(pl.LightningModule):
         self._model: Final[transformers.PreTrainedModel] = model
         self._datasets: Final[Dict[str, torch.utils.data.Dataset]] = datasets
         self._tokenizer: Final[transformers.PreTrainedTokenizer] = tokenizer
-        self._tokenizer_padding_mode: Final[str] = tokenizer_padding_mode
         self._batch_size: Final[dict[str, int]] = batch_sizes
         self._generation_kwargs: Final[dict[str, Any]] = generation_kwargs
         self._logging_conf: Final[dict[str, bool]] = dict(
@@ -274,7 +281,6 @@ class _RefineLM(pl.LightningModule):
         self._use_scratch_pads = use_scratchpads
         self._shuffle_train: Final[bool] = SHUFFLE_TRAINING_DATA
         self._shuffle_val: Final[bool] = SHUFFLE_VALIDATION_DATA
-        self._active_training_mode: Final[str] = constants.PipelineModes.MLE_TRAINING
         self._training_collators = {
             constants.PipelineModes.MLE_TRAINING: 
                 MLETrainingCollator(self._tokenizer, self._lm_masking_mode),
@@ -304,10 +310,6 @@ class _RefineLM(pl.LightningModule):
 
 
     def _training_step_mle(self, batch, batch_idx):
-        utils.check_equal(
-            self._active_training_mode, 
-            constants.PipelineModes.MLE_TRAINING,
-        )
 
         assert "labels" in batch, (
             "Labels must be in batch. We must mask the input section with -100"
@@ -317,34 +319,12 @@ class _RefineLM(pl.LightningModule):
             k: v for k, v in batch.items() 
             if k in ["input_ids", "attention_mask", "labels"]
         }
-        bsz = batch["attention_mask"].shape[0]
         
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Expensive Test: The last unmasked token in labels should be eos
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~        
-        last_unmasked_token_value = _last_non_masked(batch["labels"], -100)
-        assert (last_unmasked_token_value == self._tokenizer.eos_token_id).all()
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Expensive Test: 
-        #   Make sure the attention mask is exactly the non padded areas.
-        #   This shouldn't matter though, since the eos token is not a matter of
-        #   input tokens.
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        if self._tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN:
-            computed_attention_mask = batch["input_ids"] != self._tokenizer.pad_token_id
-            assert (computed_attention_mask == batch["attention_mask"]).all()
-            
-            # There should be exactly one eos token per label line
-            qty_eos_labels = (batch["labels"] == self._tokenizer.eos_token_id).sum(dim=1)
-            assert (qty_eos_labels == 1).all(), qty_eos_labels
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         outputs = self(**batch)
 
         self.log(
             "train_loss", outputs.loss, 
-            batch_size=self._batch_size[self._active_training_mode], 
+            batch_size=self._batch_size[constants.PipelineModes.MLE_TRAINING], 
             **self._logging_conf
         )
 
@@ -368,20 +348,24 @@ class _RefineLM(pl.LightningModule):
         """
 
         mode: Final[str] = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
-        utils.check_equal(self._active_training_mode, mode)
 
-        # TODO: Not sure about the options in these
-        inputs_outputs = self._model.generate(
-            input_ids=batch["generation_input_ids"],
-            attention_mask=batch["generation_attention_mask"], 
-            **self._generation_kwargs[mode],
+        rich.print(f"batch size:           {self._batch_size[mode]}")
+        rich.print(f"num return sequences: {self._generation_kwargs[mode]['num_return_sequences']}")
+
+        with utils.cuda_timeit("generation"):
+            inputs_outputs = self._model.generate(
+                input_ids=batch["generation_input_ids"],
+                attention_mask=batch["generation_attention_mask"], 
+                # Generating until CLS makes us only generate the scratchpad. Generating until EOS makes us generate the whole output.
+                # That's how the model is pre-trained with the mle objective.
+                eos_token_id=self._tokenizer.cls_token_id,  
+                **self._generation_kwargs[mode],
+            )
+            
+        utils.check_equal(
+            inputs_outputs.shape[0],
+            self._batch_size[mode] * self._generation_kwargs[mode]["num_beams"],
         )
-
-        utils.check_equal(inputs_outputs.shape, (
-            self._batch_size[self._active_training_mode], 
-            self._generation_kwargs[mode]["beam_size"], 
-            self._generation_kwargs[mode]["max_length"]
-        ))
 
         ## Concatenate final value
         
@@ -425,67 +409,79 @@ class _RefineLM(pl.LightningModule):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         elif marginal_model == "joint":
             # TODO: slow but does what it needs to for the moment
-            utils.assert_equal(inputs_outputs.ndim, 4)
-            assert self._tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN, self._tokenizer_padding_mode
+            utils.check_equal(inputs_outputs.ndim, 2)
 
             # Outputs include the inputs as well
-            unpadded_inputs_outputs = remove_padding(inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id)
-            unpadded_values = remove_padding(batch["value"], batch["value"] != self._tokenizer.pad_token_id)
+            with utils.cuda_timeit("prep score inputs"):
+                unpadded_inputs_outputs = remove_padding(
+                    inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id)
+                unpadded_values = batch["value"]
 
-            # Reproduce the structure of the multiple beams per input tensor
-            unpadded_repeated_values = utils.repeat_interleave(
-                unpadded_values, self._generation_kwargs[mode]["beam_size"]) 
+                # Reproduce the structure of the multiple beams per input tensor
+                unpadded_repeated_values = utils.repeat_interleave(
+                    unpadded_values, self._generation_kwargs[mode]["num_return_sequences"]) 
 
-            final_input_ids = []
-            final_labels = []
+                final_input_ids = []
+                final_labels = []
 
-            for io, value  in zip(unpadded_inputs_outputs, unpadded_repeated_values):
-                final_input_ids.append(io + value)
-                final_labels.append(len(io) * [-100] + value)
-                
-            # Not generation = pad right
-            padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right")
-            padded_final_attention_mask = generate_mask(final_input_ids, "right")
-            padded_final_labels = pad(final_labels, -100, "right")
+                for io, value  in zip(unpadded_inputs_outputs, unpadded_repeated_values):
+                    io = io.tolist()
+                    value = value.tolist()
+                    if not io[-1] == self._tokenizer.cls_token_id:
+                        io.append(self._tokenizer.cls_token_id)
+                    final_input_ids.append(io + value)
+                    final_labels.append(len(io) * [-100] + value)
+                    
+                # Not generation = pad right
+                padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right").to(self._model.device)
+                padded_final_labels    = pad(final_labels,    -100,                         "right").to(self._model.device)
+                padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
 
-            loss = self._model(
-                input_ids=padded_final_input_ids,
-                attention_mask=padded_final_attention_mask,
-                labels=padded_final_labels,
-            ).loss
+            with utils.cuda_timeit("score"):
+                loss = self._model(
+                    input_ids     =torch.tensor(padded_final_input_ids     .cpu().detach().numpy()).to(padded_final_input_ids.device),
+                    attention_mask=torch.tensor(padded_final_attention_mask.cpu().detach().numpy()).to(padded_final_input_ids.device),
+                    labels        =torch.tensor(padded_final_labels        .cpu().detach().numpy()).to(padded_final_input_ids.device),
+                ).loss
 
         # sum probs
         return loss
 
 
-    def training_step(self, batch, batch_idx):
+    def _decide_training_mode(self):
+        mode = constants.PipelineModes.MLE_TRAINING
         if self._switch_to_maginal_after and "epochs" in self._switch_to_maginal_after:
             assert "steps" not in self._switch_to_maginal_after, self._switch_to_maginal_after
             utils.check_equal(len(self._switch_to_maginal_after), 1)
 
             if self.current_epoch >= self._switch_to_maginal_after["epochs"]:
-                self._active_training_mode = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
+                mode = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
 
         elif self._switch_to_maginal_after and "steps" in self._switch_to_maginal_after:
             assert "epochs" not in self._switch_to_maginal_after, self._switch_to_maginal_after
             utils.check_equal(len(self._switch_to_maginal_after), 1)
 
             if self.global_step >= self._switch_to_maginal_after["steps"]:
-                self._active_training_mode = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
+                mode = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
 
         else:
             assert not self._switch_to_marginal_after, self._switch_to_marginal_after
 
+        return mode
 
-        if self._active_training_mode == constants.PipelineModes.MLE_TRAINING:
+
+    def training_step(self, batch, batch_idx):
+        mode = self._decide_training_mode()
+
+        if mode == constants.PipelineModes.MLE_TRAINING:
             return self._training_step_mle(batch, batch_idx)
         elif (
-            self._active_training_mode == 
+            mode == 
             constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
         ):
             return self._training_step_marginal_likelihood(batch, batch_idx)
         else:
-            raise ValueError(f"Unknown training mode: {self._active_training_mode}")
+            raise ValueError(f"Unknown training mode: {mode}")
 
 
     def _decode_per_token(self, batch):
@@ -513,18 +509,6 @@ class _RefineLM(pl.LightningModule):
         if batch_mode:
             generation_attention_mask = batch["generation_attention_mask"]
             
-            assert self._tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN, self._tokenizer_padding_mode
-
-            if (self._tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN or 
-                isinstance(self._tokenizer, data_synthetic_arithmetic_tokenizer.ArithmeticTokenizer)):
-
-                # There being an eos token at the end would f up the generation
-                assert (generation_inputs != self._tokenizer.eos_token_id).all()
-
-                # Weird attention masking would f up the generation
-                assert (generation_attention_mask == (generation_inputs != self._tokenizer.pad_token_id)).all()
-                assert (batch["generation_input_ids"][:, -1] != self._tokenizer.pad_token_id).all()
-
             raw_generation_outputs = self._model.generate(
                 input_ids=generation_inputs, 
                 attention_mask=generation_attention_mask, 
@@ -532,8 +516,6 @@ class _RefineLM(pl.LightningModule):
             )
             raw_generation_outputs = raw_generation_outputs[:, generation_inputs.shape[1]:]
         else:
-            assert self._tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN, self._tokenizer_padding_mode
-
             raw_generation_outputs_list =  []
             for input_ids in generation_inputs:
                 input_ids = input_ids[input_ids != self._tokenizer.pad_token_id]
@@ -639,7 +621,6 @@ class _RefineLM(pl.LightningModule):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Verify the fraction of sequences that end with an EOS token
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        assert self._tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN, self._tokenizer_padding_mode
         last_non_masked_token = _last_non_masked(gen_outputs, self._tokenizer.pad_token_id)
         fraction_eos = (last_non_masked_token == self._tokenizer.eos_token_id).float().mean()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -701,15 +682,16 @@ class _RefineLM(pl.LightningModule):
 
 
     def train_dataloader(self):        
-        assert self._active_training_mode in [
+        mode = self._decide_training_mode()
+        assert mode in {
             constants.PipelineModes.MLE_TRAINING, 
             constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
-        ], self._active_training_mode
+        }, mode
 
         return torch.utils.data.DataLoader(
-            self._datasets[self._active_training_mode],
-            collate_fn=self._training_collators[self._active_training_mode],
-            batch_size=self._batch_size[self._active_training_mode],
+            self._datasets[mode],
+            collate_fn=self._training_collators[mode],
+            batch_size=self._batch_size[mode],
             num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_train,
         )
@@ -772,8 +754,6 @@ def _get_last_checkpoint_path(
     if wandb_run_id is None:
         return None
 
-    utils.rich_print_zero_rank(f"\n[red bold]_get_last_checkpoint_path: {wandb_run_id = }")
-
     if run_name:
         dir_ = checkpoints_folder / run_name / wandb_run_id / "checkpoints"
         checkpoints = list((dir_).glob("*.ckpt"))
@@ -801,7 +781,7 @@ def _get_last_checkpoint_path(
     epoch = int(match_obj.group(1))
     step = int(match_obj.group(2))
 
-    utils.rich_print_zero_rank(f"\n[red bold]_get_last_checkpoint_path: {checkpoint_path = !s}")
+    utils.rich_print_zero_rank(f"\n[red bold]_get_last_checkpoint_path:[/] {checkpoint_path = !s}")
 
     return LastCkptInfo(checkpoint_path, run_name, epoch, step)
 
@@ -822,14 +802,13 @@ def _set_resumed_state(
     ie. the wandb run and the random seeds and states.
     """
     checkpoints_root_dir = Path(checkpoints_root_dir)
-    meta_info_path = _make_config_path(
-        checkpoints_root_dir=checkpoints_root_dir, 
-        run_name=arg_meta_info["run_name"], 
-        wandb_run_id=arg_meta_info["wandb_run_id"],
-        step=last_ckpt_info.step,
-        epoch=last_ckpt_info.epoch,
-    )
-    meta_info = utils.load_json(meta_info_path)
+
+    root_path = checkpoints_root_dir / arg_meta_info["run_name"] / arg_meta_info["wandb_run_id"] / "checkpoints" 
+    configs = list(root_path.glob(f"epoch=*-step=*.json"))
+    most_recent = max(configs, key=lambda x: int(re.match(r"epoch=(\d+)-step=(\d+).json", x.name).group(2)))
+    assert most_recent == max(configs, key=lambda x: x.stat().st_mtime), (most_recent, max(configs, key=lambda x: x.stat().st_mtime))
+
+    meta_info = utils.load_json(most_recent)
 
     # Check that the values that need to match do match
     arg_meta_info = arg_meta_info.copy()
@@ -954,7 +933,6 @@ def remove_padding(
     Removes padding.
     """
 
-
     if isinstance(mask, np.ndarray):
         assert mask.dtype == bool, mask.dtype
     elif isinstance(mask, torch.Tensor):
@@ -976,12 +954,15 @@ def _load_data(
     tokenizer: transformers.PreTrainedTokenizer,
     mode: constants.DataModes,
     cv_sets: Optional[Iterable[str]],
+    verbose: bool = False,
 ):
     """Loads the textual entries, tokenizes them and returns a dict with the columns.
     The parallelization is done by the fast tokenizers, 
     which are truely parallel with real Rust-based threads.
     There is no need to add more parallism here.
     """
+    
+
     dataset_path = Path(dataset_path)
     
     if cv_sets is None:
@@ -1009,13 +990,14 @@ def _load_data(
 
         elif mode == constants.DataModes.HDF5_PRETOK:
             cv_path = dataset_path / f"{set_}.h5"
+            
             utils.rich_print_zero_rank(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
             with h5py.File(cv_path, "r") as f:
                 keys_to_do = [key for key in f if not key.endswith("_text")]
                 for key in keys_to_do:
                     assert f[key].dtype != object, key
 
-                cached = {k: f[k][:] for k in tqdm(keys_to_do, desc="Reading from file.")}
+                cached = {k: f[k][:] for k in tqdm(keys_to_do, desc="Reading from file.", disable=not verbose)}
                 for k, v in cached.items():
                     assert isinstance(v, np.ndarray), f"Field `{k}` is of type {type(v)}, expected np.ndarray."
 
@@ -1037,13 +1019,13 @@ def _load_data(
             
             # Remove the padding
             # Dynamic padding makes everything easier to deal with.
-            for key in tqdm(ids_keys, desc="Removing padding"):
+            for key in tqdm(ids_keys, desc="Removing padding", disable=not verbose):
                 mask_key = key + "_attention_mask"
                 tokenized_data[set_][key] = []
 
                 tokenized_data[set_][key] = remove_padding(cached[key], cached[mask_key] == 1)
 
-            for key in tqdm(text_keys, desc="Tokenizing"):
+            for key in tqdm(text_keys, desc="Tokenizing", disable=not verbose):
                 tokenized_data[set_][key] = cached[key]
 
             utils.rich_print_zero_rank(f"\n[bold]Done loading a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
@@ -1106,15 +1088,15 @@ def generate_mask(list_of_list: list[list[int]], direction: str) -> torch.LongTe
     return attention_mask
 
 
-def prep_mle_train_and_valid(*, examples, eos_token_id: int, lm_masking_mode: str, pad_token_id: int) -> None:
+def prep_mle_train_and_valid(*, examples, eos_token_id: int, scratchpad_eos_token_id: int, lm_masking_mode: str, pad_token_id: int) -> None:
     # We take a mini bit of slowness vs bug potential any day of the week right now
     examples = examples.copy()
 
     for example in examples:
         # Transormations
-        example["input_ids"] = example["input"].tolist()       + example["scratchpad"].tolist() + example["value"].tolist() + [eos_token_id]
+        example["input_ids"] = example["input"].tolist()       + example["scratchpad"].tolist() + [scratchpad_eos_token_id] + example["value"].tolist() + [eos_token_id]
         if lm_masking_mode == constants.LMMaskingMode.MASK_INPUT:
-            example["labels"] = [-100] * len(example["input"]) + example["scratchpad"].tolist() + example["value"].tolist() + [eos_token_id]
+            example["labels"] = [-100] * len(example["input"]) + example["scratchpad"].tolist() + [scratchpad_eos_token_id] + example["value"].tolist() + [eos_token_id]
         elif lm_masking_mode == constants.LMMaskingMode.PLAIN_AUTOREGRESSIVE:
             example["labels"] = example["input_ids"].copy()
         else:
@@ -1171,7 +1153,8 @@ class MLETrainingCollator:
 
         examples = prep_mle_train_and_valid(
             examples=raw_examples, 
-            eos_token_id=self._tokenizer.eos_token_id, 
+            eos_token_id=self._tokenizer.eos_token_id,
+            scratchpad_eos_token_id=self._tokenizer.cls_token_id, 
             pad_token_id=self._tokenizer.pad_token_id,
             lm_masking_mode=self._lm_masking_mode,
         )
@@ -1208,6 +1191,7 @@ class ValitationCollator:
             examples=raw_examples, 
             eos_token_id=self._tokenizer.eos_token_id, 
             pad_token_id=self._tokenizer.pad_token_id,
+            scratchpad_eos_token_id=self._tokenizer.cls_token_id,
             lm_masking_mode=self._lm_masking_mode,
         )
 
@@ -1285,7 +1269,7 @@ class DDPInfo:
             )
 
             self.num_nodes = int(os.environ["SLURM_NNODES"])
-            self.num_devices = int(len(os.environ["SLURM_JOB_GPUS"].split(",")))
+            self.num_devices = "auto"
             self.global_rank = int(os.environ["SLURM_PROCID"])
             self.local_rank = int(os.environ["SLURM_LOCALID"])
             self.node_rank = int(os.environ["SLURM_NODEID"])
@@ -1313,19 +1297,15 @@ def _setup_ddp(distribute_strategy: str) -> DDPInfo:
 
     return ddp_info
 
-def _setup_tokenizer(hf_name: str, tokenizer_padding_mode: Optional[str], is_gpt2_model) -> transformers.PreTrainedTokenizer:
+def _setup_tokenizer(hf_name: str, is_gpt2_model) -> transformers.PreTrainedTokenizer:
     if TOKENIZER_MODE == constants.TokenizerModes.ARITHMETIC:
         return data_synthetic_arithmetic_tokenizer.ArithmeticTokenizer()
         
     elif TOKENIZER_MODE == constants.TokenizerModes.PRETRAINED:
-        utils.rich_print_zero_rank(f"\n[bold]Loading tokenizer.")
-        if tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN:
-            tokenizer = transformers.AutoTokenizer.from_pretrained(
-                hf_name, pad_token="<|pad|>")
-        else:
-            tokenizer = transformers.AutoTokenizer.from_pretrained(hf_name)
-            if is_gpt2_model:
-                utils.setattr_must_exist(tokenizer, "pad_token", tokenizer.eos_token)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            hf_name, pad_token="<|pad|>", 
+            cls_token="<|cls|>"
+        )
         
         utils.setattr_must_exist(tokenizer, "padding_side", "left")        
         utils.rich_print_zero_rank(f"Tokenizer loaded.")
@@ -1341,7 +1321,6 @@ def _setup_base_model(
     is_gpt2_model: bool,
     model_mode: str,
     tokenizer: transformers.PreTrainedTokenizer,
-    tokenizer_padding_mode: str,
     verbose: bool = True
 ) -> transformers.PreTrainedModel:
     """
@@ -1389,8 +1368,7 @@ def _setup_base_model(
         raise ValueError(f"Unsupported model mode: {model_mode}")
 
 
-    if tokenizer_padding_mode:
-        base_model.resize_token_embeddings(len(tokenizer))
+    base_model.resize_token_embeddings(len(tokenizer))
 
     ###########################################################################
     # Shared modifications
@@ -1407,34 +1385,20 @@ def _setup_base_model(
     ###########################################################################
     # GPT2 model type specific modifications, invariant to the config of the model
     ###########################################################################
-    if (not tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN and is_gpt2_model and isinstance(
-        tokenizer, (transformers.PreTrainedTokenizer, transformers.PreTrainedTokenizerFast))):
-
-        utils.check_equal(TOKENIZER_MODE, constants.TokenizerModes.PRETRAINED)
-        utils.setattr_must_exist(base_model.config, "pad_token_id", base_model.config.eos_token_id)
-    else:
-        assert (isinstance(tokenizer, data_synthetic_arithmetic_tokenizer.ArithmeticTokenizer) 
-            or tokenizer_padding_mode == constants.TokenizerPaddingModes.NEW_TOKEN
-            ), (type(tokenizer), tokenizer_padding_mode)
-
-        utils.setattr_must_exist(base_model.config, "pad_token_id", tokenizer.pad_token_id)
-        # utils.setattr_must_exist(base_model.config, "bos_token_id", tokenizer.bos_token_id)
-        utils.setattr_must_exist(base_model.config, "eos_token_id", tokenizer.eos_token_id)
-
+    utils.setattr_must_exist(base_model.config, "pad_token_id", tokenizer.pad_token_id)
+    utils.setattr_must_exist(base_model.config, "eos_token_id", tokenizer.eos_token_id)
 
     ###########################################################################
     # Shared checks
     ###########################################################################
-    utils.check_equal(base_model.config.pad_token_id, tokenizer.pad_token_id)
-    utils.check_equal(base_model.config.bos_token_id, tokenizer.bos_token_id)
-    utils.check_equal(base_model.config.eos_token_id, tokenizer.eos_token_id)
     utils.check_equal(base_model.config.vocab_size, len(tokenizer.vocab))  # type: ignore[attr-defined]
 
     return base_model
 
 
 def _compute_batch_size_defaults(
-    local_rank: int, hf_name: str, batch_sizes: Optional[dict[str, int]], accelerator
+    local_rank: int, hf_name: str, batch_sizes: Optional[dict[str, int]], accelerator,
+    num_beam_groups: int,
 ) -> dict[str, int]:
     """Ad-hoc function for default the batch sizes.
     """
@@ -1444,7 +1408,7 @@ def _compute_batch_size_defaults(
         base = DEFAULT_SHARED_BATCH_SIZE
     return {
             constants.PipelineModes.MLE_TRAINING: base,
-            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: base,
+            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: MARGINAL_LIKELIHOOD_BS,
             constants.PipelineModes.VALIDATION: base * 2,
         }  
     
@@ -1491,9 +1455,8 @@ class EntryPoints:
         batch_sizes=None,
         strategy=DEFAULT_DISTRIBUTE_STRATEGIES,
         is_gpt2_model=True,
-        tokenizer_padding_mode=DEFAULT_TOKENIZER_PADDING_MODE,
         lm_masking_mode=DEFAULT_LM_MASKING_MODE,
-        switch_to_maginal_after: int = DEFAULT_SWITCH_TO_MARGINAL_AFTER,
+        switch_to_maginal_after: Optional[dict[str, int]] = DEFAULT_SWITCH_TO_MARGINAL_AFTER,
 
         #######################################################################
         # Model config
@@ -1554,17 +1517,13 @@ class EntryPoints:
 
         if resuming:
             latest_checkpoint = last_ckpt_info.path
-            utils.rich_print_zero_rank(f"[bold red] Will resume from \"{latest_checkpoint}\"")
+            utils.rich_print_zero_rank(f"[bold red] Will resume from:[/] \"{latest_checkpoint}\"")
         else:
             latest_checkpoint = None
             utils.rich_print_zero_rank(f"[bold green]Not resuming: Will start from scratch.")
 
         ddp_info = _setup_ddp(strategy)
 
-        if batch_sizes is None:
-            batch_sizes = _compute_batch_size_defaults(
-                ddp_info.local_rank, transformers_model_name, batch_sizes, ACCELERATOR
-            )
 
         arg_meta_info = _build_meta_info(
             accumulate_grad_batches=accumulate_grad_batches,
@@ -1587,17 +1546,20 @@ class EntryPoints:
             transformers_model_name=transformers_model_name,
             wandb_run_id=wandb_run_id,
             weight_decay=weight_decay,
-            tokenizer_padding_mode=tokenizer_padding_mode,
             switch_to_maginal_after=switch_to_maginal_after,
         )
         
+        
+
         # Load the pretrained model. If a checkpoint is used, it will
         # be loaded with the trainer.fit call, further in the code.
         
         
         if resuming:
-            utils.rich_print_zero_rank("\n[bold red]Resuming from checkpoint:[/]", latest_checkpoint)
-            meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
+            utils.rich_print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint)
+            # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
+            utils.rich_print_zero_rank("[bold]WATCH OUT: Not loading meta info from checkpoint.[bold]")
+            meta_info = arg_meta_info
             
             del arg_meta_info
             logger = pl.loggers.WandbLogger(
@@ -1624,10 +1586,15 @@ class EntryPoints:
             meta_info, logger = _set_initial_state(
                 checkpoints_folder, arg_meta_info, ddp_info.global_rank)
             del arg_meta_info
+        
+        if batch_sizes is None:
+            batch_sizes = _compute_batch_size_defaults(
+                ddp_info.local_rank, transformers_model_name, batch_sizes, ACCELERATOR, 
+                meta_info["generation_kwargs"][constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING]["num_beam_groups"],
+            )
 
         tokenizer = _setup_tokenizer(
             meta_info["transformers_model_name"], 
-            tokenizer_padding_mode=meta_info["tokenizer_padding_mode"],
             is_gpt2_model=meta_info["is_gpt2_model"],
         )
 
@@ -1637,7 +1604,6 @@ class EntryPoints:
             is_gpt2_model=meta_info["is_gpt2_model"],
             model_mode=meta_info["model_mode"], 
             tokenizer=tokenizer,
-            tokenizer_padding_mode=meta_info["tokenizer_padding_mode"],
         )
         utils.rich_print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"\n")
         datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
@@ -1663,7 +1629,6 @@ class EntryPoints:
             scheduler_type=meta_info["scheduler_type"],
             switch_to_maginal_after=meta_info["switch_to_maginal_after"],
             tokenizer=tokenizer,
-            tokenizer_padding_mode=meta_info["tokenizer_padding_mode"],
             use_scratchpads=use_scratchpads, 
             wandb_logger=logger,
             weight_decay=meta_info["weight_decay"],
@@ -1764,7 +1729,6 @@ class EntryPoints:
             is_gpt2_model=meta_info["is_gpt2_model"],
             model_mode=meta_info["model_mode"], 
             tokenizer=tokenizer,
-            tokenizer_padding_mode=meta_info["tokenizer_padding_mode"],
         )
         tokenizer = _setup_tokenizer(meta_info["transformers_model_name"])  
         datasets = _text_mode_build_dataset(

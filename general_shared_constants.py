@@ -59,31 +59,6 @@ class TokenizerModes(str, enum.Enum):
     ARITHMETIC = "arithmetic"
 
 
-class TokenizerPaddingModes(str, enum.Enum):
-    """
-    
-    GPT2 is not pre-trained with a special token for padding.
-    - USE_EOS: use the end-of-sentence token as padding
-    - NEW_TOKEN: use a new token as padding
-
-    Using a separate token for padding is not necessary in theory. Indeed,
-    the model should never back-propagate to them, they should always be masked.
-
-    The only reason to use a separate token is to test masking more directly.
-    Indeed, if we use a special padding token, we can just check that
-    
-    ```
-    (attention_mask == (input_ids != padding_token_id)).all()
-    ```
-    
-    We can't do this if we use the end-of-sentence token as padding, 
-    because of the end-of-sentence token's regular role.
-
-    """
-    USE_EOS = "use_eos"
-    NEW_TOKEN = "new_token"
-
-
 class SchedulerTypes(str, enum.Enum):
     """
     The type of scheduler to use.
