@@ -10,7 +10,6 @@ First, install the `general_utils` package, here: http://www.github.com/julesgm/
 Then run the script with
 
 ```
-
 python bin_refine.py main \
 --strategy None \
 --dataset_path [directory with the dataset] \

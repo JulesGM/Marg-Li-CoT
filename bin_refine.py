@@ -51,8 +51,8 @@ ANSWER_CHAINER = "\nThe final answer is "
 DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=1)
 LIMIT_VAL_BATCHES = 5
 
-DEFAULT_NUM_BEAMS = 5
-MARGINAL_LIKELIHOOD_BS = (64 * 2) // 5
+DEFAULT_NUM_BEAMS = 20
+MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
 
 DEFAULT_LM_MASKING_MODE = constants.LMMaskingMode.MASK_INPUT
 DEFAULT_LEARNING_RATE = 0.001
@@ -125,13 +125,13 @@ DEFAULT_GENERATION_KWARGS = {
         max_new_tokens=80, # This is a very important knob
         
         # Not changing
-        constraints=None,
-        diversity_penalty=0.25, # This needs to be tuned
-        num_beams=DEFAULT_NUM_BEAMS, 
-        num_beam_groups=DEFAULT_NUM_BEAMS,
-        num_return_sequences=DEFAULT_NUM_BEAMS, 
-        repetition_penalty=None,
         use_cache=True,
+        constraints=None,
+        repetition_penalty=None,
+        num_beams=DEFAULT_NUM_BEAMS, 
+        num_return_sequences=DEFAULT_NUM_BEAMS, 
+        # diversity_penalty=0.25, # This needs to be tuned
+        # num_beam_groups=DEFAULT_NUM_BEAMS,
     ),
 }
 
@@ -352,7 +352,7 @@ class _RefineLM(pl.LightningModule):
         rich.print(f"batch size:           {self._batch_size[mode]}")
         rich.print(f"num return sequences: {self._generation_kwargs[mode]['num_return_sequences']}")
 
-        with utils.cuda_timeit("generation"):
+        with utils.cuda_timeit("bin_refine.py::Generation"):
             inputs_outputs = self._model.generate(
                 input_ids=batch["generation_input_ids"],
                 attention_mask=batch["generation_attention_mask"], 
@@ -416,6 +416,8 @@ class _RefineLM(pl.LightningModule):
                 unpadded_inputs_outputs = remove_padding(
                     inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id)
                 unpadded_values = batch["value"]
+                unpadded_inputs = remove_padding(
+                    batch["generation_input_ids"], batch["generation_attention_mask"] == 1)
 
                 # Reproduce the structure of the multiple beams per input tensor
                 unpadded_repeated_values = utils.repeat_interleave(
@@ -424,20 +426,28 @@ class _RefineLM(pl.LightningModule):
                 final_input_ids = []
                 final_labels = []
 
-                for io, value  in zip(unpadded_inputs_outputs, unpadded_repeated_values):
-                    io = io.tolist()
+                for inputs, io, value  in zip(unpadded_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
                     value = value.tolist()
+                    io = io.tolist()
+
                     if not io[-1] == self._tokenizer.cls_token_id:
                         io.append(self._tokenizer.cls_token_id)
+                    
+                    scratchpad = io[len(inputs):]
                     final_input_ids.append(io + value)
-                    final_labels.append(len(io) * [-100] + value)
+                    final_labels.append(len(inputs) * [-100] + scratchpad + value)
                     
                 # Not generation = pad right
+                utils.check_equal(len(final_input_ids), len(final_labels))
                 padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right").to(self._model.device)
                 padded_final_labels    = pad(final_labels,    -100,                         "right").to(self._model.device)
                 padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
 
             with utils.cuda_timeit("score"):
+                
+                assert utils.check_equal(len(padded_final_input_ids), len(padded_final_attention_mask))
+                assert utils.check_equal(len(padded_final_labels), len(padded_final_attention_mask))
+
                 loss = self._model(
                     input_ids     =torch.tensor(padded_final_input_ids     .cpu().detach().numpy()).to(padded_final_input_ids.device),
                     attention_mask=torch.tensor(padded_final_attention_mask.cpu().detach().numpy()).to(padded_final_input_ids.device),
@@ -865,10 +875,12 @@ def _set_resumed_state(
 
 
 def _set_initial_state(
+    *,
     checkpoints_root_dir: Union[Path, str], 
     arg_meta_info: dict[str, Any], 
     global_rank: int,
-
+    wandb_project: Optional[str] = None,
+    wandb_entity: Optional[str] = None,
 ) -> tuple[dict[str, Any], pl.loggers.WandbLogger]:
     """
     Sets the initial state of the global state, ie. 
@@ -886,9 +898,9 @@ def _set_initial_state(
         arg_meta_info["wandb_run_id"] is None), arg_meta_info 
 
     wandb_logger = pl.loggers.WandbLogger(
-        project=WANDB_PROJECT,
+        project=wandb_project,
         name=arg_meta_info["run_name"],
-        entity=WANDB_ENTITY,
+        entity=wandb_project,
         log_model=False,
         config=dict(
             meta_info=arg_meta_info,
@@ -1398,7 +1410,6 @@ def _setup_base_model(
 
 def _compute_batch_size_defaults(
     local_rank: int, hf_name: str, batch_sizes: Optional[dict[str, int]], accelerator,
-    num_beam_groups: int,
 ) -> dict[str, int]:
     """Ad-hoc function for default the batch sizes.
     """
@@ -1586,13 +1597,17 @@ class EntryPoints:
         else:
             utils.rich_print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
             meta_info, logger = _set_initial_state(
-                checkpoints_folder, arg_meta_info, ddp_info.global_rank)
+                checkpoints_folder=checkpoints_folder,
+                arg_meta_info=checkpoints_folder, 
+                global_rank=ddp_info.global_rank,
+                wandb_project=wandb_project,
+                wandb_entity=wandb_entity,
+            )
             del arg_meta_info
         
         if batch_sizes is None:
             batch_sizes = _compute_batch_size_defaults(
                 ddp_info.local_rank, transformers_model_name, batch_sizes, ACCELERATOR, 
-                meta_info["generation_kwargs"][constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING]["num_beam_groups"],
             )
 
         tokenizer = _setup_tokenizer(
