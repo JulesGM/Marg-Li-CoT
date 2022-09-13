@@ -144,8 +144,8 @@ ACCELERATOR = "cuda"
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Wandb stuff
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-WANDB_ENTITY = "julesgm"
-WANDB_PROJECT = "SAG"
+DEFAULT_WANDB_ENTITY = "julesgm"
+DEFAULT_WANDB_PROJECT = "SAG"
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Training loop stuff
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1479,6 +1479,8 @@ class EntryPoints:
         #######################################################################
         wandb_run_id: Optional[str] = DEFAULT_WANDB_ID,
         checkpoints_folder: Union[Path, str] = DEFAULT_CHECKPOINTS_DIR,
+        wandb_entity: str = DEFAULT_WANDB_ENTITY,
+        wandb_project: str = DEFAULT_WANDB_PROJECT,
 
         #######################################################################
         # Don't do anything yet
@@ -1565,8 +1567,8 @@ class EntryPoints:
             logger = pl.loggers.WandbLogger(
                 resume="must", 
                 id=wandb_run_id,
-                project=WANDB_PROJECT,
-                entity=WANDB_ENTITY,
+                project=wandb_project,
+                entity=wandb_entity,
                 log_model=False,
                 name=meta_info["run_name"],
                 config=dict(
