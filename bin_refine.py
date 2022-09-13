@@ -419,14 +419,18 @@ class _RefineLM(pl.LightningModule):
                 unpadded_inputs = remove_padding(
                     batch["generation_input_ids"], batch["generation_attention_mask"] == 1)
 
+                unpadded_repeated_inputs = utils.repeat_interleave(
+                    unpadded_inputs, self._generation_kwargs[mode]["num_return_sequences"]
+                )
                 # Reproduce the structure of the multiple beams per input tensor
                 unpadded_repeated_values = utils.repeat_interleave(
-                    unpadded_values, self._generation_kwargs[mode]["num_return_sequences"]) 
+                    unpadded_values, self._generation_kwargs[mode]["num_return_sequences"]
+                ) 
 
                 final_input_ids = []
                 final_labels = []
 
-                for inputs, io, value  in zip(unpadded_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
+                for inputs, io, value  in zip(unpadded_repeated_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
                     assert torch.all(
                         io[:len(inputs)] == inputs), (
                             io[:len(inputs)] == inputs
@@ -440,7 +444,7 @@ class _RefineLM(pl.LightningModule):
                     
                     scratchpad = io[len(inputs):]
                     final_input_ids.append(io + value)
-                    final_labels.append(len(inputs) * [-100] + scratchpad + [self._tokenizer.cls_token_id] + value)
+                    final_labels.append(len(inputs) * [-100] + scratchpad + value)
                     
                 # Not generation = pad right
                 utils.check_equal(len(final_input_ids), len(final_labels))
