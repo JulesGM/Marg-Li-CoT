@@ -11,9 +11,13 @@ Then run the script with
 
 ```
 
-python bin_refine.py main --strategy None --dataset_path [directory with the dataset] \
---checkpoint_path [directory to save the checkpoints] --wandb_entity [your wandb entity] \
---wandb_project [a project you own] --wandb_run_id None
+python bin_refine.py main \
+--strategy None \
+--dataset_path [directory with the dataset] \
+--checkpoint_path [directory to save the checkpoints] \
+--wandb_entity [your wandb entity] \
+--wandb_project [a project you own] \
+--wandb_run_id None \
 
 ```
 
