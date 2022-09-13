@@ -427,6 +427,11 @@ class _RefineLM(pl.LightningModule):
                 final_labels = []
 
                 for inputs, io, value  in zip(unpadded_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
+                    assert torch.all(
+                        io[:len(inputs)] == inputs), (
+                            io[:len(inputs)] == inputs
+                        )
+                    
                     value = value.tolist()
                     io = io.tolist()
 
@@ -435,7 +440,7 @@ class _RefineLM(pl.LightningModule):
                     
                     scratchpad = io[len(inputs):]
                     final_input_ids.append(io + value)
-                    final_labels.append(len(inputs) * [-100] + scratchpad + value)
+                    final_labels.append(len(inputs) * [-100] + scratchpad + [self._tokenizer.cls_token_id] + value)
                     
                 # Not generation = pad right
                 utils.check_equal(len(final_input_ids), len(final_labels))
@@ -444,8 +449,8 @@ class _RefineLM(pl.LightningModule):
                 padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
 
             with utils.cuda_timeit("score"):
-                utils.check_equal(len(padded_final_input_ids), len(padded_final_attention_mask))
-                utils.check_equal(len(padded_final_attention_mask), len(padded_final_labels))
+                utils.check_equal(padded_final_input_ids.shape, padded_final_attention_mask.shape)
+                utils.check_equal(padded_final_attention_mask.shape, padded_final_labels.shape)
 
                 loss = self._model(
                     input_ids     =torch.tensor(padded_final_input_ids     .cpu().detach().numpy()).to(padded_final_input_ids.device),
@@ -1596,7 +1601,7 @@ class EntryPoints:
         else:
             utils.rich_print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
             meta_info, logger = _set_initial_state(
-                checkpoints_folder=checkpoints_folder,
+                checkpoints_root_dir=checkpoints_folder,
                 arg_meta_info=checkpoints_folder, 
                 global_rank=ddp_info.global_rank,
                 wandb_project=wandb_project,
