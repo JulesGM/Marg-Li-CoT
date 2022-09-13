@@ -560,7 +560,6 @@ class _RefineLM(pl.LightningModule):
         )
         mode: Final[str] = constants.PipelineModes.VALIDATION
         
-
         gen_outputs = self._generate(
             batch=batch, 
             generation_kwargs=self._generation_kwargs[mode], 
@@ -611,42 +610,16 @@ class _RefineLM(pl.LightningModule):
                 rich.print(f"[bold blue]\[gen] {gen}")
                 rich.print("=" * 80)
             
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Compute the lengths of the labels and generated text
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            gen_len = _compute_length_stats(target=gen_outputs, pad_token_id=self._tokenizer.pad_token_id)
-            lab_len = _compute_length_stats(target=batch["generation_input_ids"], pad_token_id=-100)
-            
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Plot the lengths
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            length, qty = zip(*gen_len.items())
-            plotext.simple_bar(length, qty, title="Generated Lengths")
-            plotext.show()
-
-            length, qty = zip(*lab_len.items())
-            plotext.simple_bar(length, qty, title="Label Lengths")
-            plotext.show()
             
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute different 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         em_accuracy      = np.mean([x == y                                       for x, y in for_comparison])
-        # prefix_accuracy  = np.mean([_prefix_match(x, y)                          for x, y in for_comparison])
         final_answer_acc = np.mean([_get_final_number(x) == _get_final_number(y) for x, y in for_comparison])
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Verify the fraction of sequences that end with an EOS token
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        last_non_masked_token = _last_non_masked(gen_outputs, self._tokenizer.pad_token_id)
-        fraction_eos = (last_non_masked_token == self._tokenizer.eos_token_id).float().mean()
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
         ppl_outputs = self._model(**{k: batch[k]for k in ["input_ids", "attention_mask", "labels"]})
 
-        # self.log("val_prem", prefix_accuracy,  batch_size=self._batch_size[mode], **self._logging_conf)
-        self.log("fra_eos" , fraction_eos,     batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_em"  , em_accuracy,      batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_answ", final_answer_acc, batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[mode], **self._logging_conf)
@@ -793,7 +766,7 @@ def _get_last_checkpoint_path(
     if run_name is None:
         # We recover the run name from the wandb run id
         run_name = path.parent.parent.parent.name
-        utils.rich_print_zero_rank(f"\n[red bold]Inferring `run_name` value of: {run_name = !s}")
+        utils.rich_print_zero_rank(f"\n[red bold]Inferring `run_name` value of:[/] {run_name = !s}")
 
     match_obj = re.match(r"epoch=(\d+)-step=(\d+).ckpt", checkpoint_path.name)
     epoch = int(match_obj.group(1))
