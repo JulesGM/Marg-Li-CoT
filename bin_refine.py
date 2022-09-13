@@ -50,6 +50,7 @@ ANSWER_CHAINER = "\nThe final answer is "
 ###############################################################################################
 DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=1)
 LIMIT_VAL_BATCHES = 5
+VAL_CHECK_INTERVAL = 0.05
 
 DEFAULT_NUM_BEAMS = 20
 MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
@@ -348,11 +349,12 @@ class _RefineLM(pl.LightningModule):
         """
 
         mode: Final[str] = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
+        disable_timing = True  # not utils.is_rank_zero()
 
         rich.print(f"batch size:           {self._batch_size[mode]}")
         rich.print(f"num return sequences: {self._generation_kwargs[mode]['num_return_sequences']}")
 
-        with utils.cuda_timeit("bin_refine.py::Generation"):
+        with utils.cuda_timeit("bin_refine.py::Generation", disable=disable_timing):
             inputs_outputs = self._model.generate(
                 input_ids=batch["generation_input_ids"],
                 attention_mask=batch["generation_attention_mask"], 
@@ -412,28 +414,33 @@ class _RefineLM(pl.LightningModule):
             utils.check_equal(inputs_outputs.ndim, 2)
 
             # Outputs include the inputs as well
-            with utils.cuda_timeit("[bold]bin_refine.py::Prep:[/] score inputs", disable=not utils.is_rank_zero()):
-                with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] Unpad, Repeat-interleave"):
-                    unpadded_inputs_outputs = remove_padding(
-                        inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id)
-                    unpadded_values = batch["value"]
-                    unpadded_inputs = remove_padding(
-                        batch["generation_input_ids"], batch["generation_attention_mask"] == 1
-                    )
+            with utils.cuda_timeit("[bold]bin_refine.py::Prep:[/] score inputs", disable=disable_timing):
+                with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] Unpad, Repeat-interleave", disable=disable_timing):
+                    with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] unpad then repeat-interleave", disable=disable_timing):
+                    
+                        unpadded_inputs_outputs = remove_padding(
+                            inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id
+                        )
+                        unpadded_values = batch["value"]
+                        unpadded_inputs = remove_padding(
+                            batch["generation_input_ids"], batch["generation_attention_mask"] == 1
+                        )
 
-                    unpadded_repeated_inputs = utils.repeat_interleave(
-                        unpadded_inputs, self._generation_kwargs[mode]["num_return_sequences"]
-                    )
-                    # Reproduce the structure of the multiple beams per input tensor
-                    unpadded_repeated_values = utils.repeat_interleave(
-                        unpadded_values, self._generation_kwargs[mode]["num_return_sequences"]
-                    ) 
+                        unpadded_repeated_inputs = utils.repeat_interleave(
+                            unpadded_inputs, self._generation_kwargs[mode]["num_return_sequences"]
+                        )
+                        # Reproduce the structure of the multiple beams per input tensor
+                        unpadded_repeated_values = utils.repeat_interleave(
+                            unpadded_values, self._generation_kwargs[mode]["num_return_sequences"]
+                        ) 
 
                 final_input_ids = []
                 final_labels = []
 
-                with utils.cuda_timeit("[bold]bin_refine.py::PSI-B:[/] Loop"):
+                with utils.cuda_timeit("[bold]bin_refine.py::PSI-B:[/] Loop", disable=disable_timing):
                     for inputs, io, value  in zip(unpadded_repeated_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
+                        # TODO: Future optimization: don't convert to a list. Probably faster.
+
                         value = value.tolist()
                         io = io.tolist()
 
@@ -445,13 +452,13 @@ class _RefineLM(pl.LightningModule):
                         final_labels.append(len(inputs) * [-100] + scratchpad + value)
                         
                 # Not generation = pad right
-                with utils.cuda_timeit("[bold]bin_refine.py::PSI-C:[/] Pad"):
+                with utils.cuda_timeit("[bold]bin_refine.py::PSI-C:[/] Pad", disable=disable_timing):
                     utils.check_equal(len(final_input_ids), len(final_labels))
                     padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right").to(self._model.device)
                     padded_final_labels    = pad(final_labels,    -100,                         "right").to(self._model.device)
                     padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
 
-            with utils.cuda_timeit("bin_refine.py::Score", not utils.is_rank_zero()):
+            with utils.cuda_timeit("bin_refine.py::Score", disable=disable_timing):
                 utils.check_equal(padded_final_input_ids.shape, padded_final_attention_mask.shape)
                 utils.check_equal(padded_final_attention_mask.shape, padded_final_labels.shape)
 
@@ -873,14 +880,12 @@ def _set_initial_state(
     """
     checkpoints_root_dir = Path(checkpoints_root_dir)
     
-
-    assert ("wandb_run_id" not in arg_meta_info or 
-        arg_meta_info["wandb_run_id"] is None), arg_meta_info 
+    assert ("wandb_run_id" not in arg_meta_info or arg_meta_info["wandb_run_id"] is None), arg_meta_info 
 
     wandb_logger = pl.loggers.WandbLogger(
         project=wandb_project,
         name=arg_meta_info["run_name"],
-        entity=wandb_project,
+        entity=wandb_entity,
         log_model=False,
         config=dict(
             meta_info=arg_meta_info,
@@ -1575,7 +1580,7 @@ class EntryPoints:
             utils.rich_print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
             meta_info, logger = _set_initial_state(
                 checkpoints_root_dir=checkpoints_folder,
-                arg_meta_info=checkpoints_folder, 
+                arg_meta_info=arg_meta_info, 
                 global_rank=ddp_info.global_rank,
                 wandb_project=wandb_project,
                 wandb_entity=wandb_entity,
@@ -1747,14 +1752,15 @@ class EntryPoints:
         )
 
         trainer = pl.Trainer(
-            deterministic=DETERMINISTIC,
-            default_root_dir=str(checkpoints_root_dir),
             precision=PRECISION,
             accelerator=ACCELERATOR,
-            limit_val_batches=LIMIT_VAL_BATCHES,
-            strategy=distribute_strategy,
-            num_nodes=ddp_info.num_nodes,
+            deterministic=DETERMINISTIC,
             devices=ddp_info.num_devices,
+            num_nodes=ddp_info.num_nodes,
+            strategy=distribute_strategy,
+            limit_val_batches=LIMIT_VAL_BATCHES,
+            val_check_interval=VAL_CHECK_INTERVAL,
+            default_root_dir=str(checkpoints_root_dir),
             limit_predict_batches=math.ceil(qty / batch_sizes[mode]),
         )
 
