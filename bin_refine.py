@@ -444,9 +444,8 @@ class _RefineLM(pl.LightningModule):
                 padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
 
             with utils.cuda_timeit("score"):
-                
-                assert utils.check_equal(len(padded_final_input_ids), len(padded_final_attention_mask))
-                assert utils.check_equal(len(padded_final_labels), len(padded_final_attention_mask))
+                utils.check_equal(len(padded_final_input_ids), len(padded_final_attention_mask))
+                utils.check_equal(len(padded_final_attention_mask), len(padded_final_labels))
 
                 loss = self._model(
                     input_ids     =torch.tensor(padded_final_input_ids     .cpu().detach().numpy()).to(padded_final_input_ids.device),
