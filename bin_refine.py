@@ -412,47 +412,46 @@ class _RefineLM(pl.LightningModule):
             utils.check_equal(inputs_outputs.ndim, 2)
 
             # Outputs include the inputs as well
-            with utils.cuda_timeit("prep score inputs"):
-                unpadded_inputs_outputs = remove_padding(
-                    inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id)
-                unpadded_values = batch["value"]
-                unpadded_inputs = remove_padding(
-                    batch["generation_input_ids"], batch["generation_attention_mask"] == 1)
+            with utils.cuda_timeit("[bold]bin_refine.py::Prep:[/] score inputs", disable=not utils.is_rank_zero()):
+                with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] Unpad, Repeat-interleave"):
+                    unpadded_inputs_outputs = remove_padding(
+                        inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id)
+                    unpadded_values = batch["value"]
+                    unpadded_inputs = remove_padding(
+                        batch["generation_input_ids"], batch["generation_attention_mask"] == 1
+                    )
 
-                unpadded_repeated_inputs = utils.repeat_interleave(
-                    unpadded_inputs, self._generation_kwargs[mode]["num_return_sequences"]
-                )
-                # Reproduce the structure of the multiple beams per input tensor
-                unpadded_repeated_values = utils.repeat_interleave(
-                    unpadded_values, self._generation_kwargs[mode]["num_return_sequences"]
-                ) 
+                    unpadded_repeated_inputs = utils.repeat_interleave(
+                        unpadded_inputs, self._generation_kwargs[mode]["num_return_sequences"]
+                    )
+                    # Reproduce the structure of the multiple beams per input tensor
+                    unpadded_repeated_values = utils.repeat_interleave(
+                        unpadded_values, self._generation_kwargs[mode]["num_return_sequences"]
+                    ) 
 
                 final_input_ids = []
                 final_labels = []
 
-                for inputs, io, value  in zip(unpadded_repeated_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
-                    assert torch.all(
-                        io[:len(inputs)] == inputs), (
-                            io[:len(inputs)] == inputs
-                        )
-                    
-                    value = value.tolist()
-                    io = io.tolist()
+                with utils.cuda_timeit("[bold]bin_refine.py::PSI-B:[/] Loop"):
+                    for inputs, io, value  in zip(unpadded_repeated_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
+                        value = value.tolist()
+                        io = io.tolist()
 
-                    if not io[-1] == self._tokenizer.cls_token_id:
-                        io.append(self._tokenizer.cls_token_id)
-                    
-                    scratchpad = io[len(inputs):]
-                    final_input_ids.append(io + value)
-                    final_labels.append(len(inputs) * [-100] + scratchpad + value)
-                    
+                        if not io[-1] == self._tokenizer.cls_token_id:
+                            io.append(self._tokenizer.cls_token_id)
+                        
+                        scratchpad = io[len(inputs):]
+                        final_input_ids.append(io + value)
+                        final_labels.append(len(inputs) * [-100] + scratchpad + value)
+                        
                 # Not generation = pad right
-                utils.check_equal(len(final_input_ids), len(final_labels))
-                padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right").to(self._model.device)
-                padded_final_labels    = pad(final_labels,    -100,                         "right").to(self._model.device)
-                padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
+                with utils.cuda_timeit("[bold]bin_refine.py::PSI-C:[/] Pad"):
+                    utils.check_equal(len(final_input_ids), len(final_labels))
+                    padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right").to(self._model.device)
+                    padded_final_labels    = pad(final_labels,    -100,                         "right").to(self._model.device)
+                    padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
 
-            with utils.cuda_timeit("score"):
+            with utils.cuda_timeit("bin_refine.py::Score", not utils.is_rank_zero()):
                 utils.check_equal(padded_final_input_ids.shape, padded_final_attention_mask.shape)
                 utils.check_equal(padded_final_attention_mask.shape, padded_final_labels.shape)
 
@@ -1368,9 +1367,6 @@ def _setup_base_model(
     ###########################################################################
     utils.setattr_must_exist(base_model.config, "early_stopping", True)
     del base_model.config.task_specific_params
-
-    if utils.is_rank_zero():
-        print(base_model)
 
     assert is_gpt2_model == (base_model.config.model_type == "gpt2"), (
         is_gpt2_model, base_model.config.model_type)
