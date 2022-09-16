@@ -48,7 +48,7 @@ CHAINER = " => "
 DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=6)
 LIMIT_VAL_BATCHES = 10
 LIMIT_TRAIN_BATCHES = None
-VAL_CHECK_INTERVAL = 0.05
+VAL_CHECK_INTERVAL = 0.01
 
 DEFAULT_NUM_BEAMS = 20
 MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
@@ -83,7 +83,7 @@ SCHEDULER_FN = {
 }
 
 
-DEFAULT_WANDB_ID: Optional[str] = "2rid5n8n"
+DEFAULT_WANDB_ID: Optional[str] = None #; "2rid5n8n"
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
 DEFAULT_USE_SCRATCHPADS = False
 
@@ -92,17 +92,17 @@ TOKENIZER_MODE = constants.TokenizerModes.PRETRAINED
 
 
 DEFAULT_HUGGING_FACE = "distilgpt2"
-# DEFAULT_MODEL_MODE = constants.ModelModes.PRETRAINED
-# DEFAULT_CUSTOM_MODEL_CONFIG: Optional[dict[str, Any]] = None
+DEFAULT_MODEL_MODE = constants.ModelModes.PRETRAINED
+DEFAULT_CUSTOM_MODEL_CONFIG: Optional[dict[str, Any]] = None
 
-DEFAULT_MODEL_MODE = constants.ModelModes.RANDOM
-DEFAULT_CUSTOM_MODEL_CONFIG = dict(
-    n_ctx=64,
-    n_embd=64,
-    hidden_size=64,
-    num_hidden_layers=4,
-    num_attention_heads=4,
-)
+# DEFAULT_MODEL_MODE = constants.ModelModes.RANDOM
+# DEFAULT_CUSTOM_MODEL_CONFIG = dict(
+#     n_ctx=64,
+#     n_embd=64,
+#     hidden_size=64,
+#     num_hidden_layers=4,
+#     num_attention_heads=4,
+# )
 
 DEFAULT_GENERATION_KWARGS = {
     constants.PipelineModes.VALIDATION: 
@@ -1669,12 +1669,6 @@ class EntryPoints:
         ###############################################################
         trainer = pl.Trainer(
             accumulate_grad_batches=meta_info["accumulate_grad_batches"],
-            enable_checkpointing=pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
-                dirpath=checkpoints_folder,
-                every_n_epochs=1, 
-                save_on_train_epoch_end=True, 
-                save_last=True
-            ),
             logger=logger,
             num_nodes=ddp_info.num_nodes,
             devices=ddp_info.num_devices,
@@ -1695,6 +1689,12 @@ class EntryPoints:
 
             callbacks=[
                 pl.callbacks.LearningRateMonitor(logging_interval="step"),
+                pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
+                    dirpath=checkpoints_folder,
+                    every_n_epochs=1, 
+                    save_on_train_epoch_end=True, 
+                    save_last=True
+                ),
             ]
         )
         
@@ -1794,7 +1794,6 @@ class EntryPoints:
             num_nodes=ddp_info.num_nodes,
             strategy=distribute_strategy,
             default_root_dir=str(checkpoints_root_dir),
-
             limit_predict_batches=math.ceil(qty / batch_sizes[mode]),
         )
 
