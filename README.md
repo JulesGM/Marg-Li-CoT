@@ -41,3 +41,8 @@ srun python bin_refine.py main --strategy=ddp_find_unused_parameters_false
 2. Refine GPT2 with the dataset
 3. Fine-tune GPT2 with marginal likelihood
 
+# WHY DOESN'T LEARN AT ALL
+
+##### Quantize every now and then
+##### Inference once per few epochs
+##### 

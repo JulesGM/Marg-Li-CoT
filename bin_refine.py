@@ -62,47 +62,25 @@ DEFAULT_SCHEDULER_TYPE = constants.SchedulerTypes.LINEAR_WARMUP_LINEAR
 WARMUP_EPOCHS = 1
 MAX_EPOCHS = 53
 
-SCHEDULER_FN = {
-    constants.SchedulerTypes.CONSTANT:
-        lambda optimizer, steps_per_epoch:
-            transformers.get_constant_schedule(
-                optimizer),
-
-    constants.SchedulerTypes.LINEAR_WARMUP_CONSTANT: 
-        lambda optimizer, steps_per_epoch:
-            transformers.get_linear_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=steps_per_epoch * WARMUP_EPOCHS),
-
-    constants.SchedulerTypes.LINEAR_WARMUP_LINEAR: 
-        lambda optimizer, steps_per_epoch:
-            transformers.get_linear_schedule_with_warmup(
-                optimizer, 
-                num_warmup_steps=steps_per_epoch * WARMUP_EPOCHS,
-                num_training_steps=steps_per_epoch * MAX_EPOCHS,),
-}
-
-
-DEFAULT_WANDB_ID: Optional[str] = None #; "2rid5n8n"
+DEFAULT_WANDB_ID: Optional[str] = "2rid5n8n" 
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
 DEFAULT_USE_SCRATCHPADS = False
 
 DATA_MODE = constants.DataModes.HDF5_PRETOK
 TOKENIZER_MODE = constants.TokenizerModes.PRETRAINED
 
-
 DEFAULT_HUGGING_FACE = "distilgpt2"
-DEFAULT_MODEL_MODE = constants.ModelModes.PRETRAINED
-DEFAULT_CUSTOM_MODEL_CONFIG: Optional[dict[str, Any]] = None
+# DEFAULT_MODEL_MODE = constants.ModelModes.PRETRAINED
+# DEFAULT_CUSTOM_MODEL_CONFIG: Optional[dict[str, Any]] = None
 
-# DEFAULT_MODEL_MODE = constants.ModelModes.RANDOM
-# DEFAULT_CUSTOM_MODEL_CONFIG = dict(
-#     n_ctx=64,
-#     n_embd=64,
-#     hidden_size=64,
-#     num_hidden_layers=4,
-#     num_attention_heads=4,
-# )
+DEFAULT_MODEL_MODE = constants.ModelModes.RANDOM
+DEFAULT_CUSTOM_MODEL_CONFIG = dict(
+    n_ctx=64,
+    n_embd=64,
+    hidden_size=64,
+    num_hidden_layers=4,
+    num_attention_heads=4,
+)
 
 DEFAULT_GENERATION_KWARGS = {
     constants.PipelineModes.VALIDATION: 
@@ -165,6 +143,25 @@ DATA_PATH = SCRIPT_DIR / "data"
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 PRECISION = 16
 
+SCHEDULER_FN = {
+    constants.SchedulerTypes.CONSTANT:
+        lambda optimizer, steps_per_epoch:
+            transformers.get_constant_schedule(
+                optimizer),
+
+    constants.SchedulerTypes.LINEAR_WARMUP_CONSTANT: 
+        lambda optimizer, steps_per_epoch:
+            transformers.get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=steps_per_epoch * WARMUP_EPOCHS),
+
+    constants.SchedulerTypes.LINEAR_WARMUP_LINEAR: 
+        lambda optimizer, steps_per_epoch:
+            transformers.get_linear_schedule_with_warmup(
+                optimizer, 
+                num_warmup_steps=steps_per_epoch * WARMUP_EPOCHS,
+                num_training_steps=steps_per_epoch * MAX_EPOCHS,),
+}
 
 def _compute_length_stats(*, target, pad_token_id):
     good_mask = target != pad_token_id
@@ -464,22 +461,34 @@ class _RefineLM(pl.LightningModule):
                 )
 
                 labels = padded_final_labels
-                lm_probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
 
+                log_inside = False
+                if log_inside:
+                    lm_probs = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
+                else:
+                    lm_probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
                 shift_probs = lm_probs[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 
                 new_labels = shift_labels.view(-1).unsqueeze(-1)
                 new_probs = shift_probs.view(-1, shift_probs.shape[-1])
-                new_probs[new_labels[:, 0] == -100, self._tokenizer.pad_token_id] = 1
+                utils.check_equal(new_labels.shape[1], 1)
+                utils.check_equal(new_labels.ndim, 2)
+                mask_minus_hundred = new_labels[:, 0] == -100, self._tokenizer.pad_token_id
+                new_probs[mask_minus_hundred] = 1
                 new_labels[new_labels == -100] = self._tokenizer.pad_token_id
 
                 label_probs = torch.gather(new_probs, dim=1, index=new_labels)
-                label_probs = label_probs.view(*shift_labels.shape, -1)
+                label_probs = label_probs.view(*shift_labels.shape)
 
-                marginalized_probs = torch.sum(label_probs.prod(dim=-1), dim=-1)
-                logged = torch.log(marginalized_probs)
-                loss = torch.mean(logged, dim=-1)
+                if log_inside:
+                    marginalized_probs = torch.sum(label_probs.sum(dim=-1), dim=-1)
+                    logged = marginalized_probs
+                else:
+                    marginalized_probs = torch.sum(label_probs.prod(dim=-1), dim=-1)
+                    logged = torch.log(marginalized_probs)
+                
+                loss = - torch.mean(logged, dim=-1)
                 assert torch.isnan(loss).sum() == 0
                 assert loss.ndim == 0, loss.shape
                     
@@ -1690,7 +1699,7 @@ class EntryPoints:
             callbacks=[
                 pl.callbacks.LearningRateMonitor(logging_interval="step"),
                 pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
-                    dirpath=checkpoints_folder,
+                    dirpath=checkpoints_folder / meta_info["run_name"] / wandb_run_id,
                     every_n_epochs=1, 
                     save_on_train_epoch_end=True, 
                     save_last=True
