@@ -62,7 +62,7 @@ DEFAULT_SCHEDULER_TYPE = constants.SchedulerTypes.LINEAR_WARMUP_LINEAR
 WARMUP_EPOCHS = 1
 MAX_EPOCHS = 53
 
-DEFAULT_WANDB_ID: Optional[str] = "2rid5n8n" 
+DEFAULT_WANDB_ID: Optional[str] = None # "2rid5n8n" 
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
 DEFAULT_USE_SCRATCHPADS = False
 
@@ -296,7 +296,7 @@ class _RefineLM(pl.LightningModule):
         self._scheduler = None
 
 
-    def on_epoch_start(self) -> None:
+    def on_train_epoch_start(self) -> None:
         mode = self._decide_training_mode()
         if mode == constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING:
             self.trainer.val_check_interval = VAL_CHECK_INTERVAL
@@ -462,11 +462,15 @@ class _RefineLM(pl.LightningModule):
 
                 labels = padded_final_labels
 
-                log_inside = False
-                if log_inside:
+                log_mode = "inside"
+                assert log_mode in {"inside", "outside", "logsumexp"}
+
+                if log_mode in {"inside", "logsumexp"}:
                     lm_probs = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
-                else:
+                elif log_mode == "outside":
                     lm_probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+                else:
+                    raise ValueError(log_mode)
 
                 shift_probs = lm_probs[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
@@ -482,13 +486,18 @@ class _RefineLM(pl.LightningModule):
                 label_probs = torch.gather(new_probs, dim=1, index=new_labels)
                 label_probs = label_probs.view(*shift_labels.shape)
 
-                if log_inside:
+                if log_mode == "log_inside":
                     marginalized_probs = torch.sum(label_probs.sum(dim=-1), dim=-1)
                     logged = marginalized_probs
-                else:
+                elif log_mode == "logsumexp":
+                    marginalized_probs = torch.logsumexp(label_probs, dim=-1)
+                    logged = marginalized_probs
+                elif log_mode == "inside":
                     marginalized_probs = torch.sum(label_probs.prod(dim=-1), dim=-1)
                     logged = torch.log(marginalized_probs)
-                
+                else:
+                    raise ValueError(log_mode)
+
                 loss = - torch.mean(logged, dim=-1)
                 assert torch.isnan(loss).sum() == 0
                 assert loss.ndim == 0, loss.shape
@@ -1470,7 +1479,7 @@ def _compute_batch_size_defaults(
 
 @beartype
 def _make_config_path(checkpoints_root_dir: Path, run_name: str, wandb_run_id: str, step: int, epoch: int) -> Path:
-    return checkpoints_root_dir / run_name / wandb_run_id / "checkpoints" / f"epoch={epoch}-step={step}.json"
+    return checkpoints_root_dir / run_name / wandb_run_id / f"epoch={epoch}-step={step}.json"
 
 
 DATA_DIR = SCRIPT_DIR / "data"
@@ -1546,7 +1555,7 @@ class EntryPoints:
         )
 
         torch.use_deterministic_algorithms(mode=DETERMINISTIC)
-        run_name = dataset_path.name + "_0.01_wd"   
+        run_name = dataset_path.name
         last_ckpt_info = _get_last_checkpoint_path(
             checkpoints_folder, None, wandb_run_id)
         resuming = wandb_run_id is not None
@@ -1561,7 +1570,6 @@ class EntryPoints:
             utils.rich_print_zero_rank(f"[bold green]Not resuming: Will start from scratch.")
 
         ddp_info = _setup_ddp(strategy)
-
 
         arg_meta_info = _build_meta_info(
             accumulate_grad_batches=accumulate_grad_batches,
@@ -1587,11 +1595,8 @@ class EntryPoints:
             switch_to_maginal_after=switch_to_maginal_after,
         )
         
-        
-
         # Load the pretrained model. If a checkpoint is used, it will
         # be loaded with the trainer.fit call, further in the code.
-        
         
         if resuming:
             utils.rich_print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint)
@@ -1655,6 +1660,10 @@ class EntryPoints:
         rich.print(f"[bold red]Strategy: {strategy}[/]")
         rich.print(f"[bold red]ddp_info: {vars(ddp_info)}[/]")
 
+        if strategy:
+            
+        assert wandb_run_id, wandb_run_id
+
         ###############################################################
         # Build the pt-lightning dataloader
         ###############################################################
@@ -1676,12 +1685,6 @@ class EntryPoints:
             weight_decay=meta_info["weight_decay"],
             
         )
-
-        if strategy is not None and not resuming:
-            assert wandb_run_id is None
-            utils.check_equal(strategy, "ddp")
-            strat = pl.strategies.DDPStrategy()
-            wandb_run_id = strat.broadcast(wandb_run_id, 0)
 
         ###############################################################
         # All of the follwing arguments are very stable
@@ -1709,7 +1712,7 @@ class EntryPoints:
             callbacks=[
                 pl.callbacks.LearningRateMonitor(logging_interval="step"),
                 pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
-                    dirpath=checkpoints_folder / meta_info["run_name"] / wandb_run_id,
+                    dirpath=(checkpoints_folder / meta_info["run_name"] / wandb_run_id) if wandb_run_id else None,
                     every_n_epochs=1, 
                     save_on_train_epoch_end=True, 
                     save_last=True
