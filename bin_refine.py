@@ -4,10 +4,8 @@
 print("Importing modules.")
 import collections
 import dataclasses
-import enum
 import itertools
 import json  # type: ignore[import]
-import logging
 import math
 import os
 from pathlib import Path
@@ -19,12 +17,10 @@ from typing import *
 
 from beartype import beartype  # type: ignore[import]
 import fire  # type: ignore[import]
-import functorch  # type: ignore[import]
 import h5py  # type: ignore[import]
 import jsonlines as jsonl  # type: ignore
 import more_itertools  # type: ignore[import]
 import numpy as np
-import plotext  # type: ignore[import]
 import pretty_traceback  # type: ignore
 import pytorch_lightning as pl  # type: ignore[import]
 import rich  # type: ignore[import]
@@ -42,14 +38,17 @@ import data_synthetic_arithmetic_tokenizer
 pretty_traceback.install()
 print("Done loading modules.\n")
 
+torch.autograd.set_detect_anomaly(True)
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 CHAINER = " => "
-ANSWER_CHAINER = "\nThe final answer is "
 
 ###############################################################################################
 # Constants that should be changed from time to time
 ###############################################################################################
-DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=2)
-LIMIT_VAL_BATCHES = 5
+DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=6)
+LIMIT_VAL_BATCHES = 10
+LIMIT_TRAIN_BATCHES = None
 VAL_CHECK_INTERVAL = 0.05
 
 DEFAULT_NUM_BEAMS = 20
@@ -85,7 +84,7 @@ SCHEDULER_FN = {
 }
 
 
-DEFAULT_WANDB_ID: Optional[str] = None  # "103uy4nu"
+DEFAULT_WANDB_ID: Optional[str] = "2rid5n8n"
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
 DEFAULT_USE_SCRATCHPADS = False
 
@@ -151,7 +150,6 @@ DEFAULT_WANDB_PROJECT = "SAG"
 # Training loop stuff
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 EVAL_EVERY_N_EPOCHS = 1
-LIMIT_TRAIN_BATCHES = None
 DETERMINISTIC = False
 DEFAULT_CHECKPOINTS_DIR = SCRIPT_DIR / "checkpoints"
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -259,7 +257,7 @@ class _RefineLM(pl.LightningModule):
 
         self._dataloader_num_workers: Final[int] = DATALOADER_NUM_WORKERS
         self._wandb_logger: Final[pl.loggers.WandbLogger] = wandb_logger
-        self._model: Final[transformers.PreTrainedModel] = model
+        self._model: Final[transformers.GPT2LMHeadModel] = model
         self._datasets: Final[Dict[str, torch.utils.data.Dataset]] = datasets
         self._tokenizer: Final[transformers.PreTrainedTokenizer] = tokenizer
         self._batch_size: Final[dict[str, int]] = batch_sizes
@@ -307,7 +305,11 @@ class _RefineLM(pl.LightningModule):
 
 
     def on_epoch_start(self) -> None:
+        mode = self._decide_training_mode()
+        if mode == constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING:
+            self.trainer.val_check_interval = VAL_CHECK_INTERVAL
         self.trainer.reset_train_dataloader()
+
 
     def forward(self, *args, **kwargs):
         return self._model(*args, **kwargs)
@@ -327,7 +329,8 @@ class _RefineLM(pl.LightningModule):
         outputs = self(**batch)
 
         self.log(
-            "train_loss", outputs.loss, 
+            "train_loss", 
+            outputs.loss, 
             batch_size=self._batch_size[constants.PipelineModes.MLE_TRAINING], 
             **self._logging_conf
         )
@@ -452,10 +455,9 @@ class _RefineLM(pl.LightningModule):
                             io.append(self._tokenizer.cls_token_id)
                         
                         scratchpad = io[len(inputs):]
-                        final_input_ids.append(io + value)
-                        final_labels.append(len(inputs) * [-100] + scratchpad + value)
+                        final_input_ids.append(io + value + [self._tokenizer.eos_token_id])
+                        final_labels.append(len(inputs) * [-100] + scratchpad + value + [self._tokenizer.eos_token_id])
                         
-                # Not generation = pad right
                 with utils.cuda_timeit("[bold]bin_refine.py::PSI-C:[/] Pad", disable=disable_timing):
                     utils.check_equal(len(final_input_ids), len(final_labels))
                     padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right").to(self._model.device)
@@ -466,12 +468,50 @@ class _RefineLM(pl.LightningModule):
                 utils.check_equal(padded_final_input_ids.shape, padded_final_attention_mask.shape)
                 utils.check_equal(padded_final_attention_mask.shape, padded_final_labels.shape)
 
-                loss = self._model(
-                    input_ids     =torch.tensor(padded_final_input_ids     .cpu().detach().numpy()).to(padded_final_input_ids.device),
-                    attention_mask=torch.tensor(padded_final_attention_mask.cpu().detach().numpy()).to(padded_final_input_ids.device),
-                    labels        =torch.tensor(padded_final_labels        .cpu().detach().numpy()).to(padded_final_input_ids.device),
-                ).loss
+                # sample_index = np.random.randint(0, len(padded_final_input_ids))
+                # import rich.table as table
+                # table_ = table.Table("Input", "Attn-Mask", "Label")
+                # for input_id, attention_mask, label in zip(
+                #     padded_final_input_ids[sample_index], 
+                #     padded_final_attention_mask[sample_index], 
+                #     padded_final_labels[sample_index]
+                # ):
+                #     if label == -100:
+                #         label = self._tokenizer.pad_token_id
+                
+                #     table_.add_row(
+                #         f"'{self._tokenizer.decode(input_id)}'", 
+                #         f"'{self._tokenizer.decode(label)}'", 
+                #         f"'{str(attention_mask.item())}'",
+                #     )
+                # rich.print(table_)
 
+                assert torch.all(padded_final_input_ids[:, 0] != self._tokenizer.pad_token_id)
+                outputs = self._model(
+                    input_ids      = padded_final_input_ids,
+                    attention_mask = padded_final_attention_mask,
+                    labels         = padded_final_labels,
+                )
+
+                labels = padded_final_labels
+                lm_logits = outputs.logits
+
+                shift_logits = lm_logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                
+                new_labels = shift_labels.view(-1).unsqueeze(-1)
+                new_probs = shift_logits.view(-1, shift_logits.shape[-1])
+                new_probs[new_labels[:, 0] == -100, self._tokenizer.pad_token_id] = 1
+                new_labels[new_labels == -100] = self._tokenizer.pad_token_id
+
+                label_probs = torch.gather(new_probs, dim=1, index=new_labels)
+                label_probs = label_probs.view(*shift_labels.shape, -1)
+
+                marginalized_probs = torch.sum(label_probs.prod(dim=-1), dim=-1)
+                logged = torch.log(marginalized_probs)
+                loss = torch.mean(logged, dim=-1)
+                assert loss.ndim == 0, loss.shape
+                    
         # sum probs
         return loss
 
@@ -586,7 +626,7 @@ class _RefineLM(pl.LightningModule):
             ) for gen, l in zip(dps_generation, dps_labels)
         ]
 
-        if False and (batch_idx == 0 and utils.is_rank_zero()):
+        if batch_idx == 0 and utils.is_rank_zero():
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Log Generated Text in Wandb.  
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1169,9 +1209,6 @@ class MLETrainingCollator:
             lm_masking_mode=self._lm_masking_mode,
         )
 
-        examples["generation_attention_mask"] = generate_mask(examples["input"], "left")
-        examples["generation_input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
-        
         return examples
 
 
@@ -1680,6 +1717,7 @@ class EntryPoints:
             max_epochs=MAX_EPOCHS,
             limit_train_batches=LIMIT_TRAIN_BATCHES,
             limit_val_batches=LIMIT_VAL_BATCHES,
+            reload_dataloaders_every_n_epochs=1,
 
             callbacks=[
                 pl.callbacks.LearningRateMonitor(logging_interval="step"),
