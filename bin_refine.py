@@ -1677,8 +1677,11 @@ class EntryPoints:
             
         )
 
-        if strategy is not None:
-            wandb_run_id = pl_object.all_gather(wandb_run_id)[0]
+        if strategy is not None and not resuming:
+            assert wandb_run_id is None
+            utils.check_equal(strategy, "ddp")
+            strat = pl.strategies.DDPStrategy()
+            wandb_run_id = strat.broadcast(wandb_run_id, 0)
 
         ###############################################################
         # All of the follwing arguments are very stable
