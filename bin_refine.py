@@ -33,7 +33,6 @@ import wandb
 
 import general_shared_constants as constants
 import general_utils as utils
-import data_synthetic_arithmetic_tokenizer 
 
 pretty_traceback.install()
 print("Done loading modules.\n")
