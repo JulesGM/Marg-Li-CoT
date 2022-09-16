@@ -467,6 +467,7 @@ class _RefineLM(pl.LightningModule):
                     lm_probs = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
                 else:
                     lm_probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+
                 shift_probs = lm_probs[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 
@@ -921,6 +922,7 @@ def _set_initial_state(
         ),
     )
 
+    wandb_run_id = None
     if global_rank == 0:
         wandb.run.log_code(SCRIPT_DIR)
         arg_meta_info["wandb_run_id"] = wandb.run.id
@@ -942,8 +944,10 @@ def _set_initial_state(
             config_path, 
             default=_json_default_paths,
         )
-
-    return arg_meta_info, wandb_logger
+        wandb_run_id = wandb.run.id
+    
+    # Broadcast the wandb run id
+    return arg_meta_info, wandb_logger, wandb_run_id
 
 
 def _build_meta_info(**kwargs):
@@ -1617,7 +1621,7 @@ class EntryPoints:
                 wandb.run.log_code(SCRIPT_DIR)
         else:
             utils.rich_print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
-            meta_info, logger = _set_initial_state(
+            meta_info, logger, wandb_run_id = _set_initial_state(
                 checkpoints_root_dir=checkpoints_folder,
                 arg_meta_info=arg_meta_info, 
                 global_rank=ddp_info.global_rank,
@@ -1630,7 +1634,7 @@ class EntryPoints:
             batch_sizes = _compute_batch_size_defaults(
                 ddp_info.local_rank, transformers_model_name, batch_sizes, ACCELERATOR, 
             )
-
+        
         tokenizer = _setup_tokenizer(
             meta_info["transformers_model_name"], 
             is_gpt2_model=meta_info["is_gpt2_model"],
@@ -1672,6 +1676,9 @@ class EntryPoints:
             weight_decay=meta_info["weight_decay"],
             
         )
+
+        if strategy is not None:
+            wandb_run_id = pl_object.all_gather(wandb_run_id)[0]
 
         ###############################################################
         # All of the follwing arguments are very stable
