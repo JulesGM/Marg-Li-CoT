@@ -383,31 +383,6 @@ class _RefineLM(pl.LightningModule):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if marginal_model == "separate":
             assert False, "code under development"
-            z_knowing_x_val, z_knowing_x_mask = unpad_concatenate_repad(
-                tensors=[
-                    batch["input_ids"], 
-                    outputs,
-                ], 
-                attention_masks=[
-                    batch["input_ids"] != self._tokenizer.pad_token_id, 
-                    outputs != self._tokenizer.pad_token_id
-                ],
-                pad_token_id=self._tokenizer.pad_token_id,
-                new_padding_direction="right",
-            )
-            
-            label_mask = torch.ones_like(z_knowing_x_mask) * -100
-            assert label_mask.dtype == torch.long, label_mask.dtype
-            y_knowing_x_z_val, y_knowing_x_z_mask = unpad_concatenate_repad(
-                tensors=[label_mask, batch["value"]],
-                attention_masks=[
-                    label_mask,
-                    batch["value"] != self._tokenizer.pad_token_id,
-                ],
-                pad_token_id=-100,
-                new_padding_direction="right",
-            )
-            loss = self._model(input_ids=y_z_knowing_x).loss
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # p(y, z | x)
@@ -489,17 +464,17 @@ class _RefineLM(pl.LightningModule):
                 outputs = self._model(
                     input_ids      = padded_final_input_ids,
                     attention_mask = padded_final_attention_mask,
-                    labels         = padded_final_labels,
+                    # labels         = padded_final_labels,
                 )
 
                 labels = padded_final_labels
-                lm_logits = outputs.logits
+                lm_probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
 
-                shift_logits = lm_logits[..., :-1, :].contiguous()
+                shift_probs = lm_probs[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 
                 new_labels = shift_labels.view(-1).unsqueeze(-1)
-                new_probs = shift_logits.view(-1, shift_logits.shape[-1])
+                new_probs = shift_probs.view(-1, shift_probs.shape[-1])
                 new_probs[new_labels[:, 0] == -100, self._tokenizer.pad_token_id] = 1
                 new_labels[new_labels == -100] = self._tokenizer.pad_token_id
 
