@@ -40,3 +40,4 @@ srun python bin_refine.py main --strategy=ddp_find_unused_parameters_false
 1. Generate default scratch pads with GPT3
 2. Refine GPT2 with the dataset
 3. Fine-tune GPT2 with marginal likelihood
+

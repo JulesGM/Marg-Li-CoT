@@ -139,12 +139,8 @@ DEFAULT_GENERATION_KWARGS = {
 ###############################################################################################
 SCRIPT_DIR = Path(__file__).absolute().parent
 ACCELERATOR = "cuda"
+DEFAULT_WANDB_CONFIG_PATH = SCRIPT_DIR / "wandb_config.json"
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Wandb stuff
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-DEFAULT_WANDB_ENTITY = "julesgm"
-DEFAULT_WANDB_PROJECT = "SAG"
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Training loop stuff
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -484,6 +480,7 @@ class _RefineLM(pl.LightningModule):
                 marginalized_probs = torch.sum(label_probs.prod(dim=-1), dim=-1)
                 logged = torch.log(marginalized_probs)
                 loss = torch.mean(logged, dim=-1)
+                assert torch.isnan(loss).sum() == 0
                 assert loss.ndim == 0, loss.shape
                     
         # sum probs
@@ -1502,8 +1499,7 @@ class EntryPoints:
         #######################################################################
         wandb_run_id: Optional[str] = DEFAULT_WANDB_ID,
         checkpoints_folder: Union[Path, str] = DEFAULT_CHECKPOINTS_DIR,
-        wandb_entity: str = DEFAULT_WANDB_ENTITY,
-        wandb_project: str = DEFAULT_WANDB_PROJECT,
+        wandb_config_path: Union[Path, str] = DEFAULT_WANDB_CONFIG_PATH,
 
         #######################################################################
         # Don't do anything yet
@@ -1520,6 +1516,10 @@ class EntryPoints:
                 f"We only support JSONL for arithmetic tokenizer, as things "
                 "are pre-tokenized in the h5 mode. {DATA_MODE}"
             )
+
+        wandb_config_path = Path(wandb_config_path)
+        assert wandb_config_path.exists(), wandb_config_path
+        wandb_config = utils.load_json(wandb_config_path)
 
         dataset_path = Path(dataset_path)
         assert dataset_path.exists(), dataset_path
@@ -1590,8 +1590,8 @@ class EntryPoints:
             logger = pl.loggers.WandbLogger(
                 resume="must", 
                 id=wandb_run_id,
-                project=wandb_project,
-                entity=wandb_entity,
+                project=wandb_config["project"],
+                entity=wandb_config["entity"],
                 log_model=False,
                 name=meta_info["run_name"],
                 config=dict(
@@ -1612,8 +1612,8 @@ class EntryPoints:
                 checkpoints_root_dir=checkpoints_folder,
                 arg_meta_info=arg_meta_info, 
                 global_rank=ddp_info.global_rank,
-                wandb_project=wandb_project,
-                wandb_entity=wandb_entity,
+                wandb_project=wandb_config["project"],
+                wandb_entity=wandb_config["entity"],
             )
             del arg_meta_info
         
