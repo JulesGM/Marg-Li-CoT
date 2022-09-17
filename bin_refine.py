@@ -788,7 +788,7 @@ def _get_last_checkpoint_path(
         return None
 
     if run_name:
-        dir_ = checkpoints_folder / run_name / wandb_run_id / "checkpoints"
+        dir_ = checkpoints_folder / run_name / wandb_run_id 
         checkpoints = list((dir_).glob("*.ckpt"))
         
     else:
