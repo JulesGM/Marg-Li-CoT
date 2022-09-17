@@ -783,6 +783,7 @@ def _get_last_checkpoint_path(
     run_name: Optional[str] = None, 
     wandb_run_id: Optional[str] = None
 ) -> LastCkptInfo:
+    import pdb; pdb.set_trace()
 
     if wandb_run_id is None:
         return None
@@ -794,7 +795,7 @@ def _get_last_checkpoint_path(
     else:
         checkpoints = []
         for path in checkpoints_folder.glob("**/*.ckpt"):
-            if path.parent.parent.name == wandb_run_id:
+            if path.parent.name == wandb_run_id and path.name == "last.ckpt":
                 checkpoints.append(path)
 
     if not checkpoints:
@@ -805,16 +806,12 @@ def _get_last_checkpoint_path(
     
     if run_name is None:
         # We recover the run name from the wandb run id
-        run_name = path.parent.parent.parent.name
+        run_name = path.parent.parent.name
         utils.rich_print_zero_rank(f"\n[red bold]Inferring `run_name` value of:[/] {run_name = !s}")
-
-    match_obj = re.match(r"epoch=(\d+)-step=(\d+).ckpt", checkpoint_path.name)
-    epoch = int(match_obj.group(1))
-    step = int(match_obj.group(2))
 
     utils.rich_print_zero_rank(f"\n[red bold]_get_last_checkpoint_path:[/] {checkpoint_path = !s}")
 
-    return LastCkptInfo(checkpoint_path, run_name, epoch, step)
+    return LastCkptInfo(checkpoint_path, run_name, None, None)
 
 
 def _json_default_paths(entry: Any):
@@ -834,12 +831,9 @@ def _set_resumed_state(
     """
     checkpoints_root_dir = Path(checkpoints_root_dir)
 
-    root_path = checkpoints_root_dir / arg_meta_info["run_name"] / arg_meta_info["wandb_run_id"] / "checkpoints" 
-    configs = list(root_path.glob(f"epoch=*-step=*.json"))
-    most_recent = max(configs, key=lambda x: int(re.match(r"epoch=(\d+)-step=(\d+).json", x.name).group(2)))
-    assert most_recent == max(configs, key=lambda x: x.stat().st_mtime), (most_recent, max(configs, key=lambda x: x.stat().st_mtime))
+    json_path = checkpoints_root_dir / arg_meta_info["run_name"] / arg_meta_info["wandb_run_id"] / "last.json"
 
-    meta_info = utils.load_json(most_recent)
+    meta_info = utils.load_json(json_path)
 
     # Check that the values that need to match do match
     arg_meta_info = arg_meta_info.copy()
@@ -1477,7 +1471,7 @@ def _compute_batch_size_defaults(
 
 @beartype
 def _make_config_path(checkpoints_root_dir: Path, run_name: str, wandb_run_id: str, step: int, epoch: int) -> Path:
-    return checkpoints_root_dir / run_name / wandb_run_id / f"epoch={epoch}-step={step}.json"
+    return checkpoints_root_dir / run_name / wandb_run_id / f"last.json"
 
 
 DATA_DIR = SCRIPT_DIR / "data"
