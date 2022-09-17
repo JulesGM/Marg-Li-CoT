@@ -45,7 +45,7 @@ CHAINER = " => "
 ###############################################################################################
 # Constants that should be changed from time to time
 ###############################################################################################
-DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=6)
+DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=4)
 LIMIT_VAL_BATCHES = 10
 LIMIT_TRAIN_BATCHES = None
 VAL_CHECK_INTERVAL = 0.01
@@ -141,7 +141,7 @@ DATA_PATH = SCRIPT_DIR / "data"
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Varia
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-PRECISION = 16
+PRECISION = 32
 
 SCHEDULER_FN = {
     constants.SchedulerTypes.CONSTANT:
@@ -411,6 +411,8 @@ class _RefineLM(pl.LightningModule):
                 final_input_ids = []
                 final_labels = []
 
+                LABEL_PAD = self._tokenizer.pad_token_id
+
                 with utils.cuda_timeit("[bold]bin_refine.py::PSI-B:[/] Loop", disable=disable_timing):
                     for inputs, io, value  in zip(unpadded_repeated_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
                         # TODO: Future optimization: don't convert to a list. Probably faster.
@@ -423,12 +425,12 @@ class _RefineLM(pl.LightningModule):
                         
                         scratchpad = io[len(inputs):]
                         final_input_ids.append(io + value + [self._tokenizer.eos_token_id])
-                        final_labels.append(len(inputs) * [-100] + scratchpad + value + [self._tokenizer.eos_token_id])
+                        final_labels.append(len(inputs) * [LABEL_PAD] + scratchpad + value + [self._tokenizer.eos_token_id])
                         
                 with utils.cuda_timeit("[bold]bin_refine.py::PSI-C:[/] Pad", disable=disable_timing):
                     utils.check_equal(len(final_input_ids), len(final_labels))
                     padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right").to(self._model.device)
-                    padded_final_labels    = pad(final_labels,    -100,                         "right").to(self._model.device)
+                    padded_final_labels    = pad(final_labels,    LABEL_PAD,                         "right").to(self._model.device)
                     padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
 
             with utils.cuda_timeit("bin_refine.py::Score", disable=disable_timing):
@@ -443,7 +445,7 @@ class _RefineLM(pl.LightningModule):
                 #     padded_final_attention_mask[sample_index], 
                 #     padded_final_labels[sample_index]
                 # ):
-                #     if label == -100:
+                #     if label == LABEL_PAD:
                 #         label = self._tokenizer.pad_token_id
                 
                 #     table_.add_row(
@@ -462,35 +464,33 @@ class _RefineLM(pl.LightningModule):
 
                 labels = padded_final_labels
 
-                log_mode = "logsumexp"
-                assert log_mode in {"inside", "outside", "logsumexp"}
+                log_mode = "inside"
+                utils.check_contained(log_mode, {"inside", "outside", "logsumexp"})
 
-                shift_logits = outputs.logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
+                bsz_times_num_beams, seq_len, vocab_size = outputs.logits[..., :-1, :].shape
 
-                bsz_times_num_beams, seq_len, vocab_size = shift_logits.shape
                 num_scratchpads = self._generation_kwargs[mode]["num_return_sequences"]
                 batch_size = self._batch_size[mode]
 
                 shift_labels = labels[..., 1:].contiguous()
                 flat_labels = shift_labels.view(-1).unsqueeze(-1).contiguous()
+                
                 utils.check_equal(flat_labels.shape, (batch_size * num_scratchpads * seq_len, 1))
                 utils.check_equal(bsz_times_num_beams, self._batch_size[mode] * num_scratchpads)
                 utils.check_equal(shift_labels.shape, (num_scratchpads * batch_size, seq_len))
-
+                utils.check_equal(outputs.logits.shape, (batch_size * num_scratchpads, seq_len + 1, vocab_size))
+                torch.autograd.set_detect_anomaly(True)
+                
                 if log_mode == "inside":
                     # Flatten the log-probs and the labels to get a 2D tensor from which we can gather
-                    shift_logprobs = outputs.logits.log_softmax(dim=-1).contiguous()
+                    shift_logprobs = outputs.logits.log_softmax(dim=-1)[..., :-1, :].contiguous()
                     flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1]).contiguous()
                     utils.check_equal(flat_logprobs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
 
-                    # Mask out the log-probabilities of the -100 labels
-                    mask_minus_hundred = (flat_labels[:, 0] == -100, self._tokenizer.pad_token_id)
-                    flat_logprobs[mask_minus_hundred] = 0
-                    flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
-
                     # Do the gathering
                     flat_label_logprobs = flat_logprobs.gather(dim=1, index=flat_labels)
+                    flat_label_logprobs.masked_fill_(flat_labels == LABEL_PAD, 0)
                     utils.check_equal(flat_label_logprobs.shape, (batch_size * num_scratchpads * seq_len, 1))
                     label_logprobs = flat_label_logprobs.view(batch_size, num_scratchpads, seq_len)
 
@@ -504,18 +504,14 @@ class _RefineLM(pl.LightningModule):
                     flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1]).contiguous()
                     utils.check_equal(flat_logprobs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
 
-                    # Mask out the probabilities of the -100 labels
-                    mask_minus_hundred = (flat_labels[:, 0] == -100, self._tokenizer.pad_token_id)
-                    flat_logprobs[mask_minus_hundred] = 0
-                    flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
-
+                    # Mask out the probabilities of the LABEL_PAD labels
                     # Do the gathering
                     flat_label_logprobs = flat_logprobs.gather(dim=1, index=flat_labels)
+                    flat_label_logprobs.masked_fill_(flat_labels == LABEL_PAD, 0)
                     utils.check_equal(flat_label_logprobs.shape, (batch_size * num_scratchpads * seq_len, 1))
                     label_logprobs = flat_label_logprobs.view(batch_size, num_scratchpads, seq_len)
 
                     # Marginalize
-                    torch.autograd.set_detect_anomaly(True)
                     marginalized_probs = label_logprobs.sum(dim=-1).logsumexp(dim=-1)
                     ll = marginalized_probs
 
@@ -524,14 +520,10 @@ class _RefineLM(pl.LightningModule):
                     shift_probs = outputs.logits.softmax(dim=-1)[..., :-1, :].contiguous()
                     flat_probs = shift_probs.view(-1, shift_probs.shape[-1]).contiguous()
                     utils.check_equal(flat_probs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
-                    
-                    # Mask out the probabilities of the -100 labels
-                    mask_minus_hundred = (flat_labels[:, 0] == -100, self._tokenizer.pad_token_id)
-                    flat_probs[mask_minus_hundred] = 1
-                    flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
 
                     # Do the gathering
                     flat_label_probs = flat_probs.gather(dim=1, index=flat_labels)
+                    flat_label_probs.masked_fill_(flat_labels == LABEL_PAD, 1)
                     utils.check_equal(flat_label_probs.shape, (batch_size * num_scratchpads * seq_len, 1))
                     label_probs = flat_label_probs.view(batch_size, num_scratchpads, seq_len)
 
