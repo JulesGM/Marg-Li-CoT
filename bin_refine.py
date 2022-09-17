@@ -486,13 +486,13 @@ class _RefineLM(pl.LightningModule):
                 label_probs = torch.gather(new_probs, dim=1, index=new_labels)
                 label_probs = label_probs.view(*shift_labels.shape)
 
-                if log_mode == "log_inside":
+                if log_mode == "inside":
                     marginalized_probs = torch.sum(label_probs.sum(dim=-1), dim=-1)
                     logged = marginalized_probs
                 elif log_mode == "logsumexp":
                     marginalized_probs = torch.logsumexp(label_probs, dim=-1)
                     logged = marginalized_probs
-                elif log_mode == "inside":
+                elif log_mode == "outside":
                     marginalized_probs = torch.sum(label_probs.prod(dim=-1), dim=-1)
                     logged = torch.log(marginalized_probs)
                 else:
