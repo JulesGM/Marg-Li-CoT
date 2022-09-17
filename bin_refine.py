@@ -794,8 +794,6 @@ def _get_last_checkpoint_path(
     else:
         checkpoints = []
         for path in checkpoints_folder.glob("**/*.ckpt"):
-            assert path.parent.name == "checkpoints", (
-                f"{path.parent.name} != checkpoints")
             if path.parent.parent.name == wandb_run_id:
                 checkpoints.append(path)
 
