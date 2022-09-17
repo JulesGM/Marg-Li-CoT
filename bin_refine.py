@@ -1559,6 +1559,7 @@ class EntryPoints:
         last_ckpt_info = _get_last_checkpoint_path(
             checkpoints_folder, None, wandb_run_id)
         resuming = wandb_run_id is not None
+        
         if resuming:
             assert last_ckpt_info is not None, last_ckpt_info
 
@@ -1660,9 +1661,6 @@ class EntryPoints:
         rich.print(f"[bold red]Strategy: {strategy}[/]")
         rich.print(f"[bold red]ddp_info: {vars(ddp_info)}[/]")
 
-        if strategy:
-            
-        assert wandb_run_id, wandb_run_id
 
         ###############################################################
         # Build the pt-lightning dataloader
@@ -1712,7 +1710,7 @@ class EntryPoints:
             callbacks=[
                 pl.callbacks.LearningRateMonitor(logging_interval="step"),
                 pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
-                    dirpath=(checkpoints_folder / meta_info["run_name"] / wandb_run_id) if wandb_run_id else None,
+                    dirpath=(checkpoints_folder / meta_info["run_name"] / wandb_run_id) if wandb_run_id else "this is nonsense",
                     every_n_epochs=1, 
                     save_on_train_epoch_end=True, 
                     save_last=True
