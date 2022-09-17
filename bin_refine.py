@@ -465,41 +465,65 @@ class _RefineLM(pl.LightningModule):
                 log_mode = "outside"
                 assert log_mode in {"inside", "outside", "logsumexp"}
 
-                if log_mode in {"inside", "logsumexp"}:
-                    lm_probs = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
-                elif log_mode == "outside":
-                    lm_probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                else:
-                    raise ValueError(log_mode)
-
-                shift_probs = lm_probs[..., :-1, :].contiguous()
+                shift_logits = outputs.logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
-                
-                new_labels = shift_labels.view(-1).unsqueeze(-1)
-                new_probs = shift_probs.view(-1, shift_probs.shape[-1])
-                utils.check_equal(new_labels.shape[1], 1)
-                utils.check_equal(new_labels.ndim, 2)
-                mask_minus_hundred = new_labels[:, 0] == -100, self._tokenizer.pad_token_id
-                new_probs[mask_minus_hundred] = 1
-                new_labels[new_labels == -100] = self._tokenizer.pad_token_id
-
-                label_probs = torch.gather(new_probs, dim=1, index=new_labels)
-                label_probs = label_probs.view(*shift_labels.shape)
 
                 if log_mode == "inside":
-                    marginalized_probs = torch.sum(label_probs.sum(dim=-1), dim=-1)
-                    logged = marginalized_probs
+                    shift_logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+                    flat_labels = shift_labels.view(-1).unsqueeze(-1)
+                    flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1])
+                    utils.check_equal(flat_labels.shape[1], 1)
+                    utils.check_equal(flat_labels.ndim, 2)
+
+                    mask_minus_hundred = flat_labels[:, 0] == -100, self._tokenizer.pad_token_id
+                    flat_logprobs[mask_minus_hundred] = 0
+                    flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
+
+                    label_logprobs = torch.gather(flat_logprobs, dim=1, index=flat_labels)
+                    label_logprobs = flat_label_logprobs.view(*shift_labels.shape)
+                    marginalized_probs = label_logprobs.sum(dim=-1).logsumexp(dim=-1)
+                    ll = marginalized_probs
+
                 elif log_mode == "logsumexp":
-                    marginalized_probs = torch.logsumexp(label_probs, dim=-1)
-                    logged = marginalized_probs
+                    shift_logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+                    flat_labels = shift_labels.view(-1).unsqueeze(-1)
+                    flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1])
+                    utils.check_equal(flat_labels.shape[1], 1)
+                    utils.check_equal(flat_labels.ndim, 2)
+                    mask_minus_hundred = flat_labels[:, 0] == -100, self._tokenizer.pad_token_id
+                    
+                    flat_logprobs[mask_minus_hundred] = 0
+                    flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
+
+                    flat_label_logprobs = torch.gather(flat_logprobs, dim=1, index=flat_labels)
+                    label_logprobs = flat_label_logprobs.view(*shift_labels.shape)
+                    marginalized_probs = torch.sum(label_logprobs.sum(dim=-1), dim=-1)
+                    ll = marginalized_probs
+
                 elif log_mode == "outside":
+                    shift_probs = torch.nn.functional.softmax(shift_logits, dim=-1)
+                    flat_labels = shift_labels.view(-1).unsqueeze(-1)
+                    flat_probs = shift_probs.view(-1, shift_probs.shape[-1])
+                    utils.check_equal(flat_labels.shape[1], 1)
+                    utils.check_equal(flat_labels.ndim, 2)
+
+                    mask_minus_hundred = flat_labels[:, 0] == -100, self._tokenizer.pad_token_id
+                    flat_probs[mask_minus_hundred] = 1
+                    flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
+
+                    flat_label_probs = torch.gather(flat_probs, dim=1, index=flat_labels)
+                    label_probs = flat_label_probs.view(*shift_labels.shape)
+                    
                     marginalized_probs = torch.sum(label_probs.prod(dim=-1), dim=-1)
-                    logged = torch.log(marginalized_probs)
+                    ll = torch.log(marginalized_probs)
+
                 else:
                     raise ValueError(log_mode)
 
-                loss = - torch.mean(logged, dim=-1)
+
+                loss = - torch.mean(ll, dim=-1)
                 assert torch.isnan(loss).sum() == 0
+                assert torch.isinf(loss).sum() == 0
                 assert loss.ndim == 0, loss.shape
                     
         # sum probs
@@ -783,7 +807,6 @@ def _get_last_checkpoint_path(
     run_name: Optional[str] = None, 
     wandb_run_id: Optional[str] = None
 ) -> LastCkptInfo:
-    import pdb; pdb.set_trace()
 
     if wandb_run_id is None:
         return None
