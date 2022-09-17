@@ -504,7 +504,7 @@ class _RefineLM(pl.LightningModule):
 
                     # Mask out the probabilities of the -100 labels
                     mask_minus_hundred = (flat_labels[:, 0] == -100, self._tokenizer.pad_token_id)
-                    flat_logprobs[mask_minus_hundred] = 0
+                    flat_logprobs[mask_minus_hundred] *= 0
                     flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
 
                     # Do the gathering
