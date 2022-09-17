@@ -471,14 +471,17 @@ class _RefineLM(pl.LightningModule):
                 bsz_times_num_beams, seq_len, vocab_size = shift_logits.shape
                 num_scratchpads = self._generation_kwargs[mode]["num_return_sequences"]
                 batch_size = self._batch_size[mode]
+
+                shift_labels = labels[..., 1:].contiguous()
+                flat_labels = shift_labels.view(-1).unsqueeze(-1).contiguous()
+                utils.check_equal(flat_labels.shape, (batch_size * num_scratchpads * seq_len, 1))
                 utils.check_equal(bsz_times_num_beams, self._batch_size[mode] * num_scratchpads)
+                utils.check_equal(shift_labels.shape, (num_scratchpads * batch_size, seq_len))
 
                 if log_mode == "inside":
                     # Flatten the log-probs and the labels to get a 2D tensor from which we can gather
-                    shift_logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-                    flat_labels = shift_labels.view(-1).unsqueeze(-1)
-                    flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1])
-                    utils.check_equal(flat_labels.shape, (batch_size * num_scratchpads * seq_len, 1))
+                    shift_logprobs = outputs.logits.log_softmax(dim=-1).contiguous()
+                    flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1]).contiguous()
                     utils.check_equal(flat_logprobs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
 
                     # Mask out the log-probabilities of the -100 labels
@@ -487,7 +490,8 @@ class _RefineLM(pl.LightningModule):
                     flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
 
                     # Do the gathering
-                    label_logprobs = flat_logprobs.gather(dim=1, index=flat_labels)
+                    flat_label_logprobs = flat_logprobs.gather(dim=1, index=flat_labels)
+                    utils.check_equal(flat_label_logprobs.shape, (batch_size * num_scratchpads * seq_len, 1))
                     label_logprobs = flat_label_logprobs.view(batch_size, num_scratchpads, seq_len)
 
                     # Marginalize
@@ -496,31 +500,29 @@ class _RefineLM(pl.LightningModule):
 
                 elif log_mode == "logsumexp":
                     # Flatten the log-probs and the labels to get a 2D tensor from which we can gather
-                    shift_logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-                    flat_labels = shift_labels.view(-1).unsqueeze(-1)
-                    flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1])
-                    utils.check_equal(flat_labels.shape, (batch_size * num_scratchpads * seq_len, 1))
+                    shift_logprobs = outputs.logits.log_softmax(dim=-1)[..., :-1, :].contiguous()
+                    flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1]).contiguous()
                     utils.check_equal(flat_logprobs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
 
                     # Mask out the probabilities of the -100 labels
                     mask_minus_hundred = (flat_labels[:, 0] == -100, self._tokenizer.pad_token_id)
-                    flat_logprobs[mask_minus_hundred] *= 0
+                    flat_logprobs[mask_minus_hundred] = 0
                     flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
 
                     # Do the gathering
                     flat_label_logprobs = flat_logprobs.gather(dim=1, index=flat_labels)
+                    utils.check_equal(flat_label_logprobs.shape, (batch_size * num_scratchpads * seq_len, 1))
                     label_logprobs = flat_label_logprobs.view(batch_size, num_scratchpads, seq_len)
 
                     # Marginalize
+                    torch.autograd.set_detect_anomaly(True)
                     marginalized_probs = label_logprobs.sum(dim=-1).logsumexp(dim=-1)
                     ll = marginalized_probs
 
                 elif log_mode == "outside":
                     # Flatten the probs and the labels to get a 2D tensor from which we can gather
-                    shift_probs = torch.nn.functional.softmax(shift_logits, dim=-1)
-                    flat_labels = shift_labels.view(-1).unsqueeze(-1)
-                    flat_probs = shift_probs.view(-1, shift_probs.shape[-1])
-                    utils.check_equal(flat_labels.shape, (batch_size * num_scratchpads * seq_len, 1))
+                    shift_probs = outputs.logits.softmax(dim=-1)[..., :-1, :].contiguous()
+                    flat_probs = shift_probs.view(-1, shift_probs.shape[-1]).contiguous()
                     utils.check_equal(flat_probs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
                     
                     # Mask out the probabilities of the -100 labels
@@ -530,6 +532,7 @@ class _RefineLM(pl.LightningModule):
 
                     # Do the gathering
                     flat_label_probs = flat_probs.gather(dim=1, index=flat_labels)
+                    utils.check_equal(flat_label_probs.shape, (batch_size * num_scratchpads * seq_len, 1))
                     label_probs = flat_label_probs.view(batch_size, num_scratchpads, seq_len)
 
                     # Marginalize
