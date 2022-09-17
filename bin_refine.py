@@ -462,7 +462,7 @@ class _RefineLM(pl.LightningModule):
 
                 labels = padded_final_labels
 
-                log_mode = "inside"
+                log_mode = "outside"
                 assert log_mode in {"inside", "outside", "logsumexp"}
 
                 if log_mode in {"inside", "logsumexp"}:
