@@ -490,8 +490,8 @@ class _RefineLM(pl.LightningModule):
                     flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1])
                     utils.check_equal(flat_labels.shape[1], 1)
                     utils.check_equal(flat_labels.ndim, 2)
-                    mask_minus_hundred = flat_labels[:, 0] == -100, self._tokenizer.pad_token_id
                     
+                    mask_minus_hundred = flat_labels[:, 0] == -100, self._tokenizer.pad_token_id
                     flat_logprobs[mask_minus_hundred] = 0
                     flat_labels[flat_labels == -100] = self._tokenizer.pad_token_id
 
