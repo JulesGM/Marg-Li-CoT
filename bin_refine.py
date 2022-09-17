@@ -512,7 +512,7 @@ class _RefineLM(pl.LightningModule):
                     label_logprobs = flat_label_logprobs.view(batch_size, num_scratchpads, seq_len)
 
                     # Marginalize
-                    marginalized_probs = label_logprobs.logsumexp(dim=-1).sum(dim=-1)
+                    marginalized_probs = label_logprobs.sum(dim=-1).logsumexp(dim=-1)
                     ll = marginalized_probs
 
                 elif log_mode == "outside":
