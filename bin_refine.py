@@ -4,6 +4,7 @@
 print("Importing modules.")
 import collections
 import dataclasses
+import enum
 import itertools
 import json  # type: ignore[import]
 import math
@@ -24,6 +25,7 @@ import numpy as np
 import pretty_traceback  # type: ignore
 import pytorch_lightning as pl  # type: ignore[import]
 import rich  # type: ignore[import]
+import rich.table as table
 import torch
 import torch.utils
 import torch.utils.data
@@ -45,16 +47,16 @@ CHAINER = " => "
 ###############################################################################################
 # Constants that should be changed from time to time
 ###############################################################################################
-DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=4)
+DEFAULT_LEARNING_RATE = 0.001
+
+DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=3)
 LIMIT_VAL_BATCHES = 10
-LIMIT_TRAIN_BATCHES = None
 VAL_CHECK_INTERVAL = 0.01
 
 DEFAULT_NUM_BEAMS = 20
 MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
 
 DEFAULT_LM_MASKING_MODE = constants.LMMaskingMode.MASK_INPUT
-DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_SHARED_BATCH_SIZE = 64 * 2
 DEFAULT_GRADIENT_ACCUM = 2
 DEFAULT_SCHEDULER_TYPE = constants.SchedulerTypes.LINEAR_WARMUP_LINEAR
@@ -112,6 +114,7 @@ DEFAULT_GENERATION_KWARGS = {
     ),
 }
 
+
 ###############################################################################################
 # Should not change
 ###############################################################################################
@@ -138,10 +141,12 @@ DATALOADER_NUM_WORKERS = 0 # int(os.environ.get("SLURM_CPUS_PER_TASK", 6)) - 1
 SHUFFLE_TRAINING_DATA = True
 SHUFFLE_VALIDATION_DATA = True
 DATA_PATH = SCRIPT_DIR / "data"
+LIMIT_TRAIN_BATCHES = None
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Varia
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-PRECISION = 32
+PRECISION = 16
 
 SCHEDULER_FN = {
     constants.SchedulerTypes.CONSTANT:
@@ -222,7 +227,174 @@ def _last_non_masked(target: torch.Tensor, mask_token_id: int):
     label_range[target == mask_token_id] = 0
     last_unmasked_token_pos = label_range.max(dim=1).values
     return torch.gather(target, 1, last_unmasked_token_pos.reshape(-1, 1))
+
+
+@dataclasses.dataclass
+class SamplesMarginal:
+    y_mask_is_not_pad: torch.LongTensor
+    z_mask_is_not_pad: torch.LongTensor
+    padded_final_labels: torch.LongTensor
+    padded_final_input_ids: torch.LongTensor
+    padded_final_attention_mask: torch.LongTensor
+
+
+def prep_samples_marginal(
+    *, 
+    inputs_outputs: torch.Tensor, batch: dict[str, torch.Tensor], 
+    generation_kwargs: dict[str, Any], 
+    disable_timing: bool, 
+    eos_token_id: int, 
+    cls_token_id: int, 
+    label_pad_token_id: int, 
+    inputs_pad_token_id: int,
+    batch_size: int, 
+    num_scratchpads: int, 
+) -> SamplesMarginal:
+
+    with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] Unpad, Repeat-interleave", disable=disable_timing):
+        with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] unpad then repeat-interleave", disable=disable_timing):
         
+            unpadded_inputs_outputs = remove_padding(
+                inputs_outputs, inputs_outputs != inputs_pad_token_id
+            )
+            unpadded_values = batch["value"]
+            unpadded_inputs = remove_padding(
+                batch["generation_input_ids"], batch["generation_attention_mask"] == 1
+            )
+
+            unpadded_repeated_inputs = utils.repeat_interleave(
+                unpadded_inputs, generation_kwargs["num_return_sequences"]
+            )
+            # Reproduce the structure of the multiple beams per input tensor
+            unpadded_repeated_values = utils.repeat_interleave(
+                unpadded_values, generation_kwargs["num_return_sequences"]
+            ) 
+
+    final_input_ids = []
+    final_labels = []
+    y_mask = []
+    z_mask = []
+
+    with utils.cuda_timeit("[bold]bin_refine.py::PSI-B:[/] Loop", disable=disable_timing):
+        for inputs, io, value  in zip(unpadded_repeated_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
+            # TODO: Future optimization: don't convert to a list. Probably faster.
+            value = value.tolist()
+            io = io.tolist()
+
+            if not io[-1] == cls_token_id:
+                io.append(cls_token_id)
+            
+            scratchpad = io[len(inputs):]
+
+            final_input_ids_entry = io                                                         + value + [eos_token_id]
+            final_labels_entry    = len(inputs) * [label_pad_token_id] + scratchpad            + value + [eos_token_id]
+            y_mask_entry          = len(inputs) * [0]                  + len(scratchpad) * [0] + (len(value) + 1) * [1]
+            z_mask_entry          = len(inputs) * [0]                  + len(scratchpad) * [1] + (len(value) + 1) * [0]
+
+            utils.check_equal(len(final_labels_entry), len(final_input_ids_entry))
+            utils.check_equal(len(y_mask_entry),       len(final_input_ids_entry))
+            utils.check_equal(len(z_mask_entry),       len(final_input_ids_entry))
+
+            final_input_ids.append(final_input_ids_entry)
+            final_labels.append   (final_labels_entry)
+            y_mask.append         (y_mask_entry)
+            z_mask.append         (z_mask_entry)
+
+
+    with utils.cuda_timeit("[bold]bin_refine.py::PSI-C:[/] Pad", disable=disable_timing):
+        utils.check_equal(len(final_input_ids), len(final_labels))
+        padded_final_input_ids = pad(final_input_ids, inputs_pad_token_id, "right").to(inputs_outputs.device)
+        padded_final_labels    = pad(final_labels,    label_pad_token_id,  "right").to(inputs_outputs.device)
+        padded_final_attention_mask = generate_mask(final_input_ids,       "right").to(inputs_outputs.device)
+        padded_y_mask_is_not_pad = pad(y_mask, 0,                                     "right").to(inputs_outputs.device, dtype=padded_final_attention_mask.dtype)
+        padded_z_mask_is_not_pad = pad(z_mask, 0,                                     "right").to(inputs_outputs.device, dtype=padded_final_attention_mask.dtype)
+        padded_y_mask_is_not_pad = padded_y_mask_is_not_pad.reshape(batch_size, num_scratchpads, -1)
+        padded_z_mask_is_not_pad = padded_z_mask_is_not_pad.reshape(batch_size, num_scratchpads, -1)
+
+        utils.check_equal(padded_final_labels.shape[-1], padded_final_input_ids.shape[-1])
+        utils.check_equal(padded_final_attention_mask.shape[-1], padded_final_input_ids.shape[-1])
+        utils.check_equal(padded_y_mask_is_not_pad.shape[-1], padded_final_input_ids.shape[-1])
+        utils.check_equal(padded_z_mask_is_not_pad.shape[-1], padded_final_input_ids.shape[-1])
+
+    with utils.cuda_timeit("bin_refine.py::Score", disable=disable_timing):
+        utils.check_equal(padded_final_input_ids.shape, padded_final_attention_mask.shape)
+        utils.check_equal(padded_final_attention_mask.shape, padded_final_labels.shape)
+        utils.check_equal(padded_y_mask_is_not_pad.shape[:-1], (batch_size, num_scratchpads,))
+
+    return SamplesMarginal(
+        padded_final_attention_mask=padded_final_attention_mask, 
+        padded_final_input_ids=padded_final_input_ids, 
+        padded_final_labels=padded_final_labels, 
+        y_mask_is_not_pad=padded_y_mask_is_not_pad, 
+        z_mask_is_not_pad=padded_z_mask_is_not_pad,
+    )
+
+
+def print_table_marginal_likelihood(
+    padded_final_input_ids, padded_final_attention_mask, 
+    padded_final_labels, label_logprobs, batch_size, 
+    num_scratchpads, seq_len, flat_labels, label_pad_token_id,
+    tokenizer
+):
+    table_ = table.Table("Input", "Label", "Attn-Mask", "prob")
+    sample_index = random.randint(0, len(padded_final_input_ids) - 1)
+    for input_id, attention_mask, label, logprobs, masked in zip(
+        padded_final_input_ids[sample_index], 
+        padded_final_attention_mask[sample_index], 
+        padded_final_labels[sample_index],
+        label_logprobs.reshape(batch_size * num_scratchpads, seq_len)[sample_index],
+        (flat_labels == label_pad_token_id).reshape(batch_size * num_scratchpads, seq_len)[sample_index]
+    ):
+        if label == label_pad_token_id:
+            label = tokenizer.pad_token_id
+    
+        table_.add_row(
+            f"'{tokenizer.decode(input_id)}'", 
+            f"'{tokenizer.decode(label)   }'", 
+            f"'{attention_mask.item()           }'",
+            f"'{torch.exp(logprobs)             }'",
+            f"'{masked                          }'",
+        )
+
+    rich.print(table_)
+
+
+def prep_logits_and_labels(
+    *,
+    vocab_size,
+    raw_logits, 
+    batch_size, 
+    padded_labels, 
+    num_scratchpads, 
+    label_pad_token_id, 
+):
+    shift_labels = padded_labels[..., 1:].contiguous()
+    flat_labels = shift_labels.view(-1).unsqueeze(-1).contiguous()
+    bsz_times_num_beams = raw_logits.shape[0]
+    shift_logits = raw_logits[..., :-1, :].contiguous()
+    seq_len = shift_labels.shape[1]
+
+    utils.check_equal(shift_logits.shape[1], seq_len)
+    flat_logits = shift_logits.view(-1, shift_logits.shape[-1]).contiguous()
+
+    flat_label_logits = flat_logits.gather(dim=1, index=flat_labels)
+    
+    utils.check_equal(flat_label_logits.shape, (batch_size * num_scratchpads * seq_len, 1))
+    utils.check_equal(flat_logits.shape      , (batch_size * num_scratchpads * seq_len, vocab_size))
+    
+    shift_label_logits = flat_label_logits.reshape(batch_size, num_scratchpads, seq_len)
+    utils.check_equal(bsz_times_num_beams,  batch_size * num_scratchpads,)
+    utils.check_equal(raw_logits.shape   , (batch_size * num_scratchpads, seq_len + 1, vocab_size))
+
+    shift_labels = shift_labels.reshape(batch_size, num_scratchpads, seq_len)
+    shift_label_is_pad = (shift_labels == label_pad_token_id).to(padded_labels.dtype)
+
+    utils.check_equal(shift_labels.shape      , (batch_size, num_scratchpads, seq_len))
+    utils.check_equal(shift_label_is_pad.shape, (batch_size, num_scratchpads, seq_len))
+    utils.check_equal(shift_label_logits.shape, (batch_size, num_scratchpads, seq_len))
+
+    return shift_label_logits, shift_label_is_pad
+
 
 class _RefineLM(pl.LightningModule):
     def __init__(
@@ -327,6 +499,9 @@ class _RefineLM(pl.LightningModule):
             **self._logging_conf
         )
 
+        # TODO: this is costly
+        assert not torch.any(torch.isnan(outputs.loss)), "Loss is NaN"
+
         return outputs.loss
 
 
@@ -346,8 +521,14 @@ class _RefineLM(pl.LightningModule):
 
         """
 
+        # Useful constants
         mode: Final[str] = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
-        disable_timing = True  # not utils.is_rank_zero()
+        batch_size = self._batch_size[mode]
+        vocab_size = len(self._tokenizer)
+        num_scratchpads = self._generation_kwargs[mode]["num_return_sequences"]
+        disable_timing = True 
+
+        torch.autograd.set_detect_anomaly(True)                
 
         if not disable_timing:
             utils.rich_print_zero_rank(f"batch size:           {self._batch_size[mode]}")
@@ -357,190 +538,219 @@ class _RefineLM(pl.LightningModule):
             inputs_outputs = self._model.generate(
                 input_ids=batch["generation_input_ids"],
                 attention_mask=batch["generation_attention_mask"], 
-                # Generating until CLS makes us only generate the scratchpad. Generating until EOS makes us generate the whole output.
+                # Generating until CLS makes us only generate the scratchpad. 
+                # Generating until EOS makes us generate the whole output.
                 # That's how the model is pre-trained with the mle objective.
                 eos_token_id=self._tokenizer.cls_token_id,  
                 **self._generation_kwargs[mode],
             )
-            
+
         utils.check_equal(
             inputs_outputs.shape[0],
-            self._batch_size[mode] * self._generation_kwargs[mode]["num_beams"],
+            self._batch_size[mode] * 
+            self._generation_kwargs[mode]["num_beams"],
         )
 
-        ## Concatenate final value
-        
-        marginal_model = "joint"
+        class MarginalModelModes(str, enum.Enum):
+            JOINT = "joint"
+            SEPARATE = "separate"
+
+        class LossModes(str, enum.Enum):
+            DEFAULT            = "default"
+            LOGSUMEXP          = "logsumexp"
+            LOG_INSIDE         = "log_inside"
+            LOG_OUTSIDE        = "log_outside"
+            SEPARATE_OUTSIDE   = "separate_outside"
+            SEPARATE_LOGSUMEXP = "separate_logsumexp"
+
+        marginal_model = MarginalModelModes.JOINT
+        loss_mode = LossModes.SEPARATE_OUTSIDE
+
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # p(y | z, x) * p(z | x), Allows to normalize p(z | x) over the top-k z.
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        if marginal_model == "separate":
-            assert False, "code under development"
-
+        if marginal_model == MarginalModelModes.SEPARATE:
+            pass
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # p(y, z | x)
         # 
         # We need to remove the padding from the generations, add the final answer,
         # and then pad to the 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        elif marginal_model == "joint":
+        elif marginal_model == MarginalModelModes.JOINT:
             # TODO: slow but does what it needs to for the moment
             utils.check_equal(inputs_outputs.ndim, 2)
 
             # Outputs include the inputs as well
             with utils.cuda_timeit("[bold]bin_refine.py::Prep:[/] score inputs", disable=disable_timing):
-                with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] Unpad, Repeat-interleave", disable=disable_timing):
-                    with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] unpad then repeat-interleave", disable=disable_timing):
-                    
-                        unpadded_inputs_outputs = remove_padding(
-                            inputs_outputs, inputs_outputs != self._tokenizer.pad_token_id
-                        )
-                        unpadded_values = batch["value"]
-                        unpadded_inputs = remove_padding(
-                            batch["generation_input_ids"], batch["generation_attention_mask"] == 1
-                        )
-
-                        unpadded_repeated_inputs = utils.repeat_interleave(
-                            unpadded_inputs, self._generation_kwargs[mode]["num_return_sequences"]
-                        )
-                        # Reproduce the structure of the multiple beams per input tensor
-                        unpadded_repeated_values = utils.repeat_interleave(
-                            unpadded_values, self._generation_kwargs[mode]["num_return_sequences"]
-                        ) 
-
-                final_input_ids = []
-                final_labels = []
-
-                LABEL_PAD = self._tokenizer.pad_token_id
-
-                with utils.cuda_timeit("[bold]bin_refine.py::PSI-B:[/] Loop", disable=disable_timing):
-                    for inputs, io, value  in zip(unpadded_repeated_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
-                        # TODO: Future optimization: don't convert to a list. Probably faster.
-
-                        value = value.tolist()
-                        io = io.tolist()
-
-                        if not io[-1] == self._tokenizer.cls_token_id:
-                            io.append(self._tokenizer.cls_token_id)
-                        
-                        scratchpad = io[len(inputs):]
-                        final_input_ids.append(io + value + [self._tokenizer.eos_token_id])
-                        final_labels.append(len(inputs) * [LABEL_PAD] + scratchpad + value + [self._tokenizer.eos_token_id])
-                        
-                with utils.cuda_timeit("[bold]bin_refine.py::PSI-C:[/] Pad", disable=disable_timing):
-                    utils.check_equal(len(final_input_ids), len(final_labels))
-                    padded_final_input_ids = pad(final_input_ids, self._tokenizer.pad_token_id, "right").to(self._model.device)
-                    padded_final_labels    = pad(final_labels,    LABEL_PAD,                         "right").to(self._model.device)
-                    padded_final_attention_mask = generate_mask(final_input_ids, "right").to(self._model.device)
-
-            with utils.cuda_timeit("bin_refine.py::Score", disable=disable_timing):
-                utils.check_equal(padded_final_input_ids.shape, padded_final_attention_mask.shape)
-                utils.check_equal(padded_final_attention_mask.shape, padded_final_labels.shape)
-
-                # sample_index = np.random.randint(0, len(padded_final_input_ids))
-                # import rich.table as table
-                # table_ = table.Table("Input", "Attn-Mask", "Label")
-                # for input_id, attention_mask, label in zip(
-                #     padded_final_input_ids[sample_index], 
-                #     padded_final_attention_mask[sample_index], 
-                #     padded_final_labels[sample_index]
-                # ):
-                #     if label == LABEL_PAD:
-                #         label = self._tokenizer.pad_token_id
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Loss Mode selection
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 
-                #     table_.add_row(
-                #         f"'{self._tokenizer.decode(input_id)}'", 
-                #         f"'{self._tokenizer.decode(label)}'", 
-                #         f"'{str(attention_mask.item())}'",
-                #     )
-                # rich.print(table_)
+                if loss_mode == LossModes.SEPARATE_OUTSIDE:
+                    label_pad_token_id = -100
+                elif loss_mode in {
+                    LossModes.LOGSUMEXP, 
+                    LossModes.LOG_INSIDE, 
+                    LossModes.LOG_OUTSIDE,
+                    LossModes.SEPARATE_OUTSIDE,
+                    LossModes.SEPARATE_LOGSUMEXP,
+                }: 
+                    label_pad_token_id = self._tokenizer.pad_token_id
+                else:
+                    raise ValueError(f"Unknown loss mode: {loss_mode}")
+                
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Sample preparation
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                samples_marginal = prep_samples_marginal(
+                    batch               = batch, 
+                    batch_size          = batch_size, 
+                    eos_token_id        = self._tokenizer.eos_token_id, 
+                    cls_token_id        = self._tokenizer.cls_token_id, 
+                    disable_timing      = disable_timing, 
+                    inputs_outputs      = inputs_outputs, 
+                    num_scratchpads     = num_scratchpads, 
+                    generation_kwargs   = self._generation_kwargs[mode], 
+                    label_pad_token_id  = label_pad_token_id, 
+                    inputs_pad_token_id = self._tokenizer.pad_token_id,
+                ) 
 
-                assert torch.all(padded_final_input_ids[:, 0] != self._tokenizer.pad_token_id)
+                padded_final_attention_mask = samples_marginal.padded_final_attention_mask
+                padded_final_input_ids      = samples_marginal.padded_final_input_ids
+                padded_final_labels         = samples_marginal.padded_final_labels
+                y_mask_is_not_pad = samples_marginal.y_mask_is_not_pad
+                z_mask_is_not_pad = samples_marginal.z_mask_is_not_pad
+                shift_y_mask_is_not_pad = y_mask_is_not_pad[:, :, 1:]
+                shift_z_mask_is_not_pad = z_mask_is_not_pad[:, :, 1:]
+
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Learning rate
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                assert torch.all(
+                    padded_final_input_ids[:, 0] != self._tokenizer.pad_token_id)
+                optimizer = self.trainer.optimizers[0]
+                lr = optimizer.param_groups[0]["lr"]                
+                utils.check_equal(len(self.trainer.optimizers), 1)
+                utils.check_equal(len(optimizer.param_groups), 1)
+                rich.print(f"{lr = }")
+
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Compute the logits
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 outputs = self._model(
+                    labels         = padded_final_labels if loss_mode == LossModes.DEFAULT else None,
                     input_ids      = padded_final_input_ids,
                     attention_mask = padded_final_attention_mask,
-                    # labels         = padded_final_labels,
                 )
+                raw_logits = outputs.logits
 
-                labels = padded_final_labels
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Shift the logits and labels
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                shift_label_logits, shift_label_is_pad = prep_logits_and_labels(
+                    vocab_size         = vocab_size,
+                    raw_logits         = raw_logits, 
+                    batch_size         = batch_size, 
+                    padded_labels      = padded_final_labels, 
+                    num_scratchpads    = num_scratchpads, 
+                    label_pad_token_id = label_pad_token_id, 
+                ) 
+                shift_seq_len = shift_label_logits.shape[2]
 
-                log_mode = "inside"
-                utils.check_contained(log_mode, {"inside", "outside", "logsumexp"})
-
-                shift_labels = labels[..., 1:].contiguous()
-                bsz_times_num_beams, seq_len, vocab_size = outputs.logits[..., :-1, :].shape
-
-                num_scratchpads = self._generation_kwargs[mode]["num_return_sequences"]
-                batch_size = self._batch_size[mode]
-
-                shift_labels = labels[..., 1:].contiguous()
-                flat_labels = shift_labels.view(-1).unsqueeze(-1).contiguous()
-                
-                utils.check_equal(flat_labels.shape, (batch_size * num_scratchpads * seq_len, 1))
-                utils.check_equal(bsz_times_num_beams, self._batch_size[mode] * num_scratchpads)
-                utils.check_equal(shift_labels.shape, (num_scratchpads * batch_size, seq_len))
-                utils.check_equal(outputs.logits.shape, (batch_size * num_scratchpads, seq_len + 1, vocab_size))
-                torch.autograd.set_detect_anomaly(True)
-                
-                if log_mode == "inside":
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Do checks
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                if loss_mode == LossModes.LOG_INSIDE:
                     # Flatten the log-probs and the labels to get a 2D tensor from which we can gather
-                    shift_logprobs = outputs.logits.log_softmax(dim=-1)[..., :-1, :].contiguous()
-                    flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1]).contiguous()
-                    utils.check_equal(flat_logprobs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
+                    assert False
 
-                    # Do the gathering
-                    flat_label_logprobs = flat_logprobs.gather(dim=1, index=flat_labels)
-                    flat_label_logprobs.masked_fill_(flat_labels == LABEL_PAD, 0)
-                    utils.check_equal(flat_label_logprobs.shape, (batch_size * num_scratchpads * seq_len, 1))
-                    label_logprobs = flat_label_logprobs.view(batch_size, num_scratchpads, seq_len)
-
-                    # Marginalize
-                    marginalized_probs = label_logprobs.sum(dim=-1).sum(dim=-1)
+                    log_probs = shift_label_logits.log_softmax(dim=-1)
+                    masked_log_probs = log_probs.masked_fill(shift_label_is_pad == 0, 0.)
+                    marginalized_probs = masked_log_probs.sum(dim=-1).sum(dim=-1)
                     ll = marginalized_probs
+                    utils.check_equal(ll.ndims, 1)
+                    loss = - torch.mean(ll)
 
-                elif log_mode == "logsumexp":
-                    # Flatten the log-probs and the labels to get a 2D tensor from which we can gather
-                    shift_logprobs = outputs.logits.log_softmax(dim=-1)[..., :-1, :].contiguous()
-                    flat_logprobs = shift_logprobs.view(-1, shift_logprobs.shape[-1]).contiguous()
-                    utils.check_equal(flat_logprobs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
+                elif loss_mode == LossModes.LOGSUMEXP:
+                    # This should be the most stable
+                    assert False
 
-                    # Mask out the probabilities of the LABEL_PAD labels
-                    # Do the gathering
-                    flat_label_logprobs = flat_logprobs.gather(dim=1, index=flat_labels)
-                    flat_label_logprobs.masked_fill_(flat_labels == LABEL_PAD, 0)
-                    utils.check_equal(flat_label_logprobs.shape, (batch_size * num_scratchpads * seq_len, 1))
-                    label_logprobs = flat_label_logprobs.view(batch_size, num_scratchpads, seq_len)
+                    shift_log_probs = shift_label_logits.log_softmax(dim=-1)
+                    shift_masked_log_probs = shift_log_probs.masked_fill(shift_label_is_pad == 0, 0.)
+                    shift_marginalized_probs = shift_masked_log_probs.sum(dim=-1).logsumexp(dim=-1)
+                    ll = shift_marginalized_probs
+                    utils.check_equal(ll.ndim, 1)
+                    loss = - torch.mean(ll)
 
-                    # Marginalize
-                    marginalized_probs = label_logprobs.sum(dim=-1).logsumexp(dim=-1)
-                    ll = marginalized_probs
-
-                elif log_mode == "outside":
-                    # Flatten the probs and the labels to get a 2D tensor from which we can gather
-                    shift_probs = outputs.logits.softmax(dim=-1)[..., :-1, :].contiguous()
-                    flat_probs = shift_probs.view(-1, shift_probs.shape[-1]).contiguous()
-                    utils.check_equal(flat_probs.shape, (batch_size * num_scratchpads * seq_len, vocab_size))
-
-                    # Do the gathering
-                    flat_label_probs = flat_probs.gather(dim=1, index=flat_labels)
-                    flat_label_probs.masked_fill_(flat_labels == LABEL_PAD, 1)
-                    utils.check_equal(flat_label_probs.shape, (batch_size * num_scratchpads * seq_len, 1))
-                    label_probs = flat_label_probs.view(batch_size, num_scratchpads, seq_len)
-
-                    # Marginalize
-                    marginalized_probs = label_probs.prod(dim=-1).sum(dim=-1)
-                    ll = marginalized_probs.log()
-
-                else:
-                    raise ValueError(log_mode)
-
-
-                loss = - torch.mean(ll, dim=-1)
-                assert torch.isnan(loss).sum() == 0
-                assert torch.isinf(loss).sum() == 0
-                assert loss.ndim == 0, loss.shape
+                elif loss_mode == LossModes.SEPARATE_LOGSUMEXP:
+                    # This should be the most stable
+                    shift_log_probs = shift_label_logits.log_softmax(dim=-1)
                     
-        # sum probs
+                    utils.check_equal(shift_log_probs         .shape, (batch_size, num_scratchpads, shift_seq_len))
+                    utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
+                    utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
+                    utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
+
+                    y_log_probs = shift_log_probs * shift_y_mask_is_not_pad * shift_label_is_pad.bool().logical_not().long()
+                    z_log_probs = shift_log_probs * shift_z_mask_is_not_pad * shift_label_is_pad.bool().logical_not().long()
+
+                    y_part = y_log_probs.sum(dim=-1).exp().log_softmax(dim=-1)
+                    z_part = z_log_probs.sum(dim=-1)
+
+                    ll = (y_part + z_part).logsumexp(dim=-1)
+                    utils.check_equal(ll.ndim, 1)
+                    loss = - torch.mean(ll)
+                    utils.check_equal(ll.shape, (batch_size,))
+
+                elif loss_mode == LossModes.SEPARATE_OUTSIDE:
+                    # This should be the most stable
+
+                    torch.cuda.synchronize()
+                    shift_probs = shift_label_logits.softmax(dim=-1)
+                    
+                    torch.cuda.synchronize()
+                    shift_probs.masked_fill(shift_label_is_pad.bool(), 1)
+
+                    torch.cuda.synchronize()
+                    utils.check_equal(shift_probs             .shape, (batch_size, num_scratchpads, shift_seq_len))
+                    utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
+                    utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
+                    utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
+                    
+                    torch.cuda.synchronize()
+                    y_probs = shift_probs.masked_fill(shift_y_mask_is_not_pad.bool().logical_not(), 1.)
+                    z_probs = shift_probs.masked_fill(shift_z_mask_is_not_pad.bool().logical_not(), 1.)
+                    
+                    torch.cuda.synchronize()
+                    y_part = y_probs.prod(dim=-1).softmax(dim=-1)
+                    z_part = z_probs.prod(dim=-1)
+                    torch.cuda.synchronize()
+
+                    utils.check_equal(y_part.shape, (batch_size, num_scratchpads))
+                    utils.check_equal(z_part.shape, (batch_size, num_scratchpads))
+
+                    ll = (y_part * z_part).sum(dim=-1)
+                    torch.cuda.synchronize()
+
+                    loss = - torch.mean(ll)
+                    torch.cuda.synchronize()
+
+                    utils.check_equal(ll.ndim, 1)
+                    utils.check_equal(ll.shape, (batch_size,))
+
+                elif loss_mode == LossModes.LOG_OUTSIDE:
+                    assert False
+                    # This is probably the least stable
+                    probs = shift_label_logits.softmax(dim=-1)
+                    masked_probs = probs.masked_fill(shift_label_is_pad == 0, 1.)
+                    marginalized_probs = masked_probs.prod(dim=-1).log().sum(dim=-1)
+                    # marginalized_probs = masked_probs.prod(dim=-1).prod(dim=-1).log()
+                    ll = marginalized_probs
+                    utils.check_equal(ll.ndims, 1)
+                    loss = - torch.mean(ll)
+
+        print(f"[{self.trainer.global_rank}] Was ok: {loss_mode} {loss}")
         return loss
 
 
@@ -686,7 +896,6 @@ class _RefineLM(pl.LightningModule):
                 rich.print(f"[bold blue]\[gen] {gen}")
                 rich.print("=" * 80)
             
-            
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute different metrics
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -699,7 +908,8 @@ class _RefineLM(pl.LightningModule):
         self.log("val_em"  , em_accuracy,      batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_answ", final_answer_acc, batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[mode], **self._logging_conf)
-        
+
+        assert not torch.any(torch.isnan(ppl_outputs.loss)), "Loss is NaN"        
         return ppl_outputs
 
 
@@ -841,9 +1051,7 @@ def _get_last_checkpoint_path(
     if run_name is None:
         # We recover the run name from the wandb run id
         run_name = path.parent.parent.name
-        utils.rich_print_zero_rank(f"\n[red bold]Inferring `run_name` value of:[/] {run_name = !s}")
-
-    utils.rich_print_zero_rank(f"\n[red bold]_get_last_checkpoint_path:[/] {checkpoint_path = !s}")
+        utils.rich_print_zero_rank(f"\n[bold]Inferring `run_name` value of:[/] {run_name = !s}")
 
     return LastCkptInfo(checkpoint_path, run_name, None, None)
 
@@ -1178,9 +1386,6 @@ def prep_mle_train_and_valid(*, examples, eos_token_id: int, scratchpad_eos_toke
 class MarginalLikelihoodTrainingCollator:
     _tokenizer: transformers.PreTrainedTokenizer
 
-    def __post_init__(self):
-        rich.print("[bold red]Initializing MLETrainingCollator")
-
     def __call__(self, examples):
         """
         - We have the questions, we have the answers. Nothing else.
@@ -1207,9 +1412,6 @@ class MLETrainingCollator:
     _tokenizer: transformers.PreTrainedTokenizer
     _lm_masking_mode: str
 
-    def __post_init__(self):
-        rich.print("[bold red]Initializing MLETrainingCollator")
-
     def __call__(self, raw_examples):
         """
         - For perplexity evaluation:
@@ -1235,9 +1437,6 @@ class MLETrainingCollator:
 class ValitationCollator:
     _tokenizer: transformers.PreTrainedTokenizer
     _lm_masking_mode: str
-
-    def __post_init__(self):
-        rich.print("[bold red]Initializing ValidationCollator")
 
     def __call__(self, raw_examples):
         """
@@ -1369,10 +1568,10 @@ def _setup_ddp(distribute_strategy: str) -> DDPInfo:
 
     return ddp_info
 
+
 def _setup_tokenizer(hf_name: str, is_gpt2_model) -> transformers.PreTrainedTokenizer:
     if TOKENIZER_MODE == constants.TokenizerModes.ARITHMETIC:
-        return data_synthetic_arithmetic_tokenizer.ArithmeticTokenizer()
-        
+        assert False, "This is not supported anymore."
     elif TOKENIZER_MODE == constants.TokenizerModes.PRETRAINED:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             hf_name, pad_token="<|pad|>", 
@@ -1413,7 +1612,7 @@ def _setup_base_model(
     # Random Model
     ###########################################################################
     if model_mode == constants.ModelModes.RANDOM :
-        utils.rich_print_zero_rank(f"[bold red]USING A NON PRETRAINED MODEL.")
+        utils.rich_print_zero_rank(f"\n[bold]USING A NON PRETRAINED MODEL.")
 
         config = transformers.AutoConfig.from_pretrained(hf_name)
         utils.setattr_must_exist(config, "vocab_size", len(tokenizer.vocab))  # type: ignore[attr-defined]
@@ -1422,7 +1621,7 @@ def _setup_base_model(
         # Random model with custom config
         ###########################################################################
         if custom_model_config is not None:
-            utils.rich_print_zero_rank(f"[bold red]USING CUSTOM MODEL CONFIGURATION.")
+            utils.rich_print_zero_rank(f"\n[bold]USING CUSTOM MODEL CONFIGURATION.")
             for k, v in custom_model_config.items():
                 utils.setattr_must_exist(config, k, v)
 
@@ -1433,7 +1632,7 @@ def _setup_base_model(
     # Pretrained model
     ###########################################################################
     elif model_mode == constants.ModelModes.PRETRAINED:
-        utils.rich_print_zero_rank(f"[bold GREEN]USING A PRETRAINED MODEL.")
+        utils.rich_print_zero_rank(f"\n[bold GREEN]USING A PRETRAINED MODEL.")
         base_model = transformers.GPT2LMHeadModel.from_pretrained(hf_name)
 
     else:
@@ -1509,6 +1708,7 @@ def _make_config_path(checkpoints_root_dir: Path, run_name: str, wandb_run_id: s
 
 
 DATA_DIR = SCRIPT_DIR / "data"
+
 
 class EntryPoints:
     @classmethod
@@ -1591,10 +1791,10 @@ class EntryPoints:
 
         if resuming:
             latest_checkpoint = last_ckpt_info.path
-            utils.rich_print_zero_rank(f"[bold red] Will resume from:[/] \"{latest_checkpoint}\"")
+            utils.rich_print_zero_rank(f"\n[bold]Will resume from:[/] \"{latest_checkpoint}\"")
         else:
             latest_checkpoint = None
-            utils.rich_print_zero_rank(f"[bold green]Not resuming: Will start from scratch.")
+            utils.rich_print_zero_rank(f"\n[bold]Not resuming: Will start from scratch.")
 
         ddp_info = _setup_ddp(strategy)
 
@@ -1628,7 +1828,7 @@ class EntryPoints:
         if resuming:
             utils.rich_print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint)
             # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
-            utils.rich_print_zero_rank("[bold]WATCH OUT: Not loading meta info from checkpoint.[bold]")
+            utils.rich_print_zero_rank("\n[red bold]WATCH OUT:[/] Not loading meta info from checkpoint.")
             meta_info = arg_meta_info
             
             del arg_meta_info
@@ -1679,14 +1879,13 @@ class EntryPoints:
             model_mode=meta_info["model_mode"], 
             tokenizer=tokenizer,
         )
-        utils.rich_print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"\n")
+        utils.rich_print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"")
         datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
             [constants.CVSets.TRAINING, constants.CVSets.VALIDATION]
         )
 
-        rich.print(f"[bold red]Strategy: {strategy}[/]")
-        rich.print(f"[bold red]ddp_info: {vars(ddp_info)}[/]")
-
+        rich.print(f"\n[bold]Strategy:[/] {strategy}")
+        rich.print(f"\n[bold]ddp_info:[/] {vars(ddp_info)}\n")
 
         ###############################################################
         # Build the pt-lightning dataloader

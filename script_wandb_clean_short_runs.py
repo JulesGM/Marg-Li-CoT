@@ -44,7 +44,7 @@ def main(
         err.args += f"{min_minutes = }"
         raise err
 
-    table = rich.table.Table("Name", "Runtime", "Action", "Date")
+    table = rich.table.Table("Name", "Id",  "Runtime", "Action", "Date")
     for run in runs:
         # run.state
         maybe_timestamp_str = run.summary.get("_timestamp", None)
@@ -67,10 +67,10 @@ def main(
             time_str = f"{hours_str}h {minutes_str}m {seconds_str}s"
 
             if run.state != "running" and minutes < min_minutes and hours == 0:
-                table.add_row(name_str, time_str, "[red]Deleting.", timestamp_str)
+                table.add_row(name_str, run.id, time_str, "[red]Deleting.", timestamp_str)
                 run.delete()
             else:
-                table.add_row(name_str, time_str, "-", timestamp_str)
+                table.add_row(name_str, run.id, time_str, "-", timestamp_str)
 
         else:
             table.add_row(name_str, "[red]No runtime.", "[red]Deleting.", timestamp_str)
