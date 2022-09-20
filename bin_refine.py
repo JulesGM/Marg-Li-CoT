@@ -373,6 +373,7 @@ def prep_logits_and_labels(
     # Shift the labels, prep them for the gather, create the label pad mask
     
     assert -100 not in padded_labels
+    assert num_scratchpads != -100, num_scratchpads
 
     shift_labels = padded_labels[..., 1:].contiguous()
     flat_labels = shift_labels.view(-1).unsqueeze(-1).contiguous()
@@ -579,20 +580,10 @@ class _RefineLM(pl.LightningModule):
             # Loss Mode selection
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             
-            if loss_mode == LossModes.SEPARATE_OUTSIDE:
-                label_pad_token_id = -100
-            elif loss_mode in {
-                LossModes.LOGSUMEXP, 
-                LossModes.LOG_INSIDE, 
-                LossModes.LOG_OUTSIDE,
-                LossModes.SEPARATE_OUTSIDE,
-                LossModes.SEPARATE_LOGSUMEXP,
-            }: 
-                label_pad_token_id = self._tokenizer.pad_token_id
-            else:
-                raise ValueError(f"Unknown loss mode: {loss_mode}")
-
-            utils.check_equal(label_pad_token_id, -100)
+            assert not loss_mode == LossModes.DEFAULT, "Not implemented"
+            
+            label_pad_token_id = self._tokenizer.pad_token_id
+            utils.check_equal(label_pad_token_id, self._tokenizer.pad_token_id)
 
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Sample preparation
@@ -606,7 +597,7 @@ class _RefineLM(pl.LightningModule):
                 inputs_outputs      = inputs_outputs, 
                 num_scratchpads     = num_scratchpads, 
                 generation_kwargs   = self._generation_kwargs[mode], 
-                label_pad_token_id  = self._tokenizer.pad_token_id,
+                label_pad_token_id  = label_pad_token_id,
                 inputs_pad_token_id = self._tokenizer.pad_token_id,
             ) 
 
@@ -700,35 +691,26 @@ class _RefineLM(pl.LightningModule):
             elif loss_mode == LossModes.SEPARATE_OUTSIDE:
                 # This should be the most stable
 
-                torch.cuda.synchronize()
                 shift_probs = shift_label_logits.softmax(dim=-1)
-                
-                torch.cuda.synchronize()
                 shift_probs.masked_fill(shift_label_is_pad.bool(), 1)
 
-                torch.cuda.synchronize()
                 utils.check_equal(shift_probs             .shape, (batch_size, num_scratchpads, shift_seq_len))
                 utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
                 utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
                 utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
                 
-                torch.cuda.synchronize()
                 y_probs = shift_probs.masked_fill(shift_y_mask_is_not_pad.bool().logical_not(), 1.)
                 z_probs = shift_probs.masked_fill(shift_z_mask_is_not_pad.bool().logical_not(), 1.)
                 
-                torch.cuda.synchronize()
                 y_part = y_probs.prod(dim=-1).softmax(dim=-1)
                 z_part = z_probs.prod(dim=-1)
-                torch.cuda.synchronize()
 
                 utils.check_equal(y_part.shape, (batch_size, num_scratchpads))
                 utils.check_equal(z_part.shape, (batch_size, num_scratchpads))
 
-                ll = (y_part * z_part).sum(dim=-1)
-                torch.cuda.synchronize()
+                ll = (y_part * z_part).sum(dim=-1).log()
 
                 loss = - torch.mean(ll)
-                torch.cuda.synchronize()
 
                 utils.check_equal(ll.ndim, 1)
                 utils.check_equal(ll.shape, (batch_size,))
