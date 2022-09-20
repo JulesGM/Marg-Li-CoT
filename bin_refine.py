@@ -250,6 +250,8 @@ def prep_samples_marginal(
     batch_size: int, 
     num_scratchpads: int, 
 ) -> SamplesMarginal:
+    
+    utils.check_equal(label_pad_token_id, inputs_pad_token_id)
 
     with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] Unpad, Repeat-interleave", disable=disable_timing):
         with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] unpad then repeat-interleave", disable=disable_timing):
@@ -366,29 +368,31 @@ def prep_logits_and_labels(
     batch_size, 
     padded_labels, 
     num_scratchpads, 
-    label_pad_token_id, 
+    label_pad_token_id,
 ):
+    # Shift the labels, prep them for the gather, create the label pad mask
+    
+    assert -100 not in padded_labels
+
     shift_labels = padded_labels[..., 1:].contiguous()
     flat_labels = shift_labels.view(-1).unsqueeze(-1).contiguous()
     bsz_times_num_beams = raw_logits.shape[0]
-    shift_logits = raw_logits[..., :-1, :].contiguous()
     seq_len = shift_labels.shape[1]
-
-    utils.check_equal(shift_logits.shape[1], seq_len)
-    flat_logits = shift_logits.view(-1, shift_logits.shape[-1]).contiguous()
-
-    flat_label_logits = flat_logits.gather(dim=1, index=flat_labels)
-    
-    utils.check_equal(flat_label_logits.shape, (batch_size * num_scratchpads * seq_len, 1))
-    utils.check_equal(flat_logits.shape      , (batch_size * num_scratchpads * seq_len, vocab_size))
-    
-    shift_label_logits = flat_label_logits.reshape(batch_size, num_scratchpads, seq_len)
-    utils.check_equal(bsz_times_num_beams,  batch_size * num_scratchpads,)
-    utils.check_equal(raw_logits.shape   , (batch_size * num_scratchpads, seq_len + 1, vocab_size))
-
     shift_labels = shift_labels.reshape(batch_size, num_scratchpads, seq_len)
     shift_label_is_pad = (shift_labels == label_pad_token_id).to(padded_labels.dtype)
 
+    # Shift the logits, prep them for the gather, do the gather
+    shift_logits = raw_logits[..., :-1, :].contiguous()
+    flat_logits = shift_logits.view(-1, shift_logits.shape[-1]).contiguous()
+    
+    flat_label_logits = flat_logits.gather(dim=1, index=flat_labels)
+    shift_label_logits = flat_label_logits.reshape(batch_size, num_scratchpads, seq_len)
+        
+    utils.check_equal(bsz_times_num_beams,  batch_size * num_scratchpads,)
+    utils.check_equal(raw_logits.shape   , (batch_size * num_scratchpads, seq_len + 1, vocab_size))
+    utils.check_equal(shift_logits.shape[1], seq_len)
+    utils.check_equal(flat_label_logits.shape , (batch_size * num_scratchpads * seq_len, 1))
+    utils.check_equal(flat_logits.shape       , (batch_size * num_scratchpads * seq_len, vocab_size))
     utils.check_equal(shift_labels.shape      , (batch_size, num_scratchpads, seq_len))
     utils.check_equal(shift_label_is_pad.shape, (batch_size, num_scratchpads, seq_len))
     utils.check_equal(shift_label_logits.shape, (batch_size, num_scratchpads, seq_len))
@@ -566,189 +570,179 @@ class _RefineLM(pl.LightningModule):
         marginal_model = MarginalModelModes.JOINT
         loss_mode = LossModes.SEPARATE_OUTSIDE
 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # p(y | z, x) * p(z | x), Allows to normalize p(z | x) over the top-k z.
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        if marginal_model == MarginalModelModes.SEPARATE:
-            pass
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # p(y, z | x)
-        # 
-        # We need to remove the padding from the generations, add the final answer,
-        # and then pad to the 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        elif marginal_model == MarginalModelModes.JOINT:
-            # TODO: slow but does what it needs to for the moment
-            utils.check_equal(inputs_outputs.ndim, 2)
+        # TODO: slow but does what it needs to for the moment
+        utils.check_equal(inputs_outputs.ndim, 2)
 
-            # Outputs include the inputs as well
-            with utils.cuda_timeit("[bold]bin_refine.py::Prep:[/] score inputs", disable=disable_timing):
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Loss Mode selection
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Outputs include the inputs as well
+        with utils.cuda_timeit("[bold]bin_refine.py::Prep:[/] score inputs", disable=disable_timing):
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Loss Mode selection
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            
+            if loss_mode == LossModes.SEPARATE_OUTSIDE:
+                label_pad_token_id = -100
+            elif loss_mode in {
+                LossModes.LOGSUMEXP, 
+                LossModes.LOG_INSIDE, 
+                LossModes.LOG_OUTSIDE,
+                LossModes.SEPARATE_OUTSIDE,
+                LossModes.SEPARATE_LOGSUMEXP,
+            }: 
+                label_pad_token_id = self._tokenizer.pad_token_id
+            else:
+                raise ValueError(f"Unknown loss mode: {loss_mode}")
+
+            utils.check_equal(label_pad_token_id, -100)
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Sample preparation
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            samples_marginal = prep_samples_marginal(
+                batch               = batch, 
+                batch_size          = batch_size, 
+                eos_token_id        = self._tokenizer.eos_token_id, 
+                cls_token_id        = self._tokenizer.cls_token_id, 
+                disable_timing      = disable_timing, 
+                inputs_outputs      = inputs_outputs, 
+                num_scratchpads     = num_scratchpads, 
+                generation_kwargs   = self._generation_kwargs[mode], 
+                label_pad_token_id  = self._tokenizer.pad_token_id,
+                inputs_pad_token_id = self._tokenizer.pad_token_id,
+            ) 
+
+            padded_final_attention_mask = samples_marginal.padded_final_attention_mask
+            padded_final_input_ids      = samples_marginal.padded_final_input_ids
+            padded_final_labels         = samples_marginal.padded_final_labels
+            y_mask_is_not_pad = samples_marginal.y_mask_is_not_pad
+            z_mask_is_not_pad = samples_marginal.z_mask_is_not_pad
+            shift_y_mask_is_not_pad = y_mask_is_not_pad[:, :, 1:]
+            shift_z_mask_is_not_pad = z_mask_is_not_pad[:, :, 1:]
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Learning rate
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            assert torch.all(
+                padded_final_input_ids[:, 0] != self._tokenizer.pad_token_id)
+            optimizer = self.trainer.optimizers[0]
+            lr = optimizer.param_groups[0]["lr"]                
+            utils.check_equal(len(self.trainer.optimizers), 1)
+            utils.check_equal(len(optimizer.param_groups), 1)
+            rich.print(f"{lr = }")
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Compute the logits
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            outputs = self._model(
+                labels         = padded_final_labels if loss_mode == LossModes.DEFAULT else None,
+                input_ids      = padded_final_input_ids,
+                attention_mask = padded_final_attention_mask,
+            )
+            raw_logits = outputs.logits
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Shift the logits and labels
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            shift_label_logits, shift_label_is_pad = prep_logits_and_labels(
+                vocab_size         = vocab_size,
+                raw_logits         = raw_logits, 
+                batch_size         = batch_size, 
+                padded_labels      = padded_final_labels, 
+                num_scratchpads    = num_scratchpads, 
+                label_pad_token_id = label_pad_token_id, 
+            ) 
+            shift_seq_len = shift_label_logits.shape[2]
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Do checks
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            if loss_mode == LossModes.LOG_INSIDE:
+                # Flatten the log-probs and the labels to get a 2D tensor from which we can gather
+                assert False
+
+                log_probs = shift_label_logits.log_softmax(dim=-1)
+                masked_log_probs = log_probs.masked_fill(shift_label_is_pad == 0, 0.)
+                marginalized_probs = masked_log_probs.sum(dim=-1).sum(dim=-1)
+                ll = marginalized_probs
+                utils.check_equal(ll.ndims, 1)
+                loss = - torch.mean(ll)
+
+            elif loss_mode == LossModes.LOGSUMEXP:
+                # This should be the most stable
+                assert False
+
+                shift_log_probs = shift_label_logits.log_softmax(dim=-1)
+                shift_masked_log_probs = shift_log_probs.masked_fill(shift_label_is_pad == 0, 0.)
+                shift_marginalized_probs = shift_masked_log_probs.sum(dim=-1).logsumexp(dim=-1)
+                ll = shift_marginalized_probs
+                utils.check_equal(ll.ndim, 1)
+                loss = - torch.mean(ll)
+
+            elif loss_mode == LossModes.SEPARATE_LOGSUMEXP:
+                # This should be the most stable
+                shift_log_probs = shift_label_logits.log_softmax(dim=-1)
                 
-                if loss_mode == LossModes.SEPARATE_OUTSIDE:
-                    label_pad_token_id = -100
-                elif loss_mode in {
-                    LossModes.LOGSUMEXP, 
-                    LossModes.LOG_INSIDE, 
-                    LossModes.LOG_OUTSIDE,
-                    LossModes.SEPARATE_OUTSIDE,
-                    LossModes.SEPARATE_LOGSUMEXP,
-                }: 
-                    label_pad_token_id = self._tokenizer.pad_token_id
-                else:
-                    raise ValueError(f"Unknown loss mode: {loss_mode}")
+                utils.check_equal(shift_log_probs         .shape, (batch_size, num_scratchpads, shift_seq_len))
+                utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
+                utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
+                utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
+
+                y_log_probs = shift_log_probs * shift_y_mask_is_not_pad * shift_label_is_pad.bool().logical_not().long()
+                z_log_probs = shift_log_probs * shift_z_mask_is_not_pad * shift_label_is_pad.bool().logical_not().long()
+
+                y_part = y_log_probs.sum(dim=-1).exp().log_softmax(dim=-1)
+                z_part = z_log_probs.sum(dim=-1)
+
+                ll = (y_part + z_part).logsumexp(dim=-1)
+                utils.check_equal(ll.ndim, 1)
+                loss = - torch.mean(ll)
+                utils.check_equal(ll.shape, (batch_size,))
+
+            elif loss_mode == LossModes.SEPARATE_OUTSIDE:
+                # This should be the most stable
+
+                torch.cuda.synchronize()
+                shift_probs = shift_label_logits.softmax(dim=-1)
                 
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Sample preparation
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                samples_marginal = prep_samples_marginal(
-                    batch               = batch, 
-                    batch_size          = batch_size, 
-                    eos_token_id        = self._tokenizer.eos_token_id, 
-                    cls_token_id        = self._tokenizer.cls_token_id, 
-                    disable_timing      = disable_timing, 
-                    inputs_outputs      = inputs_outputs, 
-                    num_scratchpads     = num_scratchpads, 
-                    generation_kwargs   = self._generation_kwargs[mode], 
-                    label_pad_token_id  = label_pad_token_id, 
-                    inputs_pad_token_id = self._tokenizer.pad_token_id,
-                ) 
+                torch.cuda.synchronize()
+                shift_probs.masked_fill(shift_label_is_pad.bool(), 1)
 
-                padded_final_attention_mask = samples_marginal.padded_final_attention_mask
-                padded_final_input_ids      = samples_marginal.padded_final_input_ids
-                padded_final_labels         = samples_marginal.padded_final_labels
-                y_mask_is_not_pad = samples_marginal.y_mask_is_not_pad
-                z_mask_is_not_pad = samples_marginal.z_mask_is_not_pad
-                shift_y_mask_is_not_pad = y_mask_is_not_pad[:, :, 1:]
-                shift_z_mask_is_not_pad = z_mask_is_not_pad[:, :, 1:]
+                torch.cuda.synchronize()
+                utils.check_equal(shift_probs             .shape, (batch_size, num_scratchpads, shift_seq_len))
+                utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
+                utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
+                utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
+                
+                torch.cuda.synchronize()
+                y_probs = shift_probs.masked_fill(shift_y_mask_is_not_pad.bool().logical_not(), 1.)
+                z_probs = shift_probs.masked_fill(shift_z_mask_is_not_pad.bool().logical_not(), 1.)
+                
+                torch.cuda.synchronize()
+                y_part = y_probs.prod(dim=-1).softmax(dim=-1)
+                z_part = z_probs.prod(dim=-1)
+                torch.cuda.synchronize()
 
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Learning rate
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                assert torch.all(
-                    padded_final_input_ids[:, 0] != self._tokenizer.pad_token_id)
-                optimizer = self.trainer.optimizers[0]
-                lr = optimizer.param_groups[0]["lr"]                
-                utils.check_equal(len(self.trainer.optimizers), 1)
-                utils.check_equal(len(optimizer.param_groups), 1)
-                rich.print(f"{lr = }")
+                utils.check_equal(y_part.shape, (batch_size, num_scratchpads))
+                utils.check_equal(z_part.shape, (batch_size, num_scratchpads))
 
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Compute the logits
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                outputs = self._model(
-                    labels         = padded_final_labels if loss_mode == LossModes.DEFAULT else None,
-                    input_ids      = padded_final_input_ids,
-                    attention_mask = padded_final_attention_mask,
-                )
-                raw_logits = outputs.logits
+                ll = (y_part * z_part).sum(dim=-1)
+                torch.cuda.synchronize()
 
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Shift the logits and labels
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                shift_label_logits, shift_label_is_pad = prep_logits_and_labels(
-                    vocab_size         = vocab_size,
-                    raw_logits         = raw_logits, 
-                    batch_size         = batch_size, 
-                    padded_labels      = padded_final_labels, 
-                    num_scratchpads    = num_scratchpads, 
-                    label_pad_token_id = label_pad_token_id, 
-                ) 
-                shift_seq_len = shift_label_logits.shape[2]
+                loss = - torch.mean(ll)
+                torch.cuda.synchronize()
 
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Do checks
-                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                if loss_mode == LossModes.LOG_INSIDE:
-                    # Flatten the log-probs and the labels to get a 2D tensor from which we can gather
-                    assert False
+                utils.check_equal(ll.ndim, 1)
+                utils.check_equal(ll.shape, (batch_size,))
 
-                    log_probs = shift_label_logits.log_softmax(dim=-1)
-                    masked_log_probs = log_probs.masked_fill(shift_label_is_pad == 0, 0.)
-                    marginalized_probs = masked_log_probs.sum(dim=-1).sum(dim=-1)
-                    ll = marginalized_probs
-                    utils.check_equal(ll.ndims, 1)
-                    loss = - torch.mean(ll)
-
-                elif loss_mode == LossModes.LOGSUMEXP:
-                    # This should be the most stable
-                    assert False
-
-                    shift_log_probs = shift_label_logits.log_softmax(dim=-1)
-                    shift_masked_log_probs = shift_log_probs.masked_fill(shift_label_is_pad == 0, 0.)
-                    shift_marginalized_probs = shift_masked_log_probs.sum(dim=-1).logsumexp(dim=-1)
-                    ll = shift_marginalized_probs
-                    utils.check_equal(ll.ndim, 1)
-                    loss = - torch.mean(ll)
-
-                elif loss_mode == LossModes.SEPARATE_LOGSUMEXP:
-                    # This should be the most stable
-                    shift_log_probs = shift_label_logits.log_softmax(dim=-1)
-                    
-                    utils.check_equal(shift_log_probs         .shape, (batch_size, num_scratchpads, shift_seq_len))
-                    utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
-                    utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
-                    utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
-
-                    y_log_probs = shift_log_probs * shift_y_mask_is_not_pad * shift_label_is_pad.bool().logical_not().long()
-                    z_log_probs = shift_log_probs * shift_z_mask_is_not_pad * shift_label_is_pad.bool().logical_not().long()
-
-                    y_part = y_log_probs.sum(dim=-1).exp().log_softmax(dim=-1)
-                    z_part = z_log_probs.sum(dim=-1)
-
-                    ll = (y_part + z_part).logsumexp(dim=-1)
-                    utils.check_equal(ll.ndim, 1)
-                    loss = - torch.mean(ll)
-                    utils.check_equal(ll.shape, (batch_size,))
-
-                elif loss_mode == LossModes.SEPARATE_OUTSIDE:
-                    # This should be the most stable
-
-                    torch.cuda.synchronize()
-                    shift_probs = shift_label_logits.softmax(dim=-1)
-                    
-                    torch.cuda.synchronize()
-                    shift_probs.masked_fill(shift_label_is_pad.bool(), 1)
-
-                    torch.cuda.synchronize()
-                    utils.check_equal(shift_probs             .shape, (batch_size, num_scratchpads, shift_seq_len))
-                    utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
-                    utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
-                    utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
-                    
-                    torch.cuda.synchronize()
-                    y_probs = shift_probs.masked_fill(shift_y_mask_is_not_pad.bool().logical_not(), 1.)
-                    z_probs = shift_probs.masked_fill(shift_z_mask_is_not_pad.bool().logical_not(), 1.)
-                    
-                    torch.cuda.synchronize()
-                    y_part = y_probs.prod(dim=-1).softmax(dim=-1)
-                    z_part = z_probs.prod(dim=-1)
-                    torch.cuda.synchronize()
-
-                    utils.check_equal(y_part.shape, (batch_size, num_scratchpads))
-                    utils.check_equal(z_part.shape, (batch_size, num_scratchpads))
-
-                    ll = (y_part * z_part).sum(dim=-1)
-                    torch.cuda.synchronize()
-
-                    loss = - torch.mean(ll)
-                    torch.cuda.synchronize()
-
-                    utils.check_equal(ll.ndim, 1)
-                    utils.check_equal(ll.shape, (batch_size,))
-
-                elif loss_mode == LossModes.LOG_OUTSIDE:
-                    assert False
-                    # This is probably the least stable
-                    probs = shift_label_logits.softmax(dim=-1)
-                    masked_probs = probs.masked_fill(shift_label_is_pad == 0, 1.)
-                    marginalized_probs = masked_probs.prod(dim=-1).log().sum(dim=-1)
-                    # marginalized_probs = masked_probs.prod(dim=-1).prod(dim=-1).log()
-                    ll = marginalized_probs
-                    utils.check_equal(ll.ndims, 1)
-                    loss = - torch.mean(ll)
+            elif loss_mode == LossModes.LOG_OUTSIDE:
+                assert False
+                # This is probably the least stable
+                probs = shift_label_logits.softmax(dim=-1)
+                masked_probs = probs.masked_fill(shift_label_is_pad == 0, 1.)
+                marginalized_probs = masked_probs.prod(dim=-1).log().sum(dim=-1)
+                # marginalized_probs = masked_probs.prod(dim=-1).prod(dim=-1).log()
+                ll = marginalized_probs
+                utils.check_equal(ll.ndims, 1)
+                loss = - torch.mean(ll)
 
         print(f"[{self.trainer.global_rank}] Was ok: {loss_mode} {loss}")
         return loss
