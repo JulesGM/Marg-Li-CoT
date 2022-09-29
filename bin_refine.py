@@ -24,7 +24,6 @@ import more_itertools  # type: ignore[import]
 import numpy as np
 import pretty_traceback  # type: ignore
 import pytorch_lightning as pl  # type: ignore[import]
-import rich  # type: ignore[import]
 import rich.table as table
 import torch
 import torch.utils
@@ -35,6 +34,9 @@ import wandb
 
 import general_shared_constants as constants
 import general_utils as utils
+import console
+
+CONSOLE = console.Console(force_terminal=True, force_interactive=True, width=200)
 
 pretty_traceback.install()
 print("Done loading modules.\n")
@@ -64,9 +66,8 @@ DEFAULT_SCHEDULER_TYPE = constants.SchedulerTypes.LINEAR_WARMUP_LINEAR
 WARMUP_EPOCHS = 1
 MAX_EPOCHS = 53
 
-DEFAULT_WANDB_ID: Optional[str] = None # "2rid5n8n" 
+DEFAULT_WANDB_ID: Optional[str] = None # "4sr5c621" 
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
-DEFAULT_USE_SCRATCHPADS = False
 
 DATA_MODE = constants.DataModes.HDF5_PRETOK
 TOKENIZER_MODE = constants.TokenizerModes.PRETRAINED
@@ -146,7 +147,7 @@ LIMIT_TRAIN_BATCHES = None
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Varia
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-PRECISION = 16
+PRECISION = "bf16"  # Also try mixed
 
 SCHEDULER_FN = {
     constants.SchedulerTypes.CONSTANT:
@@ -167,6 +168,13 @@ SCHEDULER_FN = {
                 num_warmup_steps=steps_per_epoch * WARMUP_EPOCHS,
                 num_training_steps=steps_per_epoch * MAX_EPOCHS,),
 }
+
+
+def clone_hf_model(model):
+    new_model = model.__class__(model.config)
+    new_model.load_state_dict(model.state_dict())
+    return new_model
+
 
 def _compute_length_stats(*, target, pad_token_id):
     good_mask = target != pad_token_id
@@ -203,13 +211,13 @@ def _print_predictions(*, inputs, masks, generated_decoded, labels, all_generate
             color == "green"
         else:
             color = "yellow"
-        rich.print(f"[bold {color}]\[gen-input][/] {in_}")
-        rich.print(f"[bold {color}]\[gen-mask][/] {mask}")
-        rich.print(f"[bold blue]\[gen-reference][/] {ref}")
-        rich.print(f"[bold {color}]\[gen-generated][/] {gen}")
-        rich.print(f"[bold]\[gen-all-labels] {all_l}")
-        rich.print(f"[bold]\[gen-all-gen] {all_g}")
-        rich.print(f"[bold]" + "=" * 80)
+        CONSOLE.print(f"[bold {color}]\[gen-input][/] {in_}")
+        CONSOLE.print(f"[bold {color}]\[gen-mask][/] {mask}")
+        CONSOLE.print(f"[bold blue]\[gen-reference][/] {ref}")
+        CONSOLE.print(f"[bold {color}]\[gen-generated][/] {gen}")
+        CONSOLE.print(f"[bold]\[gen-all-labels] {all_l}")
+        CONSOLE.print(f"[bold]\[gen-all-gen] {all_g}")
+        CONSOLE.print(f"[bold]" + "=" * 80)
 
 
 def _prefix_match(s1: str, s2: str) -> bool:
@@ -231,104 +239,121 @@ def _last_non_masked(target: torch.Tensor, mask_token_id: int):
 
 @dataclasses.dataclass
 class SamplesMarginal:
-    y_mask_is_not_pad: torch.LongTensor
-    z_mask_is_not_pad: torch.LongTensor
-    padded_final_labels: torch.LongTensor
-    padded_final_input_ids: torch.LongTensor
-    padded_final_attention_mask: torch.LongTensor
+    y_mask_is_not_pad      : torch.Tensor
+    z_mask_is_not_pad      : torch.Tensor
+    MITGSWRV_ids           : torch.Tensor  # MITGSWRV: Masked Inputs Then Generated Samples With Reference Values
+    ITGSWRV_ids            : torch.Tensor  # ITGSWRV: Inputs Then Generated Samples With Reference Values
+    ITGSWRV_attention_mask : torch.Tensor  # ITGSWRV: Inputs Then Generated Samples With Reference Values
 
 
 def prep_samples_marginal(
     *, 
-    inputs_outputs: torch.Tensor, batch: dict[str, torch.Tensor], 
-    generation_kwargs: dict[str, Any], 
-    disable_timing: bool, 
-    eos_token_id: int, 
-    cls_token_id: int, 
-    label_pad_token_id: int, 
+    inputs_outputs:      torch.Tensor, 
+    batch:               dict[str, torch.Tensor], 
+    generation_kwargs:   dict[str, Any], 
+    disable_timing:      bool, 
+    eos_token_id:        int, 
+    cls_token_id:        int, 
+    label_pad_token_id:  int, 
     inputs_pad_token_id: int,
-    batch_size: int, 
-    num_scratchpads: int, 
+    batch_size:          int, 
+    num_scratchpads:     int, 
 ) -> SamplesMarginal:
     
     utils.check_equal(label_pad_token_id, inputs_pad_token_id)
 
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Unpad and interleave.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # utils.repeat_interleave is just a generator, doesn't not unnecessarily build a tensor.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] Unpad, Repeat-interleave", disable=disable_timing):
         with utils.cuda_timeit("[bold]bin_refine.py::PSI-A:[/] unpad then repeat-interleave", disable=disable_timing):
-        
             unpadded_inputs_outputs = remove_padding(
-                inputs_outputs, inputs_outputs != inputs_pad_token_id
+                inputs_outputs, 
+                inputs_outputs != inputs_pad_token_id,
             )
             unpadded_values = batch["value"]
             unpadded_inputs = remove_padding(
-                batch["generation_input_ids"], batch["generation_attention_mask"] == 1
+                batch["generation_input_ids"], 
+                batch["generation_attention_mask"] == 1,
             )
 
             unpadded_repeated_inputs = utils.repeat_interleave(
-                unpadded_inputs, generation_kwargs["num_return_sequences"]
+                unpadded_inputs, 
+                generation_kwargs["num_return_sequences"],
             )
             # Reproduce the structure of the multiple beams per input tensor
             unpadded_repeated_values = utils.repeat_interleave(
-                unpadded_values, generation_kwargs["num_return_sequences"]
+                unpadded_values, 
+                generation_kwargs["num_return_sequences"],
             ) 
 
-    final_input_ids = []
-    final_labels = []
-    y_mask = []
-    z_mask = []
+    final_ITGSWRV: list[list[int]] = []
+    final_MITGSWRV: list[list[int]] = []
+    y_mask: list[list[int]] = []
+    z_mask: list[list[int]] = []
 
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # MITGSWRV: Masked Input Then Generated Scratchpad With Rerefence Values
+    # ITGSWRV:  Input Then Generated Scratchpad With Rerefence Values
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     with utils.cuda_timeit("[bold]bin_refine.py::PSI-B:[/] Loop", disable=disable_timing):
-        for inputs, io, value  in zip(unpadded_repeated_inputs, unpadded_inputs_outputs, unpadded_repeated_values):
+        for inputs, io, value  in zip(
+            unpadded_repeated_inputs,
+            unpadded_inputs_outputs ,
+            unpadded_repeated_values,
+        ):
             # TODO: Future optimization: don't convert to a list. Probably faster.
             value = value.tolist()
-            io = io.tolist()
+            io_list = io.tolist()
+            del io
 
-            if not io[-1] == cls_token_id:
-                io.append(cls_token_id)
+            if not io_list[-1] == cls_token_id:
+                io_list.append(cls_token_id)
             
-            scratchpad = io[len(inputs):]
+            scratchpad = io_list[len(inputs):]
 
-            final_input_ids_entry = io                                                         + value + [eos_token_id]
-            final_labels_entry    = len(inputs) * [label_pad_token_id] + scratchpad            + value + [eos_token_id]
+            final_ITGSWRV_entry   = io_list                                                    + value + [eos_token_id]
+            final_MITGSWRV_entry  = len(inputs) * [label_pad_token_id] + scratchpad            + value + [eos_token_id]
             y_mask_entry          = len(inputs) * [0]                  + len(scratchpad) * [0] + (len(value) + 1) * [1]
             z_mask_entry          = len(inputs) * [0]                  + len(scratchpad) * [1] + (len(value) + 1) * [0]
 
-            utils.check_equal(len(final_labels_entry), len(final_input_ids_entry))
-            utils.check_equal(len(y_mask_entry),       len(final_input_ids_entry))
-            utils.check_equal(len(z_mask_entry),       len(final_input_ids_entry))
-
-            final_input_ids.append(final_input_ids_entry)
-            final_labels.append   (final_labels_entry)
+            final_ITGSWRV.append(final_ITGSWRV_entry)
+            final_MITGSWRV.append(final_MITGSWRV_entry)
             y_mask.append         (y_mask_entry)
             z_mask.append         (z_mask_entry)
 
-
+            utils.check_equal(len(final_MITGSWRV_entry), len(final_ITGSWRV_entry))
+            utils.check_equal(len(y_mask_entry),         len(final_ITGSWRV_entry))
+            utils.check_equal(len(z_mask_entry),         len(final_ITGSWRV_entry))
+            
     with utils.cuda_timeit("[bold]bin_refine.py::PSI-C:[/] Pad", disable=disable_timing):
-        utils.check_equal(len(final_input_ids), len(final_labels))
-        padded_final_input_ids = pad(final_input_ids, inputs_pad_token_id, "right").to(inputs_outputs.device)
-        padded_final_labels    = pad(final_labels,    label_pad_token_id,  "right").to(inputs_outputs.device)
-        padded_final_attention_mask = generate_mask(final_input_ids,       "right").to(inputs_outputs.device)
-        padded_y_mask_is_not_pad = pad(y_mask, 0,                                     "right").to(inputs_outputs.device, dtype=padded_final_attention_mask.dtype)
-        padded_z_mask_is_not_pad = pad(z_mask, 0,                                     "right").to(inputs_outputs.device, dtype=padded_final_attention_mask.dtype)
+        utils.check_equal(len(final_ITGSWRV), len(final_MITGSWRV))
+        padded_final_ITGSWRV = pad(final_ITGSWRV, inputs_pad_token_id, "right").to(inputs_outputs.device)
+        padded_final_MITGSWRV = pad(final_MITGSWRV, label_pad_token_id , "right").to(inputs_outputs.device)
+        padded_final_attention_mask = generate_mask(final_ITGSWRV, "right").to(inputs_outputs.device)
+        padded_y_mask_is_not_pad = pad(y_mask, 0, "right").to(inputs_outputs.device, dtype=padded_final_attention_mask.dtype)
+        padded_z_mask_is_not_pad = pad(z_mask, 0, "right").to(inputs_outputs.device, dtype=padded_final_attention_mask.dtype)
         padded_y_mask_is_not_pad = padded_y_mask_is_not_pad.reshape(batch_size, num_scratchpads, -1)
         padded_z_mask_is_not_pad = padded_z_mask_is_not_pad.reshape(batch_size, num_scratchpads, -1)
 
-        utils.check_equal(padded_final_labels.shape[-1], padded_final_input_ids.shape[-1])
-        utils.check_equal(padded_final_attention_mask.shape[-1], padded_final_input_ids.shape[-1])
-        utils.check_equal(padded_y_mask_is_not_pad.shape[-1], padded_final_input_ids.shape[-1])
-        utils.check_equal(padded_z_mask_is_not_pad.shape[-1], padded_final_input_ids.shape[-1])
+        utils.check_equal(padded_final_MITGSWRV       .shape[-1], padded_final_ITGSWRV.shape[-1])
+        utils.check_equal(padded_y_mask_is_not_pad    .shape[-1], padded_final_ITGSWRV.shape[-1])
+        utils.check_equal(padded_z_mask_is_not_pad    .shape[-1], padded_final_ITGSWRV.shape[-1])
+        utils.check_equal(padded_final_attention_mask .shape[-1], padded_final_ITGSWRV.shape[-1])
 
     with utils.cuda_timeit("bin_refine.py::Score", disable=disable_timing):
-        utils.check_equal(padded_final_input_ids.shape, padded_final_attention_mask.shape)
-        utils.check_equal(padded_final_attention_mask.shape, padded_final_labels.shape)
-        utils.check_equal(padded_y_mask_is_not_pad.shape[:-1], (batch_size, num_scratchpads,))
+        utils.check_equal(padded_final_attention_mask  .shape,       padded_final_MITGSWRV.shape)
+        utils.check_equal(padded_final_ITGSWRV         .shape,       padded_final_attention_mask.shape)
+        utils.check_equal(padded_y_mask_is_not_pad     .shape[:-1], (batch_size, num_scratchpads,))
 
     return SamplesMarginal(
-        padded_final_attention_mask=padded_final_attention_mask, 
-        padded_final_input_ids=padded_final_input_ids, 
-        padded_final_labels=padded_final_labels, 
-        y_mask_is_not_pad=padded_y_mask_is_not_pad, 
-        z_mask_is_not_pad=padded_z_mask_is_not_pad,
+        ITGSWRV_attention_mask = padded_final_attention_mask, 
+        ITGSWRV_ids            = padded_final_ITGSWRV, 
+        MITGSWRV_ids           = padded_final_MITGSWRV, 
+        y_mask_is_not_pad      = padded_y_mask_is_not_pad, 
+        z_mask_is_not_pad      = padded_z_mask_is_not_pad,
     )
 
 
@@ -358,47 +383,246 @@ def print_table_marginal_likelihood(
             f"'{masked                          }'",
         )
 
-    rich.print(table_)
+    CONSOLE.print(table_)
 
 
-def prep_logits_and_labels(
+def prep_logits_and_MITGSWRV(
     *,
-    vocab_size,
-    raw_logits, 
-    batch_size, 
-    padded_labels, 
-    num_scratchpads, 
-    label_pad_token_id,
-):
-    # Shift the labels, prep them for the gather, create the label pad mask
+    vocab_size:         int,
+    batch_size:         int, 
+    num_scratchpads:    int, 
+    label_pad_token_id: int,
+    ITGSWRV_logits:     torch.Tensor, 
+    MITGSWRV_ids:       torch.Tensor, 
+    tokenizer:          transformers.GPT2Tokenizer,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
-    assert -100 not in padded_labels
+    assert -100 not in MITGSWRV_ids
     assert num_scratchpads != -100, num_scratchpads
+    assert label_pad_token_id != -100, label_pad_token_id
 
-    shift_labels = padded_labels[..., 1:].contiguous()
-    flat_labels = shift_labels.view(-1).unsqueeze(-1).contiguous()
-    bsz_times_num_beams = raw_logits.shape[0]
-    seq_len = shift_labels.shape[1]
-    shift_labels = shift_labels.reshape(batch_size, num_scratchpads, seq_len)
-    shift_label_is_pad = (shift_labels == label_pad_token_id).to(padded_labels.dtype)
+    shift_MITGSWRV = MITGSWRV_ids[..., 1:].contiguous()
+    flat_MITGSWRV = shift_MITGSWRV.view(-1).unsqueeze(-1).contiguous()
+    bsz_times_num_beams = ITGSWRV_logits.shape[0]
+
+    seq_len = shift_MITGSWRV.shape[1]
+    shift_MITGSWRV = shift_MITGSWRV.reshape(batch_size, num_scratchpads, seq_len)
+    shift_MITGSWRV_is_pad = (shift_MITGSWRV == label_pad_token_id).to(MITGSWRV_ids.dtype)
 
     # Shift the logits, prep them for the gather, do the gather
-    shift_logits = raw_logits[..., :-1, :].contiguous()
-    flat_logits = shift_logits.view(-1, shift_logits.shape[-1]).contiguous()
+    shift_ITGSWRV_logits = ITGSWRV_logits[..., :-1, :].contiguous()
+    flat_shift_ITGSWRV_logits = shift_ITGSWRV_logits.view(-1, shift_ITGSWRV_logits.shape[-1]).contiguous()
     
-    flat_label_logits = flat_logits.gather(dim=1, index=flat_labels)
-    shift_label_logits = flat_label_logits.reshape(batch_size, num_scratchpads, seq_len)
+    flat_shift_ITGSWRV_log_softmax   = flat_shift_ITGSWRV_logits.log_softmax(dim=-1)
+    flat_shift_MITGSWRV_log_softmax  = flat_shift_ITGSWRV_log_softmax.gather(dim=1, index=flat_MITGSWRV)
+    MITGSWRV_log_softmax = flat_shift_MITGSWRV_log_softmax.reshape(batch_size, num_scratchpads, seq_len)
         
-    utils.check_equal(bsz_times_num_beams,  batch_size * num_scratchpads,)
-    utils.check_equal(raw_logits.shape   , (batch_size * num_scratchpads, seq_len + 1, vocab_size))
-    utils.check_equal(shift_logits.shape[1], seq_len)
-    utils.check_equal(flat_label_logits.shape , (batch_size * num_scratchpads * seq_len, 1))
-    utils.check_equal(flat_logits.shape       , (batch_size * num_scratchpads * seq_len, vocab_size))
-    utils.check_equal(shift_labels.shape      , (batch_size, num_scratchpads, seq_len))
-    utils.check_equal(shift_label_is_pad.shape, (batch_size, num_scratchpads, seq_len))
-    utils.check_equal(shift_label_logits.shape, (batch_size, num_scratchpads, seq_len))
+    utils.check_equal(MITGSWRV_log_softmax.shape[-1],         seq_len)
+    utils.check_equal(shift_MITGSWRV.shape,                  (batch_size,  num_scratchpads,  seq_len))
+    utils.check_equal(shift_MITGSWRV_is_pad.shape,           (batch_size,  num_scratchpads,  seq_len))
+    utils.check_equal(flat_shift_MITGSWRV_log_softmax.shape, (batch_size * num_scratchpads * seq_len,     1))
+    utils.check_equal(flat_shift_ITGSWRV_logits.shape,       (batch_size * num_scratchpads * seq_len,     vocab_size))
+    utils.check_equal(bsz_times_num_beams,                    batch_size * num_scratchpads)
+    utils.check_equal(ITGSWRV_logits.shape,                  (batch_size * num_scratchpads,  seq_len + 1, vocab_size))
 
-    return shift_label_logits, shift_label_is_pad
+    return MITGSWRV_log_softmax, shift_MITGSWRV_is_pad, shift_MITGSWRV
+
+
+def show_scratchpad_padding_table(
+    *,
+    mask_x,
+    mask_y,
+    tokenizer,
+    batch_size,
+    shift_prob,
+    shift_MITGSWRV,
+    demo_input_sp,
+    demo_input_idx, 
+    num_scratchpads,
+    shift_MITGSWRV_is_pad,
+    padded_final_input_ids,
+):
+    table_ = table.Table("input", "label", "mask_x", "mask_y", "pad_label", "label_log_prob", "label_prob")
+    for input_, label, mask_x_, mask_y_, pad, prob in more_itertools.zip_equal(
+        padded_final_input_ids.view(batch_size, num_scratchpads, -1)[demo_input_idx, demo_input_sp, :-1],
+        shift_MITGSWRV                                             [demo_input_idx, demo_input_sp],
+        mask_x                                                      [demo_input_idx, demo_input_sp], 
+        mask_y                                                      [demo_input_idx, demo_input_sp], 
+        shift_MITGSWRV_is_pad                                      [demo_input_idx, demo_input_sp].logical_not(), 
+        shift_prob                                                  [demo_input_idx, demo_input_sp]
+    ):
+        table_.add_row(
+            str(tokenizer.decode(input_)),
+            str(tokenizer.decode(label )),
+            str(mask_x_.item()), 
+            str(mask_y_.item()), 
+            str(pad.item()), 
+            str(prob.item()),
+        )
+    CONSOLE.print_zero_rank(table_)
+
+
+def _show_multi_scratchpad_table_format_text(ids, tokenizer):
+    return tokenizer.decode(ids
+                ).replace("<|pad|>", "").replace("<|endoftext|>", "<eos>"
+                ).replace("<|cls|>", "<cls>") 
+
+def show_multi_scratchpad_table(
+    *,
+    labels,
+    y_prob, 
+    z_prob, 
+    tokenizer, 
+    shift_MITGSWRV,
+    demo_input_idx,
+    num_scratchpads, 
+):
+    
+    y_prob = y_prob.clone()
+    z_prob = z_prob.clone()
+
+    table_ = table.Table("Text", "y score", "z score", "y rank", "z rank")
+
+    label_text = _show_multi_scratchpad_table_format_text([x for x in labels[demo_input_idx] if x > 0], tokenizer)
+    table_.add_row(f"[bold magenta]{label_text}[/]", "", "", "", "", end_section=True)
+
+    sort_y = torch.tensor(sorted(range(num_scratchpads), key=lambda i: y_prob[demo_input_idx, i], reverse=True))
+    y_prob_entry = y_prob[demo_input_idx, sort_y]
+    z_prob_entry = z_prob[demo_input_idx, sort_y]
+
+    argsort = sorted(range(num_scratchpads), key=lambda i: z_prob_entry[i], reverse=True)
+    ranks_z = {}
+    for i, pos in enumerate(argsort):
+        ranks_z[pos] = i
+
+    for rank_y in range(num_scratchpads):
+        maybe_color = ""
+        if rank_y == 0 and ranks_z[rank_y] == 0:
+            maybe_color = "[green bold]"
+        elif rank_y == 0:
+            maybe_color = "[blue bold]"
+        elif ranks_z[rank_y] == 0:
+            maybe_color = "[yellow bold]"
+
+        maybe_close = ""        
+        if maybe_color:
+            maybe_close = "[/]"
+
+        table_.add_row(
+            maybe_color + _show_multi_scratchpad_table_format_text(shift_MITGSWRV[demo_input_idx, rank_y], tokenizer) 
+            + maybe_close,
+            f"{y_prob_entry[rank_y].item():.3}", 
+            f"{z_prob_entry[rank_y].item():.3}",
+            str(rank_y),
+            str(ranks_z[rank_y])
+        )
+        
+    CONSOLE.print_zero_rank(table_)
+
+
+def show_small_generation_table(
+    *, 
+    scores,
+    tokenizer, 
+    demo_input_sp, 
+    inputs_outputs, 
+    demo_input_idx, 
+):
+    table_ = table.Table("tok", "logit", "prob")
+
+    MITGSWRV_index_start = - scores[demo_input_idx][demo_input_sp].shape[0]
+    tokens = inputs_outputs[demo_input_idx][demo_input_sp][MITGSWRV_index_start:]
+    scores_to_show = scores[demo_input_idx][demo_input_sp]
+    assert tokens is not None, tokens
+    assert len(tokens), tokens
+    assert scores_to_show is not None, scores_to_show
+    assert len(scores_to_show), scores_to_show
+
+    for tok, score in more_itertools.zip_equal(tokens, scores_to_show):
+        table_.add_row(
+            tokenizer.decode(tok), 
+            str(score[tok].item()), 
+            str(score[tok].exp().item())
+        )
+
+    CONSOLE.print_zero_rank(table_)
+
+
+class Losses:
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "This class is a static namespace, it is not meant to be instantiated."
+        )
+
+    @classmethod
+    def most_basic_loss(cls, y_part_log_prob, z_part_log_prob):
+
+        return (y_part_log_prob + z_part_log_prob).logsumexp(dim=-1)
+    
+    @classmethod        
+    def js_divergence_loss(cls, *, y_log_probs, z_log_probs):
+        y_part_log_prob = y_log_probs.sum(dim=-1).log_softmax(dim=-1)
+        z_part_log_prob = z_log_probs.sum(dim=-1).log_softmax(dim=-1)
+
+        jsd = (y_part_log_prob.exp().detach() - z_part_log_prob.exp()
+            ) * (y_part_log_prob.detach() - z_part_log_prob)
+
+        return torch.mean(jsd)                
+
+    @classmethod
+    def squared_loss(cls, y_log_probs, z_log_probs):
+        y_part_log_prob = y_log_probs.sum(dim=-1)
+        z_part_log_prob = z_log_probs.sum(dim=-1)
+
+        return (y_part_log_prob.detach() - z_part_log_prob) ** 2
+
+
+def ref_special_gather(
+    *, 
+    tensor:           torch.Tensor, 
+    most_helpful_idx: torch.Tensor, 
+    batch_size:       int,
+) -> torch.Tensor:
+    """
+    Copy over the tokens of the scratchpad with the highest p( y | z, x ).
+
+    Reference, non-vectorized implementation.
+    """
+    ref_final_final = torch.zeros(
+        batch_size, 
+        tensor.shape[-1], 
+        dtype=torch.long, 
+        device=tensor.device
+    )
+    for i in range(batch_size):
+        for k in range(tensor.shape[-1]):
+            ref_final_final[i, k] = tensor[i, most_helpful_idx[i], k]
+
+    return ref_final_final
+
+def special_gather(
+    *, 
+    tensor:           torch.Tensor, 
+    most_helpful_idx: torch.Tensor, 
+    batch_size:       int, 
+    num_scratchpads:  int,
+) -> torch.Tensor:
+    """
+    Copy over the tokens of the scratchpad with the highest p( y | z, x )
+
+    Vectorized implementation.
+
+    tensor is of shape (batch_size, num_scratchpads, seq_len)
+
+    """
+    index = most_helpful_idx.unsqueeze(-1).unsqueeze(-1).expand(
+        batch_size, num_scratchpads, tensor.shape[-1]
+    )
+    final_final_MITGSWRV = tensor.gather(
+        dim=1, index=index,
+    )[:, 0, :]    
+
+    return final_final_MITGSWRV
 
 
 class _RefineLM(pl.LightningModule):
@@ -419,7 +643,6 @@ class _RefineLM(pl.LightningModule):
         tokenizer: transformers.PreTrainedTokenizer,
         wandb_logger: Optional[pl.loggers.WandbLogger],
         weight_decay: Optional[float],
-        use_scratchpads: bool,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model", "datasets", "tokenizer"])
@@ -427,6 +650,7 @@ class _RefineLM(pl.LightningModule):
         self._dataloader_num_workers: Final[int] = DATALOADER_NUM_WORKERS
         self._wandb_logger: Final[pl.loggers.WandbLogger] = wandb_logger
         self._model: Final[transformers.GPT2LMHeadModel] = model
+        self._fixed_model: Optional[transformers.GPT2LMHeadModel] = None
         self._datasets: Final[Dict[str, torch.utils.data.Dataset]] = datasets
         self._tokenizer: Final[transformers.PreTrainedTokenizer] = tokenizer
         self._batch_size: Final[dict[str, int]] = batch_sizes
@@ -446,14 +670,13 @@ class _RefineLM(pl.LightningModule):
         ################################################################################
         # Related to datasets
         ################################################################################
-        self._use_scratch_pads = use_scratchpads
         self._shuffle_train: Final[bool] = SHUFFLE_TRAINING_DATA
         self._shuffle_val: Final[bool] = SHUFFLE_VALIDATION_DATA
         self._training_collators = {
             constants.PipelineModes.MLE_TRAINING: 
                 MLETrainingCollator(self._tokenizer, self._lm_masking_mode),
             constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING:
-                MarginalLikelihoodTrainingCollator(self._tokenizer),
+                MarginalLikelihoodTrainingCollator(self._tokenizer, self._lm_masking_mode),
         }
 
         ################################################################################
@@ -471,13 +694,6 @@ class _RefineLM(pl.LightningModule):
         self._weight_decay: Final[Optional[float]] = weight_decay
         self._scheduler_type: Final[str] = scheduler_type
         self._scheduler = None
-
-
-    def on_train_epoch_start(self) -> None:
-        mode = self._decide_training_mode()
-        if mode == constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING:
-            self.trainer.val_check_interval = VAL_CHECK_INTERVAL
-        self.trainer.reset_train_dataloader()
 
 
     def forward(self, *args, **kwargs):
@@ -526,207 +742,326 @@ class _RefineLM(pl.LightningModule):
 
         """
 
+        #######################################################################
         # Useful constants
+        #######################################################################
         mode: Final[str] = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
         batch_size = self._batch_size[mode]
         vocab_size = len(self._tokenizer)
         num_scratchpads = self._generation_kwargs[mode]["num_return_sequences"]
         disable_timing = True 
-
+        SHOW_SCRATCHPAD_PADDING_TABLE = False
+        SHOW_MULTI_SCRATCHPAD_TABLE = True
+        SHOW_SMALL_GENERATION_TABLE = False
         torch.autograd.set_detect_anomaly(True)                
 
-        if not disable_timing:
-            utils.rich_print_zero_rank(f"batch size:           {self._batch_size[mode]}")
-            utils.rich_print_zero_rank(f"num return sequences: {self._generation_kwargs[mode]['num_return_sequences']}")
 
+        if not disable_timing:
+            CONSOLE.print_zero_rank(f"batch size:           {self._batch_size[mode]}")
+            CONSOLE.print_zero_rank(f"num return sequences: {self._generation_kwargs[mode]['num_return_sequences']}")
+
+        #######################################################################
+        # Generate the scratchpads
+        #######################################################################
         with utils.cuda_timeit("bin_refine.py::Generation", disable=disable_timing):
-            inputs_outputs = self._model.generate(
-                input_ids=batch["generation_input_ids"],
-                attention_mask=batch["generation_attention_mask"], 
-                # Generating until CLS makes us only generate the scratchpad. 
-                # Generating until EOS makes us generate the whole output.
-                # That's how the model is pre-trained with the mle objective.
-                eos_token_id=self._tokenizer.cls_token_id,  
+            self._model.eval()
+            # Generating until CLS makes us only generate the scratchpad. 
+            # Generating until EOS makes us generate the whole output.
+            # That's how the model is pre-trained with the mle objective.
+            generate_output_dict = self._model.generate(
+                input_ids               = batch["generation_input_ids"],
+                attention_mask          = batch["generation_attention_mask"], 
+                # Config stuff
+                eos_token_id            = self._tokenizer.cls_token_id,  
+                output_scores           = True,
+                return_dict_in_generate = True,
                 **self._generation_kwargs[mode],
             )
+            self._model.train()
 
-        utils.check_equal(
-            inputs_outputs.shape[0],
-            self._batch_size[mode] * 
-            self._generation_kwargs[mode]["num_beams"],
+
+        #######################################################################
+        # Preparations common to the different losses
+        #######################################################################
+        batch_size = batch["generation_input_ids"].shape[0]
+        num_scratchpads = self._generation_kwargs[mode]["num_return_sequences"]
+        vocab_size = len(self._tokenizer)
+        utils.check_equal(self._batch_size[mode], batch_size)
+
+        input_ids_then_scratchpads = generate_output_dict["sequences"].reshape(
+            batch_size * num_scratchpads,
+            -1,
+        )
+        
+        scores = torch.stack(generate_output_dict["scores"]).reshape(
+            batch_size,
+            num_scratchpads,
+            len(generate_output_dict["scores"]),
+            vocab_size
         )
 
-        class MarginalModelModes(str, enum.Enum):
-            JOINT = "joint"
-            SEPARATE = "separate"
-
         class LossModes(str, enum.Enum):
-            DEFAULT            = "default"
-            LOGSUMEXP          = "logsumexp"
-            LOG_INSIDE         = "log_inside"
-            LOG_OUTSIDE        = "log_outside"
-            SEPARATE_OUTSIDE   = "separate_outside"
-            SEPARATE_LOGSUMEXP = "separate_logsumexp"
+            PPO = "ppo"
+            STRONGEST_MLE = "strongest_mle"
 
-        marginal_model = MarginalModelModes.JOINT
-        loss_mode = LossModes.SEPARATE_OUTSIDE
+        loss_mode = LossModes.PPO
+        label_pad_token_id = self._tokenizer.pad_token_id
+        utils.check_equal(label_pad_token_id, self._tokenizer.pad_token_id)
 
-        # TODO: slow but does what it needs to for the moment
-        utils.check_equal(inputs_outputs.ndim, 2)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Sample preparation for per scratchpad stuff
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        samples_marginal = prep_samples_marginal(
+            batch               = batch, 
+            batch_size          = batch_size, 
+            eos_token_id        = self._tokenizer.eos_token_id, 
+            cls_token_id        = self._tokenizer.cls_token_id, 
+            disable_timing      = disable_timing, 
+            inputs_outputs      = input_ids_then_scratchpads, 
+            num_scratchpads     = num_scratchpads, 
+            generation_kwargs   = self._generation_kwargs[mode], 
+            label_pad_token_id  = label_pad_token_id,
+            inputs_pad_token_id = self._tokenizer.pad_token_id,
+        ) 
 
-        # Outputs include the inputs as well
-        with utils.cuda_timeit("[bold]bin_refine.py::Prep:[/] score inputs", disable=disable_timing):
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Loss Mode selection
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        ITGSWRV_attention_mask      = samples_marginal.ITGSWRV_attention_mask
+        ITGSWRV_ids                 = samples_marginal.ITGSWRV_ids
+        
+        # MITGSWRV: Masked Input Then Generated Scratchpad With Reference Value
+        MITGSWRV_ids                = samples_marginal.MITGSWRV_ids
+        y_mask_is_not_pad           = samples_marginal.y_mask_is_not_pad
+        z_mask_is_not_pad           = samples_marginal.z_mask_is_not_pad
+        shift_y_mask_is_not_pad     = y_mask_is_not_pad[:, :, 1:]
+        shift_z_mask_is_not_pad     = z_mask_is_not_pad[:, :, 1:]
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Learning rate
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        assert torch.all(
+            ITGSWRV_ids[:, 0] != self._tokenizer.pad_token_id
+        )
+        optimizer = self.trainer.optimizers[0]
+        lr = optimizer.param_groups[0]["lr"]                
+        utils.check_equal(len(self.trainer.optimizers), 1)
+        utils.check_equal(len(optimizer.param_groups), 1)
+        CONSOLE.print_zero_rank(f"[bold]Learning rate:[/] {lr:.3}")
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute the logits
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        assert (ITGSWRV_ids[:, 0] != self._tokenizer.pad_token_id).all()
+        
+        ITGSWRV_logits = self._model(
+            input_ids      = ITGSWRV_ids,
+            attention_mask = ITGSWRV_attention_mask,
+        ).logits
+
+        with torch.no_grad():
+            ITGSWRV_logits_fixed_model = self._fixed_model(
+                input_ids      = ITGSWRV_ids,
+                attention_mask = ITGSWRV_attention_mask,
+            ).logits
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Shift the logits and MITGSWRV
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        shift_MITGSWRV_log_softmax, shift_MITGSWRV_is_pad, shift_MITGSWRV = prep_logits_and_MITGSWRV(
+            vocab_size         = vocab_size,
+            ITGSWRV_logits     = ITGSWRV_logits, 
+            batch_size         = batch_size, 
+            MITGSWRV_ids       = MITGSWRV_ids, 
+            num_scratchpads    = num_scratchpads, 
+            label_pad_token_id = label_pad_token_id, 
+            tokenizer          = self._tokenizer,
+        ) 
+        shift_seq_len = shift_MITGSWRV_log_softmax.shape[2]
+
+        shift_MITGSWRV_log_softmax_fixed_model, _, _ = prep_logits_and_MITGSWRV(
+            vocab_size         = vocab_size,
+            ITGSWRV_logits     = ITGSWRV_logits_fixed_model,
+            batch_size         = batch_size,
+            MITGSWRV_ids       = MITGSWRV_ids,
+            num_scratchpads    = num_scratchpads,
+            label_pad_token_id = label_pad_token_id,
+            tokenizer          = self._tokenizer,
+        )
+
+
+        ###############################################################
+        # Extract the log-probs for the labels for y and z
+        ###############################################################
+
+        utils.check_equal(shift_MITGSWRV_log_softmax .shape, (batch_size, num_scratchpads, shift_seq_len))
+        utils.check_equal(shift_MITGSWRV_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
+        utils.check_equal(shift_y_mask_is_not_pad    .shape, (batch_size, num_scratchpads, shift_seq_len))
+        utils.check_equal(shift_z_mask_is_not_pad    .shape, (batch_size, num_scratchpads, shift_seq_len))
+
+        mask_y = shift_y_mask_is_not_pad * shift_MITGSWRV_is_pad.bool().logical_not().long()
+        mask_z = shift_z_mask_is_not_pad * shift_MITGSWRV_is_pad.bool().logical_not().long()
+
+        z_log_probs = shift_MITGSWRV_log_softmax * mask_z
+        
+        with torch.no_grad():
+            y_log_probs_fixed = shift_MITGSWRV_log_softmax_fixed_model * mask_y
+            z_log_probs_fixed = shift_MITGSWRV_log_softmax_fixed_model * mask_z
+        
+
+        ###############################################################
+        # -> Log-likelihoods for y and for z
+        # -> Importance Sampling Ratio
+        ###############################################################                
+
+        utils.check_equal(z_log_probs       .shape, (batch_size, num_scratchpads, shift_seq_len))
+        utils.check_equal(z_log_probs_fixed .shape, (batch_size, num_scratchpads, shift_seq_len))
+
+        y_log_probs_fixed_per_seq = y_log_probs_fixed.detach().sum(dim=-1)
+        z_log_probs_per_seq       = z_log_probs               .sum(dim=-1)
+
+        most_helpful_idx = y_log_probs_fixed_per_seq.argmax(dim=-1).detach()
+
+        most_helpful_log_probs = z_log_probs_per_seq.gather(
+            dim=-1, 
+            index=most_helpful_idx.unsqueeze(-1),
+        ).squeeze(-1)
+        
+        ###############################################################
+        # COMPUTE THE CROSS-ENTROPY LOSS WITH THE MOST HELPFUL SEQUENCE
+        ###############################################################
+        MITGSWRV_ids           = MITGSWRV_ids               .reshape(batch_size, num_scratchpads, -1).clone()
+        ITGSWRV_ids            = ITGSWRV_ids                .reshape(batch_size, num_scratchpads, -1).clone()
+        ITGSWRV_attention_mask = ITGSWRV_attention_mask.reshape(batch_size, num_scratchpads, -1).clone()
+
+        #######################################################################
+        # Do MLE on the strongest scratchpad
+        #######################################################################
+        if loss_mode == LossModes.STRONGEST_MLE:
+            ref_final_ITGSWRV_input_ids      = ref_special_gather(tensor=ITGSWRV_ids,            most_helpful_idx=most_helpful_idx, batch_size=batch_size)
+            ref_final_ITGSWRV_attention_mask = ref_special_gather(tensor=ITGSWRV_attention_mask, most_helpful_idx=most_helpful_idx, batch_size=batch_size)
+            ref_final_MITGSWRV_ids           = ref_special_gather(tensor=MITGSWRV_ids,           most_helpful_idx=most_helpful_idx, batch_size=batch_size)
+
+            final_ITGSWRV_input_ids      = special_gather(tensor=ITGSWRV_ids,            most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
+            final_ITGSWRV_attention_mask = special_gather(tensor=ITGSWRV_attention_mask, most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
+            final_MITGSWRV_ids           = special_gather(tensor=MITGSWRV_ids,           most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
+
+            assert -100 not in MITGSWRV_ids
+            assert (ref_final_ITGSWRV_input_ids      == final_ITGSWRV_input_ids).all()
+            assert (ref_final_ITGSWRV_attention_mask == final_ITGSWRV_attention_mask).all()
+            assert (ref_final_MITGSWRV_ids           == final_MITGSWRV_ids).all()
+
+            del ref_final_ITGSWRV_input_ids
+            del ref_final_ITGSWRV_attention_mask
+            del ref_final_MITGSWRV_ids
             
-            assert not loss_mode == LossModes.DEFAULT, "Not implemented"
+            final_MITGSWRV_ids[final_MITGSWRV_ids == self._tokenizer.pad_token_id] = -100
+
+            assert self._tokenizer.pad_token_id not in final_MITGSWRV_ids
+            assert (final_ITGSWRV_input_ids[:, 0] != self._tokenizer.pad_token_id).all()
+
+            loss = self._model(
+                input_ids      = final_ITGSWRV_input_ids,
+                attention_mask = final_ITGSWRV_attention_mask,
+                labels         = final_MITGSWRV_ids,
+            ).loss
+
+        elif loss_mode == "not ready":
+            assert False
+            import_ratio_w_fixed_z = z_log_probs.sum(dim=-1) - z_log_probs_fixed.sum(dim=-1)
+        
+            most_helpful_log_probs_ratio = import_ratio_w_fixed_z.gather(
+                dim=-1, index=most_helpful_idx.unsqueeze(-1)
+            ).squeeze(-1)
             
-            label_pad_token_id = self._tokenizer.pad_token_id
-            utils.check_equal(label_pad_token_id, self._tokenizer.pad_token_id)
+            average_log_probs_ratio = torch.mean(import_ratio_w_fixed_z, dim=-1)
 
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Sample preparation
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            samples_marginal = prep_samples_marginal(
-                batch               = batch, 
-                batch_size          = batch_size, 
-                eos_token_id        = self._tokenizer.eos_token_id, 
-                cls_token_id        = self._tokenizer.cls_token_id, 
-                disable_timing      = disable_timing, 
-                inputs_outputs      = inputs_outputs, 
-                num_scratchpads     = num_scratchpads, 
-                generation_kwargs   = self._generation_kwargs[mode], 
-                label_pad_token_id  = label_pad_token_id,
-                inputs_pad_token_id = self._tokenizer.pad_token_id,
-            ) 
+            utils.check_equal(most_helpful_log_probs_ratio.shape, (batch_size,))
+            utils.check_equal(average_log_probs_ratio.shape,      (batch_size,))
+            utils.check_equal(most_helpful_log_probs.shape,       (batch_size,))
 
-            padded_final_attention_mask = samples_marginal.padded_final_attention_mask
-            padded_final_input_ids      = samples_marginal.padded_final_input_ids
-            padded_final_labels         = samples_marginal.padded_final_labels
-            y_mask_is_not_pad = samples_marginal.y_mask_is_not_pad
-            z_mask_is_not_pad = samples_marginal.z_mask_is_not_pad
-            shift_y_mask_is_not_pad = y_mask_is_not_pad[:, :, 1:]
-            shift_z_mask_is_not_pad = z_mask_is_not_pad[:, :, 1:]
+            beta = 1.5
+            nll_best = - most_helpful_log_probs.mean(dim=-1)
+            baseline_respect_loss = beta * average_log_probs_ratio.mean(dim=-1)
+            nll = nll_best + beta * average_log_probs_ratio.mean(dim=-1)
 
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Learning rate
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            assert torch.all(
-                padded_final_input_ids[:, 0] != self._tokenizer.pad_token_id)
-            optimizer = self.trainer.optimizers[0]
-            lr = optimizer.param_groups[0]["lr"]                
-            utils.check_equal(len(self.trainer.optimizers), 1)
-            utils.check_equal(len(optimizer.param_groups), 1)
-            rich.print(f"{lr = }")
+            # E(x, y) ∼ D_{π^{RL}_φ} [r_θ(x, y) − β log (π^{RL}_φ (y | x) / π^{SFT}(y | x))] + γ E_{x}∼D_{pretrain} [log(π^{RL}_φ (x))]
+            # E[p(y | x, y) - beta * (log p(y | x, y) - log p_{fixed}(y | x))] # + γ E[log(π^{RL}_φ (x))]
+            loss = nll
 
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Compute the logits
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            outputs = self._model(
-                labels         = padded_final_labels if loss_mode == LossModes.DEFAULT else None,
-                input_ids      = padded_final_input_ids,
-                attention_mask = padded_final_attention_mask,
+            CONSOLE.print_zero_rank(f"{nll_best = }")
+            CONSOLE.print_zero_rank(f"{baseline_respect_loss = }")
+            self.log("nll_best", nll_best.item(), prog_bar=True)
+            self.log("baseline_respect_loss", baseline_respect_loss.item(), prog_bar=True)
+            utils.check_equal(loss.ndim, 0)
+
+        elif loss_mode == LossModes.PPO:
+
+            seq_z_log_probs = z_log_probs.sum(dim=-1)
+            seq_z_log_probs_fixed = z_log_probs_fixed.sum(dim=-1)
+
+            import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed
+            utils.check_equal(most_helpful_log_probs.shape,       (batch_size,))
+
+            beta = 5.
+            rl_reward = seq_z_log_probs * y_log_probs_fixed_per_seq
+            ppo_importance_sampling_penalty = seq_z_log_probs * import_ratio_w_fixed_z
+
+            # E(x, y) ∼ D_{π^{RL}_φ} [r_θ(x, y) − β log (π^{RL}_φ (y | x) / π^{SFT}(y | x))] + γ E_{x}∼D_{pretrain} [log(π^{RL}_φ (x))]
+            # E[p(y | x, y) - beta * (log p(y | x, y) - log p_{fixed}(y | x))] # + γ E[log(π^{RL}_φ (x))]
+
+            loss = (rl_reward - beta * ppo_importance_sampling_penalty).mean()
+
+            self.log("rl_reward",                       rl_reward.mean().item(),                       **self._logging_conf)
+            self.log("ppo_importance_sampling_penalty", ppo_importance_sampling_penalty.mean().item(), **self._logging_conf)
+            self.log("loss",                            loss.item(),                                   **self._logging_conf)
+            utils.check_equal(loss.ndim, 0)
+        else:
+            raise ValueError(f"Unknown loss mode {loss_mode}")
+
+
+        with torch.no_grad():
+            y_part_prob = y_log_probs_fixed_per_seq.exp()
+            z_part_prob = z_log_probs_per_seq.exp()
+
+        demo_input_idx = random.randint(0, batch_size - 1)
+        demo_input_sp = random.randint(0, num_scratchpads - 1)
+
+        if SHOW_SMALL_GENERATION_TABLE:
+            show_small_generation_table(
+                scores=scores,
+                tokenizer=self._tokenizer,
+                inputs_outputs=input_ids_then_scratchpads.view(batch_size, num_scratchpads, -1),
+                demo_input_sp=demo_input_sp,
+                demo_input_idx=demo_input_idx,
             )
-            raw_logits = outputs.logits
 
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Shift the logits and labels
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            shift_label_logits, shift_label_is_pad = prep_logits_and_labels(
-                vocab_size         = vocab_size,
-                raw_logits         = raw_logits, 
-                batch_size         = batch_size, 
-                padded_labels      = padded_final_labels, 
-                num_scratchpads    = num_scratchpads, 
-                label_pad_token_id = label_pad_token_id, 
-            ) 
-            shift_seq_len = shift_label_logits.shape[2]
+        if SHOW_MULTI_SCRATCHPAD_TABLE:                    
+            show_multi_scratchpad_table(
+                y_prob=y_part_prob,
+                z_prob=z_part_prob,
+                labels=batch["labels"], 
+                tokenizer=self._tokenizer,
+                shift_MITGSWRV=shift_MITGSWRV,
+                demo_input_idx=demo_input_idx,
+                num_scratchpads=num_scratchpads,
+            )
 
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # Do checks
-            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            if loss_mode == LossModes.LOG_INSIDE:
-                # Flatten the log-probs and the labels to get a 2D tensor from which we can gather
-                assert False
+        if SHOW_SCRATCHPAD_PADDING_TABLE :                    
+            show_scratchpad_padding_table(
+                mask_x=mask_x,
+                mask_y=mask_y,
+                batch_size=batch_size,
+                shift_MITGSWRV=shift_MITGSWRV,
+                tokenizer=self._tokenizer,
+                demo_input_sp=demo_input_sp,
+                demo_input_idx=demo_input_idx, 
+                num_scratchpads=num_scratchpads,
+                shift_MITGSWRV_is_pad=shift_MITGSWRV_is_pad,
+                padded_final_input_ids=final_ITGSWRV_input_ids,
+                shift_prob=shift_log_probs.sum(dim=-1).exp() if 
+                    "shift_log_probs" in locals() else shift_probs.prod(dim=-1),
+            )
 
-                log_probs = shift_label_logits.log_softmax(dim=-1)
-                masked_log_probs = log_probs.masked_fill(shift_label_is_pad == 0, 0.)
-                marginalized_probs = masked_log_probs.sum(dim=-1).sum(dim=-1)
-                ll = marginalized_probs
-                utils.check_equal(ll.ndims, 1)
-                loss = - torch.mean(ll)
-
-            elif loss_mode == LossModes.LOGSUMEXP:
-                # This should be the most stable
-                assert False
-
-                shift_log_probs = shift_label_logits.log_softmax(dim=-1)
-                shift_masked_log_probs = shift_log_probs.masked_fill(shift_label_is_pad == 0, 0.)
-                shift_marginalized_probs = shift_masked_log_probs.sum(dim=-1).logsumexp(dim=-1)
-                ll = shift_marginalized_probs
-                utils.check_equal(ll.ndim, 1)
-                loss = - torch.mean(ll)
-
-            elif loss_mode == LossModes.SEPARATE_LOGSUMEXP:
-                # This should be the most stable
-                shift_log_probs = shift_label_logits.log_softmax(dim=-1)
-                
-                utils.check_equal(shift_log_probs         .shape, (batch_size, num_scratchpads, shift_seq_len))
-                utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
-                utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
-                utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
-
-                y_log_probs = shift_log_probs * shift_y_mask_is_not_pad * shift_label_is_pad.bool().logical_not().long()
-                z_log_probs = shift_log_probs * shift_z_mask_is_not_pad * shift_label_is_pad.bool().logical_not().long()
-
-                y_part = y_log_probs.sum(dim=-1).exp().log_softmax(dim=-1)
-                z_part = z_log_probs.sum(dim=-1)
-
-                ll = (y_part + z_part).logsumexp(dim=-1)
-                utils.check_equal(ll.ndim, 1)
-                loss = - torch.mean(ll)
-                utils.check_equal(ll.shape, (batch_size,))
-
-            elif loss_mode == LossModes.SEPARATE_OUTSIDE:
-                # This should be the most stable
-
-                shift_probs = shift_label_logits.softmax(dim=-1)
-                shift_probs.masked_fill(shift_label_is_pad.bool(), 1)
-
-                utils.check_equal(shift_probs             .shape, (batch_size, num_scratchpads, shift_seq_len))
-                utils.check_equal(shift_label_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
-                utils.check_equal(shift_y_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
-                utils.check_equal(shift_z_mask_is_not_pad .shape, (batch_size, num_scratchpads, shift_seq_len))
-                
-                y_probs = shift_probs.masked_fill(shift_y_mask_is_not_pad.bool().logical_not(), 1.)
-                z_probs = shift_probs.masked_fill(shift_z_mask_is_not_pad.bool().logical_not(), 1.)
-                
-                y_part = y_probs.prod(dim=-1).softmax(dim=-1)
-                z_part = z_probs.prod(dim=-1)
-
-                utils.check_equal(y_part.shape, (batch_size, num_scratchpads))
-                utils.check_equal(z_part.shape, (batch_size, num_scratchpads))
-
-                ll = (y_part * z_part).sum(dim=-1).log()
-
-                loss = - torch.mean(ll)
-
-                utils.check_equal(ll.ndim, 1)
-                utils.check_equal(ll.shape, (batch_size,))
-
-            elif loss_mode == LossModes.LOG_OUTSIDE:
-                assert False
-                # This is probably the least stable
-                probs = shift_label_logits.softmax(dim=-1)
-                masked_probs = probs.masked_fill(shift_label_is_pad == 0, 1.)
-                marginalized_probs = masked_probs.prod(dim=-1).log().sum(dim=-1)
-                # marginalized_probs = masked_probs.prod(dim=-1).prod(dim=-1).log()
-                ll = marginalized_probs
-                utils.check_equal(ll.ndims, 1)
-                loss = - torch.mean(ll)
-
-        print(f"[{self.trainer.global_rank}] Was ok: {loss_mode} {loss}")
+        print(f"[{self.trainer.global_rank}] [bold]Loss:[/] {loss}")
+        
         return loss
 
 
@@ -772,7 +1107,9 @@ class _RefineLM(pl.LightningModule):
         for entry in batch:
             per_entry = []
             for token in entry:
-                per_entry.append(self._tokenizer.decode([token if token >= 0 else self._tokenizer.pad_token_id], skip_special_tokens=False))
+                per_entry.append(
+                    self._tokenizer.decode([token if token >= 0 else self._tokenizer.pad_token_id], 
+                    skip_special_tokens=False))
             dps.append(per_entry)
         return dps
 
@@ -780,11 +1117,12 @@ class _RefineLM(pl.LightningModule):
     def _decode_per_sample(self, batch):
         dps = []
         for entry in batch:
-            dps.append(self._tokenizer.decode([x if x >= 0 else self._tokenizer.pad_token_id for x in entry], skip_special_tokens=False))
+            dps.append(self._tokenizer.decode(
+                [x if x >= 0 else self._tokenizer.pad_token_id for x in entry], skip_special_tokens=False))
         return dps
 
 
-    def _generate(self, *, batch, generation_kwargs, batch_mode):
+    def _generate(self, *, batch, generation_kwargs, batch_mode, model):
         assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
         
         generation_inputs = batch["generation_input_ids"]
@@ -792,7 +1130,7 @@ class _RefineLM(pl.LightningModule):
         if batch_mode:
             generation_attention_mask = batch["generation_attention_mask"]
             
-            raw_generation_outputs = self._model.generate(
+            raw_generation_outputs = model.generate(
                 input_ids=generation_inputs, 
                 attention_mask=generation_attention_mask, 
                 **generation_kwargs,
@@ -802,7 +1140,7 @@ class _RefineLM(pl.LightningModule):
             raw_generation_outputs_list =  []
             for input_ids in generation_inputs:
                 input_ids = input_ids[input_ids != self._tokenizer.pad_token_id]
-                output = self._model.generate(
+                output = model.generate(
                     input_ids=input_ids.reshape(1, -1),
                     **generation_kwargs,
                 )
@@ -819,17 +1157,76 @@ class _RefineLM(pl.LightningModule):
         return raw_generation_outputs
 
 
+    def on_train_epoch_start(self) -> None:
+        assert (
+            not "steps" in self._switch_to_maginal_after and 
+            "epochs" in self._switch_to_maginal_after
+        ), f"Can't be both. {self._switch_to_maginal_after}"
+        
+        mode = self._decide_training_mode()
+        if mode == constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING:
+            self.trainer.val_check_interval = VAL_CHECK_INTERVAL
+        self.trainer.reset_train_dataloader()
+
+        # If we're starting epoch n (like 1), and we have 
+        # self._switch_to_maginal_after["epochs"] == n (like 1), 
+        # then we need to make a copy of the model 
+
+
+        is_changing_epoch = ("epochs" in self._switch_to_maginal_after 
+            and self._switch_to_maginal_after["epochs"] == self.current_epoch
+        )
+        is_changing_step = ("steps" in self._switch_to_maginal_after 
+            and self._switch_to_maginal_after["steps"] == self.global_step)
+
+        if is_changing_epoch or is_changing_step:
+            assert self._fixed_model is None, "We should only assign this once"
+            CONSOLE.print_zero_rank(f"[red bold]MAKING A COPY OF THE MODEL")
+            self._fixed_model = clone_hf_model(self._model).eval().to(self._model.device)
+            for param in self._fixed_model.parameters():
+                param.requires_grad = False
+
     def validation_step(self, batch: Dict[str, torch.LongTensor], batch_idx):  # type: ignore[override]
         assert "labels" in batch, (
             "Labels must be in batch. We must mask the input section with -100"
         )
         mode: Final[str] = constants.PipelineModes.VALIDATION
         
+        # if self._fixed_model is None:
         gen_outputs = self._generate(
+            model=self._model,
             batch=batch, 
-            generation_kwargs=self._generation_kwargs[mode], 
             batch_mode=True,
+            generation_kwargs=self._generation_kwargs[mode], 
         )
+        # else:
+        #     config_scratch_pad = self._generation_kwargs[mode].copy()
+        #     config_scratch_pad["eos_token_id"] = self._tokenizer.cls_token_id
+        #     gen_outputs = self._generate(
+        #         model=self._model,
+        #         batch=batch, 
+        #         batch_mode=True,
+        #         generation_kwargs=config_scratch_pad, 
+        #     )
+            
+        #     config_answer = self._generation_kwargs[mode].copy()
+        #     unpadded = remove_padding(gen_outputs)
+        #     padded = pad(unpadded, "left", self._tokenizer.pad_token_id)
+        #     attention_mask = mask(padded, self._tokenizer.pad_token_id)
+        #     new_batch = dict(
+        #         input_ids=padded,
+        #         attention_mask=attention_mask,
+        #     )
+
+        #     gen_outputs = self._generate(
+        #         model=self._model,
+        #         batch=new_batch, 
+        #         batch_mode=True,
+        #         generation_kwargs=config_scratch_pad, 
+        #     )
+
+
+            
 
         dps_generation = self._decode_per_sample(gen_outputs)
         dps_labels = self._decode_per_sample(batch["input_ids"])
@@ -863,14 +1260,14 @@ class _RefineLM(pl.LightningModule):
             for gen, ref in for_comparison:
                 if gen == ref:
                     color = "green"
-                    rich.print(f"[bold {color}]>>> Match")
+                    CONSOLE.print_zero_rank(f"[bold {color}]>>> Match")
                 else:
                     color = "red"
-                    rich.print("Mismatch")
+                    CONSOLE.print_zero_rank("Mismatch")
 
-                rich.print(f"[bold {color}]\[ref] {ref}")
-                rich.print(f"[bold blue]\[gen] {gen}")
-                rich.print("=" * 80)
+                CONSOLE.print_zero_rank(f"[bold {color}]\[ref] {ref}")
+                CONSOLE.print_zero_rank(f"[bold blue]\[gen] {gen}")
+                CONSOLE.print_zero_rank("=" * 80)
             
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute different metrics
@@ -1027,7 +1424,7 @@ def _get_last_checkpoint_path(
     if run_name is None:
         # We recover the run name from the wandb run id
         run_name = path.parent.parent.name
-        utils.rich_print_zero_rank(f"\n[bold]Inferring `run_name` value of:[/] {run_name = !s}")
+        CONSOLE.print_zero_rank(f"\n[bold]Inferring `run_name` value of:[/] {run_name = !s}")
 
     return LastCkptInfo(checkpoint_path, run_name, None, None)
 
@@ -1101,7 +1498,7 @@ def _set_resumed_state(
     # random.setstate(tuple(python_rng_state))
 
     # Resume the wandb run
-    utils.rich_print_zero_rank("\n[red bold]Resuming Wandb run:", wandb_run_id)
+    CONSOLE.print_zero_rank("\n[red bold]Resuming Wandb run:", wandb_run_id)
 
     
     return meta_info
@@ -1114,7 +1511,7 @@ def _set_initial_state(
     global_rank: int,
     wandb_project: Optional[str] = None,
     wandb_entity: Optional[str] = None,
-) -> tuple[dict[str, Any], pl.loggers.WandbLogger]:
+) -> tuple[dict[str, Any], pl.loggers.WandbLogger, int]:
     """
     Sets the initial state of the global state, ie. 
     the wandb run and the random seeds and states.
@@ -1174,7 +1571,9 @@ def _build_meta_info(**kwargs):
 
 
 def remove_padding(
-    array: np.ndarray, mask: np.ndarray) -> List[List[Any]]:
+    array: Union[np.ndarray, torch.Tensor], 
+    mask: Union[np.ndarray, torch.Tensor]
+) -> List[Union[torch.Tensor, np.ndarray]]:
     """
     Removes padding.
     """
@@ -1224,9 +1623,9 @@ def _load_data(
             cv_path = dataset_path / f"{set_}.jsonl"
             
             with jsonl.open(cv_path) as f:
-                utils.rich_print_zero_rank(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
+                CONSOLE.print_zero_rank(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
                 raw_data = list(f)
-                utils.rich_print_zero_rank(f"\n[bold]Done loading a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
+                CONSOLE.print_zero_rank(f"\n[bold]Done loading a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
 
             tokenized_data[set_] = {
                 "input":      tokenizer([x["input"] + CHAINER for x in raw_data], add_special_tokens=False)["input_ids"],
@@ -1237,7 +1636,7 @@ def _load_data(
         elif mode == constants.DataModes.HDF5_PRETOK:
             cv_path = dataset_path / f"{set_}.h5"
             
-            utils.rich_print_zero_rank(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
+            CONSOLE.print_zero_rank(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
             with h5py.File(cv_path, "r") as f:
                 keys_to_do = [key for key in f if not key.endswith("_text")]
                 for key in keys_to_do:
@@ -1274,13 +1673,13 @@ def _load_data(
             for key in tqdm(text_keys, desc="Tokenizing", disable=not verbose):
                 tokenized_data[set_][key] = cached[key]
 
-            utils.rich_print_zero_rank(f"\n[bold]Done loading a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
+            CONSOLE.print_zero_rank(f"\n[bold]Done loading a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
         
         else:
             raise ValueError(mode)
 
         delta = time.perf_counter() - start
-        utils.rich_print_zero_rank(f"\n[bold]Done preparing \"{cv_path.name}\". It took {delta:0.2f}s overall. ")
+        CONSOLE.print_zero_rank(f"\n[bold]Done preparing \"{cv_path.name}\". It took {delta:0.2f}s overall. ")
 
     return tokenized_data
 
@@ -1361,8 +1760,9 @@ def prep_mle_train_and_valid(*, examples, eos_token_id: int, scratchpad_eos_toke
 @dataclasses.dataclass
 class MarginalLikelihoodTrainingCollator:
     _tokenizer: transformers.PreTrainedTokenizer
+    _lm_masking_mode: str
 
-    def __call__(self, examples):
+    def __call__(self, raw_examples):
         """
         - We have the questions, we have the answers. Nothing else.
 
@@ -1375,7 +1775,13 @@ class MarginalLikelihoodTrainingCollator:
 
         # We can only prepare the inputs for generation. 
         # These need to be padded to the left.
-        examples = utils.dict_unzip(examples)
+        examples = prep_mle_train_and_valid(
+            examples=raw_examples, 
+            eos_token_id=self._tokenizer.eos_token_id,
+            scratchpad_eos_token_id=self._tokenizer.cls_token_id, 
+            pad_token_id=self._tokenizer.pad_token_id,
+            lm_masking_mode=self._lm_masking_mode,
+        )
         
         examples["generation_attention_mask"] = generate_mask(examples["input"], "left")
         examples["generation_input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
@@ -1521,10 +1927,10 @@ class DDPInfo:
             self.local_rank = int(os.environ["SLURM_LOCALID"])
             self.node_rank = int(os.environ["SLURM_NODEID"])
             header = f"[{self.node_rank}:{self.local_rank}] "
-            rich.print(f"[bold green]{header}Distributed Data Parallel (DDP) enabled.")
-            rich.print(f"[bold green]{header}\t- NUM_NODES:   {self.num_nodes}")
-            rich.print(f"[bold green]{header}\t- NUM_DEVICES: {self.num_devices}")
-            rich.print("")
+            CONSOLE.print(f"[bold green]{header}Distributed Data Parallel (DDP) enabled.")
+            CONSOLE.print(f"[bold green]{header}\t- NUM_NODES:   {self.num_nodes}")
+            CONSOLE.print(f"[bold green]{header}\t- NUM_DEVICES: {self.num_devices}")
+            CONSOLE.print("")
         else:
             self.num_nodes = None
             self.num_devices = 1
@@ -1555,7 +1961,7 @@ def _setup_tokenizer(hf_name: str, is_gpt2_model) -> transformers.PreTrainedToke
         )
         
         utils.setattr_must_exist(tokenizer, "padding_side", "left")        
-        utils.rich_print_zero_rank(f"Tokenizer loaded.")
+        CONSOLE.print_zero_rank(f"Tokenizer loaded.")
         return tokenizer
     else:
         raise ValueError(f"Unsupported tokenizer mode: {TOKENIZER_MODE}")
@@ -1588,7 +1994,7 @@ def _setup_base_model(
     # Random Model
     ###########################################################################
     if model_mode == constants.ModelModes.RANDOM :
-        utils.rich_print_zero_rank(f"\n[bold]USING A NON PRETRAINED MODEL.")
+        CONSOLE.print_zero_rank(f"\n[bold]USING A NON PRETRAINED MODEL.")
 
         config = transformers.AutoConfig.from_pretrained(hf_name)
         utils.setattr_must_exist(config, "vocab_size", len(tokenizer.vocab))  # type: ignore[attr-defined]
@@ -1597,7 +2003,7 @@ def _setup_base_model(
         # Random model with custom config
         ###########################################################################
         if custom_model_config is not None:
-            utils.rich_print_zero_rank(f"\n[bold]USING CUSTOM MODEL CONFIGURATION.")
+            CONSOLE.print_zero_rank(f"\n[bold]USING CUSTOM MODEL CONFIGURATION.")
             for k, v in custom_model_config.items():
                 utils.setattr_must_exist(config, k, v)
 
@@ -1608,7 +2014,7 @@ def _setup_base_model(
     # Pretrained model
     ###########################################################################
     elif model_mode == constants.ModelModes.PRETRAINED:
-        utils.rich_print_zero_rank(f"\n[bold GREEN]USING A PRETRAINED MODEL.")
+        CONSOLE.print_zero_rank(f"\n[bold GREEN]USING A PRETRAINED MODEL.")
         base_model = transformers.GPT2LMHeadModel.from_pretrained(hf_name)
 
     else:
@@ -1701,6 +2107,7 @@ class EntryPoints:
         is_gpt2_model=True,
         lm_masking_mode=DEFAULT_LM_MASKING_MODE,
         switch_to_maginal_after: Optional[dict[str, int]] = DEFAULT_SWITCH_TO_MARGINAL_AFTER,
+        new_wandb_run_id: bool = False,
 
         #######################################################################
         # Model config
@@ -1724,11 +2131,6 @@ class EntryPoints:
         wandb_run_id: Optional[str] = DEFAULT_WANDB_ID,
         checkpoints_folder: Union[Path, str] = DEFAULT_CHECKPOINTS_DIR,
         wandb_config_path: Union[Path, str] = DEFAULT_WANDB_CONFIG_PATH,
-
-        #######################################################################
-        # Don't do anything yet
-        #######################################################################
-        use_scratchpads: bool = DEFAULT_USE_SCRATCHPADS,
     ):
         all_arguments = locals().copy()
         
@@ -1767,10 +2169,10 @@ class EntryPoints:
 
         if resuming:
             latest_checkpoint = last_ckpt_info.path
-            utils.rich_print_zero_rank(f"\n[bold]Will resume from:[/] \"{latest_checkpoint}\"")
+            CONSOLE.print_zero_rank(f"\n[bold]Will resume from:[/] \"{latest_checkpoint}\"")
         else:
             latest_checkpoint = None
-            utils.rich_print_zero_rank(f"\n[bold]Not resuming: Will start from scratch.")
+            CONSOLE.print_zero_rank(f"\n[bold]Not resuming: Will start from scratch.")
 
         ddp_info = _setup_ddp(strategy)
 
@@ -1802,15 +2204,21 @@ class EntryPoints:
         # be loaded with the trainer.fit call, further in the code.
         
         if resuming:
-            utils.rich_print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint)
+            CONSOLE.print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint)
             # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
-            utils.rich_print_zero_rank("\n[red bold]WATCH OUT:[/] Not loading meta info from checkpoint.")
+            CONSOLE.print_zero_rank("\n[red bold]WATCH OUT:[/] Not loading meta info from checkpoint.")
             meta_info = arg_meta_info
             
+            if new_wandb_run_id:
+                wandb_run_id_to_use = None
+            else:
+                wandb_run_id_to_use = wandb_run_id
+                
+
             del arg_meta_info
             logger = pl.loggers.WandbLogger(
-                resume="must", 
-                id=wandb_run_id,
+                resume=False if new_wandb_run_id else "must", 
+                id=wandb_run_id_to_use,
                 project=wandb_config["project"],
                 entity=wandb_config["entity"],
                 log_model=False,
@@ -1828,7 +2236,7 @@ class EntryPoints:
                 assert wandb.run
                 wandb.run.log_code(SCRIPT_DIR)
         else:
-            utils.rich_print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
+            CONSOLE.print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
             meta_info, logger, wandb_run_id = _set_initial_state(
                 checkpoints_root_dir=checkpoints_folder,
                 arg_meta_info=arg_meta_info, 
@@ -1855,13 +2263,13 @@ class EntryPoints:
             model_mode=meta_info["model_mode"], 
             tokenizer=tokenizer,
         )
-        utils.rich_print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"")
+        CONSOLE.print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"")
         datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
             [constants.CVSets.TRAINING, constants.CVSets.VALIDATION]
         )
 
-        rich.print(f"\n[bold]Strategy:[/] {strategy}")
-        rich.print(f"\n[bold]ddp_info:[/] {vars(ddp_info)}\n")
+        CONSOLE.print(f"\n[bold]Strategy:[/] {strategy}")
+        CONSOLE.print(f"\n[bold]ddp_info:[/] {vars(ddp_info)}\n")
 
         ###############################################################
         # Build the pt-lightning dataloader
@@ -1879,7 +2287,6 @@ class EntryPoints:
             scheduler_type=meta_info["scheduler_type"],
             switch_to_maginal_after=meta_info["switch_to_maginal_after"],
             tokenizer=tokenizer,
-            use_scratchpads=use_scratchpads, 
             wandb_logger=logger,
             weight_decay=meta_info["weight_decay"],
             
@@ -2018,7 +2425,7 @@ class EntryPoints:
             limit_predict_batches=math.ceil(qty / batch_sizes[mode]),
         )
 
-        trainer.predict(
+        trainer.validate(
             pl_object,
             ckpt_path=str(last_ckpt_info.path),
         )
