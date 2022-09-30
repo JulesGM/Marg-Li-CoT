@@ -1012,14 +1012,13 @@ class _RefineLM(pl.LightningModule):
             seq_z_log_probs = z_log_probs.sum(dim=-1)
             seq_z_log_probs_fixed = z_log_probs_fixed.sum(dim=-1)
             import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed
-            beta = 1./1000.
+            beta = 1/200
 
-            y_prob_term = y_log_probs_fixed_per_seq.detach().softmax(-1)
+            y_prob_term = y_log_probs_fixed_per_seq.detach().softmax(dim=-1)
             rl_reward = (seq_z_log_probs.exp() * y_prob_term).mean()
-            ppo_importance_sampling_penalty = beta * (z_log_probs.exp() - z_log_probs_fixed.exp()).pow(2).sum(-1).sqrt().mean() # seq_z_log_probs.exp() * import_ratio_w_fixed_z
+            ppo_importance_sampling_penalty = beta * (z_log_probs - z_log_probs_fixed)
 
             # E(x, y) ∼ D_{π^{RL}_φ} [r_θ(x, y) − β log (π^{RL}_φ (y | x) / π^{SFT}(y | x))] + γ E_{x}∼D_{pretrain} [log(π^{RL}_φ (x))]
-            # E[p(y | x, y) - beta * (log p(y | x, y) - log p_{fixed}(y | x))] # + γ E[log(π^{RL}_φ (x))]
 
             loss = ppo_importance_sampling_penalty.mean() - rl_reward.mean()
 
