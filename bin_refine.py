@@ -53,7 +53,7 @@ DEFAULT_LEARNING_RATE = 0.001
 
 DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=3)
 LIMIT_VAL_BATCHES = 10
-VAL_CHECK_INTERVAL = 0.01
+VAL_CHECK_INTERVAL = 0.002
 
 DEFAULT_NUM_BEAMS = 20
 MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
@@ -478,8 +478,8 @@ def show_multi_scratchpad_table(
     num_scratchpads, 
 ):
     
-    y_prob = y_prob.clone()
-    z_prob = z_prob.clone()
+    y_prob = y_prob.clone().detach()
+    z_prob = z_prob.clone().detach()
 
     table_ = table.Table("Text", "y score", "z score", "y rank", "z rank")
 
@@ -508,11 +508,18 @@ def show_multi_scratchpad_table(
         if maybe_color:
             maybe_close = "[/]"
 
+        y_prob_color_coeff = int(y_prob_entry[rank_y].item() * 255)
+        y_prob_color = f"white on #{y_prob_color_coeff:02x}{y_prob_color_coeff:02x}{y_prob_color_coeff:02x}"
+
+        z_prob_color_coeff = int(z_prob_entry[rank_y].item() * 255)
+        z_prob_color = f"white on #{z_prob_color_coeff:02x}{z_prob_color_coeff:02x}{z_prob_color_coeff:02x}"
+
         table_.add_row(
-            maybe_color + _show_multi_scratchpad_table_format_text(shift_MITGSWRV[demo_input_idx, rank_y], tokenizer) 
+            maybe_color + _show_multi_scratchpad_table_format_text(
+                shift_MITGSWRV[demo_input_idx, rank_y], tokenizer) 
             + maybe_close,
-            f"{y_prob_entry[rank_y].item():.3}", 
-            f"{z_prob_entry[rank_y].item():.3}",
+            f"[{y_prob_color}]{y_prob_entry[rank_y].item():.3}", 
+            f"[{z_prob_color}]{z_prob_entry[rank_y].item():.3}",
             str(rank_y),
             str(ranks_z[rank_y])
         )
@@ -844,7 +851,7 @@ class _RefineLM(pl.LightningModule):
         lr = optimizer.param_groups[0]["lr"]                
         utils.check_equal(len(self.trainer.optimizers), 1)
         utils.check_equal(len(optimizer.param_groups), 1)
-        CONSOLE.print_zero_rank(f"[bold]Learning rate:[/] {lr:.3}")
+        CONSOLE.print_zero_rank(f"\n[bold]Learning rate:[/] {lr:.3}")
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute the logits
@@ -927,9 +934,9 @@ class _RefineLM(pl.LightningModule):
         ###############################################################
         # COMPUTE THE CROSS-ENTROPY LOSS WITH THE MOST HELPFUL SEQUENCE
         ###############################################################
-        MITGSWRV_ids           = MITGSWRV_ids               .reshape(batch_size, num_scratchpads, -1).clone()
-        ITGSWRV_ids            = ITGSWRV_ids                .reshape(batch_size, num_scratchpads, -1).clone()
-        ITGSWRV_attention_mask = ITGSWRV_attention_mask.reshape(batch_size, num_scratchpads, -1).clone()
+        MITGSWRV_ids           = MITGSWRV_ids          .reshape(batch_size, num_scratchpads, -1)
+        ITGSWRV_ids            = ITGSWRV_ids           .reshape(batch_size, num_scratchpads, -1)
+        ITGSWRV_attention_mask = ITGSWRV_attention_mask.reshape(batch_size, num_scratchpads, -1)
 
         #######################################################################
         # Do MLE on the strongest scratchpad
@@ -994,35 +1001,45 @@ class _RefineLM(pl.LightningModule):
 
         elif loss_mode == LossModes.PPO:
 
+            """
+            Things to explore:
+            - With softmax on p_y
+            - Without softmax
+            - Beta values
+            - KL instead of l2
+            """
+
             seq_z_log_probs = z_log_probs.sum(dim=-1)
             seq_z_log_probs_fixed = z_log_probs_fixed.sum(dim=-1)
-
             import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed
-            utils.check_equal(most_helpful_log_probs.shape,       (batch_size,))
+            beta = 1./1000.
 
-            beta = 5.
-            rl_reward = seq_z_log_probs * y_log_probs_fixed_per_seq
-            ppo_importance_sampling_penalty = seq_z_log_probs * import_ratio_w_fixed_z
+            y_prob_term = y_log_probs_fixed_per_seq.detach().softmax(-1)
+            rl_reward = (seq_z_log_probs.exp() * y_prob_term).mean()
+            ppo_importance_sampling_penalty = beta * (z_log_probs.exp() - z_log_probs_fixed.exp()).pow(2).sum(-1).sqrt().mean() # seq_z_log_probs.exp() * import_ratio_w_fixed_z
 
             # E(x, y) ∼ D_{π^{RL}_φ} [r_θ(x, y) − β log (π^{RL}_φ (y | x) / π^{SFT}(y | x))] + γ E_{x}∼D_{pretrain} [log(π^{RL}_φ (x))]
             # E[p(y | x, y) - beta * (log p(y | x, y) - log p_{fixed}(y | x))] # + γ E[log(π^{RL}_φ (x))]
 
-            loss = (rl_reward - beta * ppo_importance_sampling_penalty).mean()
+            loss = ppo_importance_sampling_penalty.mean() - rl_reward.mean()
 
-            self.log("rl_reward",                       rl_reward.mean().item(),                       **self._logging_conf)
-            self.log("ppo_importance_sampling_penalty", ppo_importance_sampling_penalty.mean().item(), **self._logging_conf)
-            self.log("loss",                            loss.item(),                                   **self._logging_conf)
+            self.log("rl_reward",                        rl_reward.item(),                        batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty.item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("loss",                             loss.item(),                             batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("log_loss",                         loss.log().item(),                       batch_size=self._batch_size[mode],  **self._logging_conf)
+
+
             utils.check_equal(loss.ndim, 0)
         else:
             raise ValueError(f"Unknown loss mode {loss_mode}")
 
 
         with torch.no_grad():
-            y_part_prob = y_log_probs_fixed_per_seq.exp()
+            y_part_prob = y_prob_term
             z_part_prob = z_log_probs_per_seq.exp()
 
         demo_input_idx = random.randint(0, batch_size - 1)
-        demo_input_sp = random.randint(0, num_scratchpads - 1)
+        demo_input_sp =  random.randint(0, num_scratchpads - 1)
 
         if SHOW_SMALL_GENERATION_TABLE:
             show_small_generation_table(
@@ -1060,7 +1077,7 @@ class _RefineLM(pl.LightningModule):
                     "shift_log_probs" in locals() else shift_probs.prod(dim=-1),
             )
 
-        print(f"[{self.trainer.global_rank}] [bold]Loss:[/] {loss}")
+        utils.rich_print_zero_rank(f"[{self.trainer.global_rank}] [bold]Loss:[/] {loss}")
         
         return loss
 
@@ -1248,11 +1265,12 @@ class _RefineLM(pl.LightningModule):
                 table_entry.append([self.current_epoch, index, "generation", gen])
                 table_entry.append([self.current_epoch, index, "label", lab])
 
-            self._wandb_logger.log_text(
-                key="samples",
-                columns=["epoch", "idx_in_batch", "type", "text"], 
-                data=table_entry,
-            )
+            if self._wandb_logger:
+                self._wandb_logger.log_text(
+                    key="samples",
+                    columns=["epoch", "idx_in_batch", "type", "text"], 
+                    data=table_entry,
+                )
 
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Print the generated text
@@ -1282,6 +1300,8 @@ class _RefineLM(pl.LightningModule):
         self.log("val_answ", final_answer_acc, batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[mode], **self._logging_conf)
 
+        utils.rich_print_zero_rank(f"val_em: {em_accuracy:.3%} val_answ: {final_answer_acc:.3%}")
+        
         assert not torch.any(torch.isnan(ppl_outputs.loss)), "Loss is NaN"        
         return ppl_outputs
 
@@ -1552,8 +1572,7 @@ def _set_initial_state(
         config_path = _make_config_path(
             checkpoints_root_dir, 
             arg_meta_info["run_name"], 
-            arg_meta_info["wandb_run_id"], 
-            0, 0)
+            arg_meta_info["wandb_run_id"])
         config_path.parent.mkdir(parents=True, exist_ok=True)
         utils.dump_json(
             arg_meta_info, 
@@ -1872,7 +1891,7 @@ def _text_mode_build_dataset(
 
     tokenized_data = _load_data(dataset_path, tokenizer, DATA_MODE, cv_sets=cv_sets)
     assert tokenized_data    
-    output_datasets = {}
+    output_datasets: dict[str, DictDataset] = {}
 
     ds_key_filter = {
         constants.PipelineModes.MLE_TRAINING: {
@@ -1975,7 +1994,7 @@ def _setup_base_model(
     model_mode: str,
     tokenizer: transformers.PreTrainedTokenizer,
     verbose: bool = True
-) -> transformers.PreTrainedModel:
+) -> transformers.GPT2LMHeadModel:
     """
     ------------------------------------------
     Structure:
@@ -2085,7 +2104,7 @@ def _compute_batch_size_defaults(
 
 
 @beartype
-def _make_config_path(checkpoints_root_dir: Path, run_name: str, wandb_run_id: str, step: int, epoch: int) -> Path:
+def _make_config_path(checkpoints_root_dir: Path, run_name: str, wandb_run_id: str) -> Path:
     return checkpoints_root_dir / run_name / wandb_run_id / f"last.json"
 
 
@@ -2367,6 +2386,7 @@ class EntryPoints:
         checkpoints_root_dir: Path = DEFAULT_CHECKPOINTS_DIR, 
         distribute_strategy: Optional[str] = None,
         batch_sizes: Optional[dict[str, int]] = None,
+        lm_masking_mode = DEFAULT_LM_MASKING_MODE,
     ) -> None:
         """
         Run by loading a json file.
@@ -2382,9 +2402,11 @@ class EntryPoints:
             checkpoints_root_dir=checkpoints_root_dir, 
             run_name=run_name, 
             wandb_run_id=wandb_run_id,
-            step=last_ckpt_info.step,
-            epoch=last_ckpt_info.epoch,
         ))
+        tokenizer = _setup_tokenizer(
+            meta_info["transformers_model_name"], 
+            is_gpt2_model=meta_info["is_gpt2_model"]
+        )  
         base_model = _setup_base_model(
             custom_model_config=meta_info["custom_model_config"], 
             hf_name=meta_info["transformers_model_name"], 
@@ -2392,19 +2414,23 @@ class EntryPoints:
             model_mode=meta_info["model_mode"], 
             tokenizer=tokenizer,
         )
-        tokenizer = _setup_tokenizer(meta_info["transformers_model_name"])  
         datasets = _text_mode_build_dataset(
             dataset_path, tokenizer, cv_sets=[constants.CVSets.VALIDATION])
         ddp_info = _setup_ddp(distribute_strategy)
+
         if batch_sizes is None:
             batch_sizes = _compute_batch_size_defaults(
-                ddp_info.local_rank, meta_info["transformers_model_name"], batch_sizes)
+                ddp_info.local_rank, 
+                meta_info["transformers_model_name"], 
+                batch_sizes,
+                accelerator=ACCELERATOR,
+            )
 
         pl_object = _RefineLM(
             model=base_model,
             datasets=datasets,
             tokenizer=tokenizer,
-            batch_sizes=meta_info["batch_sizes"],
+            batch_sizes=batch_sizes,
             generation_kwargs=meta_info["generation_kwargs"],
             learning_rate=meta_info["learning_rate"],
             path_log_results=meta_info["path_log_results"],
@@ -2412,6 +2438,9 @@ class EntryPoints:
             weight_decay=meta_info["weight_decay"],
             scheduler_type=meta_info["scheduler_type"],
             meta_info=meta_info,
+            lm_masking_mode=lm_masking_mode,
+            switch_to_maginal_after=None,
+            wandb_logger=None,
         )
 
         trainer = pl.Trainer(
