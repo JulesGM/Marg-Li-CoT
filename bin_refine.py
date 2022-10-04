@@ -1009,16 +1009,14 @@ class _RefineLM(pl.LightningModule):
             - KL instead of l2
             """
 
-            seq_z_log_probs = z_log_probs.sum(dim=-1)
-            seq_z_log_probs_fixed = z_log_probs_fixed.sum(dim=-1)
-            import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed
+            seq_z_log_probs = z_log_probs.sum(dim=-1)  # (batch_size, num_scratchpads)
+            seq_z_log_probs_fixed = z_log_probs_fixed.sum(dim=-1)  # (batch_size, num_scratchpads)
+            import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed  # (batch_size, num_scratchpads)
             beta = 1/200
 
             y_prob_term = y_log_probs_fixed_per_seq.detach().softmax(dim=-1)
-            rl_reward = (seq_z_log_probs.exp() * y_prob_term).mean()
-            ppo_importance_sampling_penalty = beta * (z_log_probs - z_log_probs_fixed)
-
-            # E(x, y) ∼ D_{π^{RL}_φ} [r_θ(x, y) − β log (π^{RL}_φ (y | x) / π^{SFT}(y | x))] + γ E_{x}∼D_{pretrain} [log(π^{RL}_φ (x))]
+            rl_reward = (seq_z_log_probs.exp() * y_prob_term).mean()  # Maybe substract the greedy reward to get the advantage
+            ppo_importance_sampling_penalty = z_log_probs.exp() * beta * (z_log_probs - z_log_probs_fixed)
 
             loss = ppo_importance_sampling_penalty.mean() - rl_reward.mean()
 
@@ -1026,7 +1024,6 @@ class _RefineLM(pl.LightningModule):
             self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty.item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
             self.log("loss",                             loss.item(),                             batch_size=self._batch_size[mode],  **self._logging_conf)
             self.log("log_loss",                         loss.log().item(),                       batch_size=self._batch_size[mode],  **self._logging_conf)
-
 
             utils.check_equal(loss.ndim, 0)
         else:
