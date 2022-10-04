@@ -7,10 +7,11 @@ Sources:
 - https://github.com/CarperAI/trlx/blob/master/trlx/model/accelerate_ppo_model.py#L76
 
 """
+import time
 
 import torch
 import torch.nn.functional as F
-
+import wandb
 
 def whiten(values, shift_mean=True):
     """
@@ -42,17 +43,17 @@ def logprobs_from_logits(logits, labels):
 
 
 def loss(
-    all_logprobs,  # floats, with_grad, batch_size x seq_len x vocab_size
-    all_rewards,  # floats, with_grad, batch_size x seq_len 
-    all_values,  # floats, with_grad, batch_size x seq_len
-    model,  # ?
-    query_tensors,  # long, (no grad), [batch_size, seq_len]
+    all_logprobs,      # floats, with_grad, batch_size x seq_len x vocab_size
+    all_rewards,       # floats, with_grad?, batch_size x seq_len 
+    all_values,        # floats, with_grad?, batch_size x seq_len
+    model,               # ?
+    query_tensors,     # long, (no grad), [batch_size, seq_len]
     response_tensors,  # long, (no_grad), [batch_size, max_seq_len]
-    config,  # namespace
+    config,            # namespace
 ):
     """
     Parameters:
-        - all_logprobs: logprob for question + [scratchpad] + answer
+        - all_logprobs: logprob for question + answer
         - all_rewards: afaik this is the KL reward with the final reward at the final step
         - all_values: values predicted by the value funciton
         - config:
@@ -72,7 +73,7 @@ def loss(
     ###########################################################################
     lastgaelam = 0
     advantages_reversed = []
-    gen_len = response_tensors.shape[1]  # [batch * num_scratchpads?] x seq_len
+    gen_len = response_tensors.shape[1] 
 
     for t in reversed(range(gen_len)):
         nextvalues = all_values[:, t + 1] if t < gen_len - 1 else 0.0  # float, with_grad?, batch_size
@@ -94,12 +95,11 @@ def loss(
     logits, _, vpred = model(all_tokens)  # The logits are only used in the PG loss
 
 
-
     ###########################################################################
     # Compute the loss of the value function
     ###########################################################################
     # Only the generation part of the values / logprobs is needed
-    vpred   = vpred  [:, - gen_len - 1: - 1] 
+    vpred = vpred[:, - gen_len - 1: - 1] 
 
     vpredclipped = clip_by_value(
         vpred,
@@ -136,3 +136,79 @@ def loss(
     
 
     return model_loss
+
+
+def make_experience(
+    *,
+    scorer_model, 
+    rl_model, 
+    ref_model,
+    chunk_size: int,
+    pipeline_iterator,
+    pipeline_loader,
+    num_rollouts: int = 1024, 
+    iter_count: int = 0, 
+):
+
+    #######################################################################
+    # Compute the logits and the values with the trainable and fixed models
+    #######################################################################
+    # Precompute logprobs, values
+    all_tokens = torch.cat((query_tensors, response_tensors), dim=1)
+    assert all_tokens.size()[1] == query_tensors.size()[1] + response_tensors.size()[1]
+    with torch.no_grad():
+        logits, _, v = rl_model.model(all_tokens)
+        ref_logits, _, _ = ref_model(all_tokens.cpu()) # TODO(dahoas): Need to make decision about what to do with ref model: keep on cpu?
+        ref_logits = ref_logits.to(rl_model.accelerator.device)
+    logprobs = logprobs_from_logits(logits[:,:-1,:], all_tokens[:,1:])
+    ref_logprobs = logprobs_from_logits(ref_logits[:,:-1,:], all_tokens[:,1:])
+    start = query_tensors.size()[1]-1
+    end = query_tensors.size()[1] + response_tensors.size()[1] - 1
+    all_values = v[:, start-1 : end-1]
+    all_logprobs = logprobs[:, start : end]
+    all_ref_logprobs = ref_logprobs[:, start : end]
+
+    #######################################################################
+    # Compute rewards
+    #######################################################################
+    texts = [q + r for q,r in zip(batch.text, response_text)]
+    scores = scorer_model.score(texts)
+
+    kls = all_logprobs - all_ref_logprobs
+    non_score_rewards = - rl_model.config.method.init_kl_coef * kls
+    all_rewards = non_score_rewards.clone()
+    all_rewards[:, -1] += scores.to(rl_model.accelerator.device)
+
+    #######################################################################
+    # Package everything to be sent back, & log
+    #######################################################################
+    query_tensors = query_tensors.cpu()
+    response_tensors = response_tensors.cpu()
+    all_logprobs = all_logprobs.cpu()
+    all_values = all_values.cpu()
+    all_rewards = all_rewards.cpu()
+
+    exp_time = time.perf_counter() - start
+
+    # Evaluate model on first chunk
+    if i == 0:
+        mean_score = torch.mean(scores).item()
+        rows = list(zip(texts, scores.tolist()))
+        stats = {
+            "exp_time": exp_time, 
+            "mean_score": mean_score, 
+            "responses": wandb.Table(columns=["response", "score"], 
+            rows=rows[:16])
+        }
+        rl_model.accelerator.log(stats, step=iter_count)
+
+
+    new_ppo_rl_elements = [dict(
+                                query_tensor=query_tensors[i, :],
+                                response_tensor=response_tensors[i, :],
+                                logprobs=all_logprobs[i, :],
+                                values=all_values[i, :],
+                                rewards=all_rewards[i, :],
+                            ) for i in range(query_tensors.size()[0])]
+    
+    return new_ppo_rl_elements

@@ -32,10 +32,10 @@ from tqdm import tqdm  # type: ignore[import]
 import transformers  # type: ignore[import]
 import wandb
 
+import console
 import general_shared_constants as constants
 import general_utils as utils
-import console
-
+import ppo
 CONSOLE = console.Console(force_terminal=True, force_interactive=True, width=200)
 
 pretty_traceback.install()
@@ -810,6 +810,7 @@ class _RefineLM(pl.LightningModule):
         class LossModes(str, enum.Enum):
             PPO = "ppo"
             STRONGEST_MLE = "strongest_mle"
+            MARGINAL_KL_W_FIXED = "marginal_kl_w_fixed"
 
         loss_mode = LossModes.PPO
         label_pad_token_id = self._tokenizer.pad_token_id
@@ -870,7 +871,7 @@ class _RefineLM(pl.LightningModule):
             ).logits
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Shift the logits and MITGSWRV
+        # Shift the logits and MITGSWRV: Masked Inputs Then Generated Scratchpads With Reference Value
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         shift_MITGSWRV_log_softmax, shift_MITGSWRV_is_pad, shift_MITGSWRV = prep_logits_and_MITGSWRV(
             vocab_size         = vocab_size,
@@ -970,36 +971,7 @@ class _RefineLM(pl.LightningModule):
                 labels         = final_MITGSWRV_ids,
             ).loss
 
-        elif loss_mode == "not ready":
-            assert False
-            import_ratio_w_fixed_z = z_log_probs.sum(dim=-1) - z_log_probs_fixed.sum(dim=-1)
-        
-            most_helpful_log_probs_ratio = import_ratio_w_fixed_z.gather(
-                dim=-1, index=most_helpful_idx.unsqueeze(-1)
-            ).squeeze(-1)
-            
-            average_log_probs_ratio = torch.mean(import_ratio_w_fixed_z, dim=-1)
-
-            utils.check_equal(most_helpful_log_probs_ratio.shape, (batch_size,))
-            utils.check_equal(average_log_probs_ratio.shape,      (batch_size,))
-            utils.check_equal(most_helpful_log_probs.shape,       (batch_size,))
-
-            beta = 1.5
-            nll_best = - most_helpful_log_probs.mean(dim=-1)
-            baseline_respect_loss = beta * average_log_probs_ratio.mean(dim=-1)
-            nll = nll_best + beta * average_log_probs_ratio.mean(dim=-1)
-
-            # E(x, y) ∼ D_{π^{RL}_φ} [r_θ(x, y) − β log (π^{RL}_φ (y | x) / π^{SFT}(y | x))] + γ E_{x}∼D_{pretrain} [log(π^{RL}_φ (x))]
-            # E[p(y | x, y) - beta * (log p(y | x, y) - log p_{fixed}(y | x))] # + γ E[log(π^{RL}_φ (x))]
-            loss = nll
-
-            CONSOLE.print_zero_rank(f"{nll_best = }")
-            CONSOLE.print_zero_rank(f"{baseline_respect_loss = }")
-            self.log("nll_best", nll_best.item(), prog_bar=True)
-            self.log("baseline_respect_loss", baseline_respect_loss.item(), prog_bar=True)
-            utils.check_equal(loss.ndim, 0)
-
-        elif loss_mode == LossModes.PPO:
+        elif loss_mode == LossModes.MARGINAL_KL_W_FIXED:
 
             """
             Things to explore:
@@ -1019,6 +991,50 @@ class _RefineLM(pl.LightningModule):
             ppo_importance_sampling_penalty = z_log_probs.exp() * beta * (z_log_probs - z_log_probs_fixed)
 
             loss = ppo_importance_sampling_penalty.mean() - rl_reward.mean()
+
+            self.log("rl_reward",                        rl_reward.item(),                        batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty.item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("loss",                             loss.item(),                             batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("log_loss",                         loss.log().item(),                       batch_size=self._batch_size[mode],  **self._logging_conf)
+
+            utils.check_equal(loss.ndim, 0)
+
+        elif loss_mode == LossModes.PPO:
+
+            """
+            Things to explore:
+            - With softmax on p_y
+            - Without softmax
+            - Beta values
+            - KL instead of l2
+            """
+
+
+            experience = ppo.make_experience(
+                scorer_model, 
+                chunk_size,
+                pipeline_iterator,
+                pipeline_loader,
+                num_rollouts 
+                iter_count, 
+                rl_model=self._model, 
+                ref_model=self._fixed_model,
+            )
+            experience_unzipped = general_utils.dict_unzip(experience)
+            experience_unzipped = {
+                k: torch.cat(v) for k, v in experience_unzipped.items()
+            }
+
+            loss = ppo.loss(
+                experience_unzipped["logprobs"],
+                experience_unzipped["rewards"]，
+                experience_unzipped["values"]，
+                model,               # ?
+                experience_unzipped["query_tensors"],    
+                experience_unzipped["response_tensors"], 
+                config,     
+            )
+
 
             self.log("rl_reward",                        rl_reward.item(),                        batch_size=self._batch_size[mode],  **self._logging_conf)
             self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty.item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
