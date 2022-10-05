@@ -354,6 +354,7 @@ def prep_samples_marginal(
         MITGSWRV_ids           = padded_final_MITGSWRV, 
         y_mask_is_not_pad      = padded_y_mask_is_not_pad, 
         z_mask_is_not_pad      = padded_z_mask_is_not_pad,
+
     )
 
 
@@ -658,6 +659,7 @@ class _RefineLM(pl.LightningModule):
         self._wandb_logger: Final[pl.loggers.WandbLogger] = wandb_logger
         self._model: Final[transformers.GPT2LMHeadModel] = model
         self._fixed_model: Optional[transformers.GPT2LMHeadModel] = None
+        self._value_model: Optional[transformers.GPT2PreTrainedModel] = None
         self._datasets: Final[Dict[str, torch.utils.data.Dataset]] = datasets
         self._tokenizer: Final[transformers.PreTrainedTokenizer] = tokenizer
         self._batch_size: Final[dict[str, int]] = batch_sizes
@@ -927,11 +929,6 @@ class _RefineLM(pl.LightningModule):
 
         most_helpful_idx = y_log_probs_fixed_per_seq.argmax(dim=-1).detach()
 
-        most_helpful_log_probs = z_log_probs_per_seq.gather(
-            dim=-1, 
-            index=most_helpful_idx.unsqueeze(-1),
-        ).squeeze(-1)
-        
         ###############################################################
         # COMPUTE THE CROSS-ENTROPY LOSS WITH THE MOST HELPFUL SEQUENCE
         ###############################################################
@@ -943,6 +940,12 @@ class _RefineLM(pl.LightningModule):
         # Do MLE on the strongest scratchpad
         #######################################################################
         if loss_mode == LossModes.STRONGEST_MLE:
+
+            most_helpful_log_probs = z_log_probs_per_seq.gather(
+                dim=-1, 
+                index=most_helpful_idx.unsqueeze(-1),
+            ).squeeze(-1)
+            
             ref_final_ITGSWRV_input_ids      = ref_special_gather(tensor=ITGSWRV_ids,            most_helpful_idx=most_helpful_idx, batch_size=batch_size)
             ref_final_ITGSWRV_attention_mask = ref_special_gather(tensor=ITGSWRV_attention_mask, most_helpful_idx=most_helpful_idx, batch_size=batch_size)
             ref_final_MITGSWRV_ids           = ref_special_gather(tensor=MITGSWRV_ids,           most_helpful_idx=most_helpful_idx, batch_size=batch_size)
@@ -1008,19 +1011,25 @@ class _RefineLM(pl.LightningModule):
             - Beta values
             - KL instead of l2
             """
-
-
+            
             experience = ppo.make_experience(
-                scorer_model, 
-                chunk_size,
-                pipeline_iterator,
-                pipeline_loader,
-                num_rollouts 
-                iter_count, 
-                rl_model=self._model, 
-                ref_model=self._fixed_model,
-            )
-            experience_unzipped = general_utils.dict_unzip(experience)
+                all_tokens_input_ids      =,
+                all_tokens_attention_mask =,
+                query_tensors             = batch["generation_input_ids"],
+                response_tensors          =,
+                scores                    = scores,
+                logprobs_generated        = z_log_probs,
+                logprobs_generated_fixed  = z_log_probs_fixed,
+                init_kl_coef              = init_kl_coef,
+                value_model               = self._value_model,
+                
+                # Arguments for logging
+                batch_idx                 = batch_idx,
+                logger                    = self.logger,    
+                logger_kwargs             = self._logging_conf, 
+            ):
+
+            experience_unzipped = utils.dict_unzip(experience)
             experience_unzipped = {
                 k: torch.cat(v) for k, v in experience_unzipped.items()
             }
@@ -1209,11 +1218,24 @@ class _RefineLM(pl.LightningModule):
             and self._switch_to_maginal_after["steps"] == self.global_step)
 
         if is_changing_epoch or is_changing_step:
+            ###################################################################
+            # Create the fixed model
+            ###################################################################
             assert self._fixed_model is None, "We should only assign this once"
             CONSOLE.print_zero_rank(f"[red bold]MAKING A COPY OF THE MODEL")
             self._fixed_model = clone_hf_model(self._model).eval().to(self._model.device)
             for param in self._fixed_model.parameters():
                 param.requires_grad = False
+
+            ###################################################################
+            # Create the value model
+            ###################################################################
+            model_copy = clone_hf_model(self._model).to(self._model.device)
+            model_copy.config.num_labels = 1
+            self._value_model = transformers.GPT2ForTokenClassification(model_copy.config, num_labels=1)
+            self._value_model.transformer = model_copy
+            utils.check_equal(self._value_model.classifier.out_features, 1)
+
 
     def validation_step(self, batch: Dict[str, torch.LongTensor], batch_idx):  # type: ignore[override]
         assert "labels" in batch, (
