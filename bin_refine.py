@@ -36,6 +36,9 @@ import console
 import general_shared_constants as constants
 import general_utils as utils
 import ppo
+
+Sequence.register(torch.Tensor)
+
 CONSOLE = console.Console(force_terminal=True, force_interactive=True, width=200)
 
 pretty_traceback.install()
@@ -50,10 +53,12 @@ CHAINER = " => "
 # Constants that should be changed from time to time
 ###############################################################################################
 DEFAULT_LEARNING_RATE = 0.001
+DEFAULT_STEP_3_LR = 0.0001
+DEFAULT_STEP_3_LOSS_MODE = constants.LossModes.MARGINAL_KL_W_FIXED 
 
 DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=3)
 LIMIT_VAL_BATCHES = 10
-VAL_CHECK_INTERVAL = 0.002
+VAL_CHECK_INTERVAL = 30
 
 DEFAULT_NUM_BEAMS = 20
 MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
@@ -61,7 +66,7 @@ MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
 DEFAULT_LM_MASKING_MODE = constants.LMMaskingMode.MASK_INPUT
 DEFAULT_SHARED_BATCH_SIZE = 64 * 2
 DEFAULT_GRADIENT_ACCUM = 2
-DEFAULT_SCHEDULER_TYPE = constants.SchedulerTypes.LINEAR_WARMUP_LINEAR
+DEFAULT_SCHEDULER_TYPE = constants.SchedulerTypes.LINEAR_WARMUP_CONSTANT
 
 WARMUP_EPOCHS = 1
 MAX_EPOCHS = 53
@@ -153,34 +158,30 @@ SCHEDULER_FN = {
     constants.SchedulerTypes.CONSTANT:
         lambda optimizer, steps_per_epoch:
             transformers.get_constant_schedule(
-                optimizer),
+                optimizer
+            ),
 
     constants.SchedulerTypes.LINEAR_WARMUP_CONSTANT: 
         lambda optimizer, steps_per_epoch:
-            transformers.get_linear_schedule_with_warmup(
+            transformers.get_constant_schedule_with_warmup(
                 optimizer,
-                num_warmup_steps=steps_per_epoch * WARMUP_EPOCHS),
+                num_warmup_steps=steps_per_epoch * WARMUP_EPOCHS
+            ),
 
     constants.SchedulerTypes.LINEAR_WARMUP_LINEAR: 
         lambda optimizer, steps_per_epoch:
             transformers.get_linear_schedule_with_warmup(
                 optimizer, 
                 num_warmup_steps=steps_per_epoch * WARMUP_EPOCHS,
-                num_training_steps=steps_per_epoch * MAX_EPOCHS,),
+                num_training_steps=steps_per_epoch * MAX_EPOCHS,
+            ),
 }
 
 
-def clone_hf_model(model):
+def _clone_hf_model(model):
     new_model = model.__class__(model.config)
     new_model.load_state_dict(model.state_dict())
     return new_model
-
-
-def _compute_length_stats(*, target, pad_token_id):
-    good_mask = target != pad_token_id
-    lengths = collections.Counter(torch.sum(good_mask, dim=1).tolist())
-    sorted_lengths = {k: v for k, v in sorted(lengths.items(), key=lambda x: -x[0])}
-    return sorted_lengths
 
 
 def _compute_steps_per_epoch(trainer: pl.Trainer):
@@ -220,30 +221,17 @@ def _print_predictions(*, inputs, masks, generated_decoded, labels, all_generate
         CONSOLE.print(f"[bold]" + "=" * 80)
 
 
-def _prefix_match(s1: str, s2: str) -> bool:
-    s1 = s1.strip()
-    s2 = s2.strip()
-    return s1.startswith(s2) or s2.startswith(s1)
-
-
-@beartype
-def _last_non_masked(target: torch.Tensor, mask_token_id: int):
-    utils.check_equal(target.ndim, 2)
-    bsz = target.shape[0]
-    label_range = torch.arange(target.shape[1]).repeat(bsz, 1).to(target.device)
-    utils.check_equal(label_range.shape, target.shape)
-    label_range[target == mask_token_id] = 0
-    last_unmasked_token_pos = label_range.max(dim=1).values
-    return torch.gather(target, 1, last_unmasked_token_pos.reshape(-1, 1))
-
-
 @dataclasses.dataclass
 class SamplesMarginal:
     y_mask_is_not_pad      : torch.Tensor
     z_mask_is_not_pad      : torch.Tensor
-    MITGSWRV_ids           : torch.Tensor  # MITGSWRV: Masked Inputs Then Generated Samples With Reference Values
-    ITGSWRV_ids            : torch.Tensor  # ITGSWRV: Inputs Then Generated Samples With Reference Values
-    ITGSWRV_attention_mask : torch.Tensor  # ITGSWRV: Inputs Then Generated Samples With Reference Values
+    MITGSWRV_ids           : torch.Tensor   # MITGSWRV: Masked Inputs Then Generated Samples With Reference Values
+    ITGSWRV_ids            : torch.Tensor   # ITGSWRV: Inputs Then Generated Samples With Reference Values
+    ITGSWRV_attention_mask : torch.Tensor   # ITGSWRV: Inputs Then Generated Samples With Reference Values
+    ITGS_ids               : torch.Tensor   # ITG: Inputs Then Generated samples
+    ITGS_attention_mask    : torch.Tensor   # ITG: Inputs Then Generated samples
+    GS_ids                 : torch.Tensor   # GS: Generated Samples
+    GS_attention_mask      : torch.Tensor   # GS: Generated Samples
 
 
 def prep_samples_marginal(
@@ -293,6 +281,8 @@ def prep_samples_marginal(
     final_MITGSWRV: list[list[int]] = []
     y_mask: list[list[int]] = []
     z_mask: list[list[int]] = []
+    ITG_ids = []
+    GS_ids = []
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # MITGSWRV: Masked Input Then Generated Scratchpad With Rerefence Values
@@ -324,6 +314,9 @@ def prep_samples_marginal(
             y_mask.append         (y_mask_entry)
             z_mask.append         (z_mask_entry)
 
+            ITG_ids.append(io_list)
+            GS_ids.append(scratchpad)
+
             utils.check_equal(len(final_MITGSWRV_entry), len(final_ITGSWRV_entry))
             utils.check_equal(len(y_mask_entry),         len(final_ITGSWRV_entry))
             utils.check_equal(len(z_mask_entry),         len(final_ITGSWRV_entry))
@@ -337,6 +330,12 @@ def prep_samples_marginal(
         padded_z_mask_is_not_pad = pad(z_mask, 0, "right").to(inputs_outputs.device, dtype=padded_final_attention_mask.dtype)
         padded_y_mask_is_not_pad = padded_y_mask_is_not_pad.reshape(batch_size, num_scratchpads, -1)
         padded_z_mask_is_not_pad = padded_z_mask_is_not_pad.reshape(batch_size, num_scratchpads, -1)
+        
+        padded_ITG_ids = pad(ITG_ids, inputs_pad_token_id, "right").to(inputs_outputs.device)
+        padded_ITG_attention_mask = generate_mask(ITG_ids, "right").to(inputs_outputs.device)
+
+        padded_GS_ids = pad(GS_ids, inputs_pad_token_id, "right").to(inputs_outputs.device)
+        padded_GS_attention_mask = generate_mask(GS_ids, "right").to(inputs_outputs.device)
 
         utils.check_equal(padded_final_MITGSWRV       .shape[-1], padded_final_ITGSWRV.shape[-1])
         utils.check_equal(padded_y_mask_is_not_pad    .shape[-1], padded_final_ITGSWRV.shape[-1])
@@ -351,40 +350,14 @@ def prep_samples_marginal(
     return SamplesMarginal(
         ITGSWRV_attention_mask = padded_final_attention_mask, 
         ITGSWRV_ids            = padded_final_ITGSWRV, 
-        MITGSWRV_ids           = padded_final_MITGSWRV, 
+        ITGS_ids                = padded_ITG_ids,
+        ITGS_attention_mask     = padded_ITG_attention_mask, 
+        GS_ids                 = padded_GS_ids,
+        GS_attention_mask      = padded_GS_attention_mask,
+        MITGSWRV_ids           = padded_final_MITGSWRV,
         y_mask_is_not_pad      = padded_y_mask_is_not_pad, 
         z_mask_is_not_pad      = padded_z_mask_is_not_pad,
-
     )
-
-
-def print_table_marginal_likelihood(
-    padded_final_input_ids, padded_final_attention_mask, 
-    padded_final_labels, label_logprobs, batch_size, 
-    num_scratchpads, seq_len, flat_labels, label_pad_token_id,
-    tokenizer
-):
-    table_ = table.Table("Input", "Label", "Attn-Mask", "prob")
-    sample_index = random.randint(0, len(padded_final_input_ids) - 1)
-    for input_id, attention_mask, label, logprobs, masked in zip(
-        padded_final_input_ids[sample_index], 
-        padded_final_attention_mask[sample_index], 
-        padded_final_labels[sample_index],
-        label_logprobs.reshape(batch_size * num_scratchpads, seq_len)[sample_index],
-        (flat_labels == label_pad_token_id).reshape(batch_size * num_scratchpads, seq_len)[sample_index]
-    ):
-        if label == label_pad_token_id:
-            label = tokenizer.pad_token_id
-    
-        table_.add_row(
-            f"'{tokenizer.decode(input_id)}'", 
-            f"'{tokenizer.decode(label)   }'", 
-            f"'{attention_mask.item()           }'",
-            f"'{torch.exp(logprobs)             }'",
-            f"'{masked                          }'",
-        )
-
-    CONSOLE.print(table_)
 
 
 def prep_logits_and_MITGSWRV(
@@ -463,10 +436,11 @@ def show_scratchpad_padding_table(
     CONSOLE.print_zero_rank(table_)
 
 
-def _show_multi_scratchpad_table_format_text(ids, tokenizer):
+def _show_multi_scratchpad_table_format_text(ids, tokenizer) -> str:
     return tokenizer.decode(ids
                 ).replace("<|pad|>", "").replace("<|endoftext|>", "<eos>"
                 ).replace("<|cls|>", "<cls>") 
+
 
 def show_multi_scratchpad_table(
     *,
@@ -515,10 +489,22 @@ def show_multi_scratchpad_table(
         z_prob_color_coeff = int(z_prob_entry[rank_y].item() * 255)
         z_prob_color = f"white on #{z_prob_color_coeff:02x}{z_prob_color_coeff:02x}{z_prob_color_coeff:02x}"
 
+        generated_text = _show_multi_scratchpad_table_format_text(shift_MITGSWRV[demo_input_idx, rank_y], tokenizer) 
+
+        output_str = []
+        for lab, gen in itertools.zip_longest(label_text, generated_text, fillvalue=" "):
+            if lab == gen:
+                output_str.append(gen)
+            else:
+                output_str.append(f"[red]{gen}[/red]")
+        diff_colored = "".join(output_str)
+        
+        if generated_text == label_text:
+            diff_colored = f"[white on green]{generated_text}[/white on green]"
+
+
         table_.add_row(
-            maybe_color + _show_multi_scratchpad_table_format_text(
-                shift_MITGSWRV[demo_input_idx, rank_y], tokenizer) 
-            + maybe_close,
+            maybe_color + diff_colored + maybe_close,
             f"[{y_prob_color}]{y_prob_entry[rank_y].item():.3}", 
             f"[{z_prob_color}]{z_prob_entry[rank_y].item():.3}",
             str(rank_y),
@@ -556,36 +542,7 @@ def show_small_generation_table(
     CONSOLE.print_zero_rank(table_)
 
 
-class Losses:
-    def __init__(self, *args, **kwargs):
-        raise RuntimeError(
-            "This class is a static namespace, it is not meant to be instantiated."
-        )
-
-    @classmethod
-    def most_basic_loss(cls, y_part_log_prob, z_part_log_prob):
-
-        return (y_part_log_prob + z_part_log_prob).logsumexp(dim=-1)
-    
-    @classmethod        
-    def js_divergence_loss(cls, *, y_log_probs, z_log_probs):
-        y_part_log_prob = y_log_probs.sum(dim=-1).log_softmax(dim=-1)
-        z_part_log_prob = z_log_probs.sum(dim=-1).log_softmax(dim=-1)
-
-        jsd = (y_part_log_prob.exp().detach() - z_part_log_prob.exp()
-            ) * (y_part_log_prob.detach() - z_part_log_prob)
-
-        return torch.mean(jsd)                
-
-    @classmethod
-    def squared_loss(cls, y_log_probs, z_log_probs):
-        y_part_log_prob = y_log_probs.sum(dim=-1)
-        z_part_log_prob = z_log_probs.sum(dim=-1)
-
-        return (y_part_log_prob.detach() - z_part_log_prob) ** 2
-
-
-def ref_special_gather(
+def _ref_special_gather(
     *, 
     tensor:           torch.Tensor, 
     most_helpful_idx: torch.Tensor, 
@@ -608,7 +565,8 @@ def ref_special_gather(
 
     return ref_final_final
 
-def special_gather(
+
+def _special_gather(
     *, 
     tensor:           torch.Tensor, 
     most_helpful_idx: torch.Tensor, 
@@ -633,6 +591,60 @@ def special_gather(
     return final_final_MITGSWRV
 
 
+def _get_scratchpad_texts(gen_scratchpads, ref_scratchpads, tokenizer):
+    return [
+        (
+            _clean_for_accuracy_computation(tokenizer.decode(gen_scratch), tokenizer).removesuffix("<|cls|>").strip(),
+            _clean_for_accuracy_computation(tokenizer.decode(ref_scratch), tokenizer)
+        )
+        for  gen_scratch, ref_scratch in more_itertools.zip_equal(gen_scratchpads, ref_scratchpads)
+    ]
+
+def _get_values_texts(gen_values, ref_values, tokenizer):
+    return [
+        (
+            _clean_for_accuracy_computation(tokenizer.decode(gen_value), tokenizer
+                ).removesuffix("<|endoftext|>").strip().removeprefix("<|cls|>").strip(),
+            _clean_for_accuracy_computation(tokenizer.decode(ref_value), tokenizer)
+        )
+        for  gen_value, ref_value in more_itertools.zip_equal(gen_values, ref_values)
+    ]
+
+
+def build_match_stat_matrixes(scratchpad_matches, value_matches):
+    p_good_sp_baad_v = np.mean(np.logical_and(scratchpad_matches,                 np.logical_not(value_matches))) # p(good_sp, baad_v | x)
+    p_baad_sp_good_v = np.mean(np.logical_and(np.logical_not(scratchpad_matches), value_matches))               # p(baad_sp, good_v | x)
+    p_good_sp_good_v = np.mean(np.logical_and(scratchpad_matches,                 value_matches))               # p(good_sp, good_v | x)
+    p_baad_sp_baad_v = np.mean(np.logical_and(np.logical_not(scratchpad_matches), np.logical_not(value_matches))) # p(baad_sp, baad_v | x)
+
+    p_good_sp_knowing_good_v = p_good_sp_good_v / (p_good_sp_good_v + p_baad_sp_good_v) # p(good_sp | good_v, x)
+    p_good_sp_knowing_baad_v = p_good_sp_baad_v / (p_good_sp_baad_v + p_baad_sp_baad_v) # p(good_sp | baad_v, x)
+    p_baad_sp_knowing_good_v = p_baad_sp_good_v / (p_good_sp_good_v + p_baad_sp_good_v) # p(baad_sp | good_v, x)
+    p_baad_sp_knowing_baad_v = p_baad_sp_baad_v / (p_good_sp_baad_v + p_baad_sp_baad_v) # p(baad_sp | baad_v, x)
+
+    p_good_v_knowing_good_sp = p_good_sp_good_v / (p_good_sp_good_v + p_good_sp_baad_v) # p(good_v | good_sp, x)
+    p_good_v_knowing_baad_sp = p_baad_sp_good_v / (p_baad_sp_good_v + p_baad_sp_baad_v) # p(good_v | baad_sp, x)
+    p_baad_v_knowing_good_sp = p_good_sp_baad_v / (p_good_sp_good_v + p_good_sp_baad_v) # p(baad_v | good_sp, x)
+    p_baad_v_knowing_baad_sp = p_baad_sp_baad_v / (p_baad_sp_good_v + p_baad_sp_baad_v) # p(baad_v | baad_sp, x)
+
+    return dict(
+        p_good_sp_baad_v=p_good_sp_baad_v,
+        p_baad_sp_good_v=p_baad_sp_good_v,
+        p_good_sp_good_v=p_good_sp_good_v,
+        p_baad_sp_baad_v=p_baad_sp_baad_v,
+
+        p_good_sp_knowing_good_v=p_good_sp_knowing_good_v,
+        p_good_sp_knowing_baad_v=p_good_sp_knowing_baad_v,
+        p_baad_sp_knowing_good_v=p_baad_sp_knowing_good_v,
+        p_baad_sp_knowing_baad_v=p_baad_sp_knowing_baad_v,
+
+        p_good_v_knowing_good_sp=p_good_v_knowing_good_sp,
+        p_good_v_knowing_baad_sp=p_good_v_knowing_baad_sp,
+        p_baad_v_knowing_good_sp=p_baad_v_knowing_good_sp,
+        p_baad_v_knowing_baad_sp=p_baad_v_knowing_baad_sp,
+    )
+
+
 class _RefineLM(pl.LightningModule):
     def __init__(
         self,
@@ -641,6 +653,8 @@ class _RefineLM(pl.LightningModule):
         datasets: Dict[str, torch.utils.data.Dataset],
         generation_kwargs: dict[str, Any],
         learning_rate: float,
+        step_3_lr: float,
+        step_3_loss_mode: str,
         meta_info: dict,
         model: transformers.GPT2LMHeadModel,
         is_adamw: bool,
@@ -651,25 +665,32 @@ class _RefineLM(pl.LightningModule):
         tokenizer: transformers.PreTrainedTokenizer,
         wandb_logger: Optional[pl.loggers.WandbLogger],
         weight_decay: Optional[float],
+
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model", "datasets", "tokenizer"])
 
-        self._dataloader_num_workers: Final[int] = DATALOADER_NUM_WORKERS
-        self._wandb_logger: Final[pl.loggers.WandbLogger] = wandb_logger
-        self._model: Final[transformers.GPT2LMHeadModel] = model
-        self._fixed_model: Optional[transformers.GPT2LMHeadModel] = None
-        self._value_model: Optional[transformers.GPT2PreTrainedModel] = None
-        self._datasets: Final[Dict[str, torch.utils.data.Dataset]] = datasets
-        self._tokenizer: Final[transformers.PreTrainedTokenizer] = tokenizer
-        self._batch_size: Final[dict[str, int]] = batch_sizes
-        self._generation_kwargs: Final[dict[str, Any]] = generation_kwargs
-        self._logging_conf: Final[dict[str, bool]] = dict(
+        utils.check_contained(
+            step_3_loss_mode, 
+            constants.LossModes.__members__.values()
+        )
+        self._step_3_loss_mode = step_3_loss_mode
+        self._step_3_lr:                Final[float]                               = step_3_lr
+        self._datasets:                 Final[Dict[str, torch.utils.data.Dataset]] = datasets
+        self._value_model:              Optional[transformers.GPT2PreTrainedModel] = None
+        self._tokenizer:                Final[transformers.PreTrainedTokenizer]    = tokenizer
+        self._fixed_model:              Optional[transformers.GPT2LMHeadModel]     = None
+        self._model:                    Final[transformers.GPT2LMHeadModel]        = model
+        self._wandb_logger:             Final[pl.loggers.WandbLogger]              = wandb_logger
+        self._generation_kwargs:        Final[dict[str, Any]]                      = generation_kwargs
+        self._batch_size:               Final[dict[str, int]]                      = batch_sizes
+        self._switch_to_maginal_after:  Final[dict[str, int]]                      = switch_to_maginal_after
+        self._dataloader_num_workers:   Final[int]                                 = DATALOADER_NUM_WORKERS
+        self._lm_masking_mode:          Final[str]                                 = lm_masking_mode
+        self._meta_info                                                            = meta_info
+        self._logging_conf:             Final[dict[str, bool]]                     = dict(
             prog_bar=True, on_step=True, on_epoch=True, logger=True, sync_dist=True
         )
-        self._meta_info = meta_info
-        self._lm_masking_mode: Final[str] = lm_masking_mode
-        self._switch_to_maginal_after: dict[str, int] = switch_to_maginal_after
         if switch_to_maginal_after:
             assert utils.safe_xor(
                 "epochs" in switch_to_maginal_after, 
@@ -679,30 +700,28 @@ class _RefineLM(pl.LightningModule):
         ################################################################################
         # Related to datasets
         ################################################################################
-        self._shuffle_train: Final[bool] = SHUFFLE_TRAINING_DATA
-        self._shuffle_val: Final[bool] = SHUFFLE_VALIDATION_DATA
-        self._training_collators = {
-            constants.PipelineModes.MLE_TRAINING: 
-                MLETrainingCollator(self._tokenizer, self._lm_masking_mode),
-            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING:
-                MarginalLikelihoodTrainingCollator(self._tokenizer, self._lm_masking_mode),
+        self._shuffle_train:       Final[bool]           = SHUFFLE_TRAINING_DATA
+        self._shuffle_val:         Final[bool]           = SHUFFLE_VALIDATION_DATA
+        self._training_collators:  Final[dict[str, Any]] = {
+            constants.PipelineModes.MLE_TRAINING:                 MLETrainingCollator               (self._tokenizer, self._lm_masking_mode),
+            constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: MarginalLikelihoodTrainingCollator(self._tokenizer, self._lm_masking_mode),
         }
 
         ################################################################################
         # Rel. to logging results for answer overlap estim.
         ################################################################################
-        self._path_log_results: Final[Path] = path_log_results
-        self._results_to_log: Optional[dict[str, dict[bool, dict[str, torch.Tensor]]]] = {}
-        self._labels_to_log: dict[str, str] = {}
+        self._results_to_log:   Optional[dict[str, dict[bool, dict[str, torch.Tensor]]]] = {}
+        self._labels_to_log:    dict[str, str] = {}
+        self._path_log_results: Final[Path]    = path_log_results
 
         ################################################################################
         # Specific to the optimizer, its scheduler
         ################################################################################
-        self._learning_rate: Final[float] = learning_rate
-        self._is_adamw: Final[bool] = is_adamw
-        self._weight_decay: Final[Optional[float]] = weight_decay
-        self._scheduler_type: Final[str] = scheduler_type
-        self._scheduler = None
+        self._weight_decay:   Final[Optional[float]] = weight_decay
+        self._learning_rate:  Final[float]           = learning_rate
+        self._is_adamw:       Final[bool]            = is_adamw
+        self._scheduler_type: Final[str]             = scheduler_type
+        self._scheduler                              = None
 
 
     def forward(self, *args, **kwargs):
@@ -710,7 +729,6 @@ class _RefineLM(pl.LightningModule):
 
 
     def _training_step_mle(self, batch, batch_idx):
-
         assert "labels" in batch, (
             "Labels must be in batch. We must mask the input section with -100"
         )
@@ -750,6 +768,9 @@ class _RefineLM(pl.LightningModule):
         p(y, z | x) = p(y | z, x) * p(z | x)
 
         """
+
+        utils.check_equal(self.      _model.device.type, "cuda")
+        utils.check_equal(self._fixed_model.device.type, "cuda")
 
         #######################################################################
         # Useful constants
@@ -809,18 +830,13 @@ class _RefineLM(pl.LightningModule):
             vocab_size
         )
 
-        class LossModes(str, enum.Enum):
-            PPO = "ppo"
-            STRONGEST_MLE = "strongest_mle"
-            MARGINAL_KL_W_FIXED = "marginal_kl_w_fixed"
-
-        loss_mode = LossModes.PPO
         label_pad_token_id = self._tokenizer.pad_token_id
         utils.check_equal(label_pad_token_id, self._tokenizer.pad_token_id)
+        utils.rich_print_zero_rank(f"\n\n[red bold]loss_mode: [white bold]{self._step_3_loss_mode.capitalize()}")
 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Sample preparation for per scratchpad stuff
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         samples_marginal = prep_samples_marginal(
             batch               = batch, 
             batch_size          = batch_size, 
@@ -834,19 +850,23 @@ class _RefineLM(pl.LightningModule):
             inputs_pad_token_id = self._tokenizer.pad_token_id,
         ) 
 
-        ITGSWRV_attention_mask      = samples_marginal.ITGSWRV_attention_mask
-        ITGSWRV_ids                 = samples_marginal.ITGSWRV_ids
+        ITGSWRV_attention_mask = samples_marginal.ITGSWRV_attention_mask
+        ITGSWRV_ids            = samples_marginal.ITGSWRV_ids
+        ITGS_ids               = samples_marginal.ITGS_ids
+        ITGS_attention_mask    = samples_marginal.ITGS_attention_mask
+        GS_ids                 = samples_marginal.GS_ids
+        GS_attention_mask      = samples_marginal.GS_attention_mask
         
         # MITGSWRV: Masked Input Then Generated Scratchpad With Reference Value
-        MITGSWRV_ids                = samples_marginal.MITGSWRV_ids
-        y_mask_is_not_pad           = samples_marginal.y_mask_is_not_pad
-        z_mask_is_not_pad           = samples_marginal.z_mask_is_not_pad
-        shift_y_mask_is_not_pad     = y_mask_is_not_pad[:, :, 1:]
-        shift_z_mask_is_not_pad     = z_mask_is_not_pad[:, :, 1:]
+        MITGSWRV_ids            = samples_marginal.MITGSWRV_ids
+        y_mask_is_not_pad       = samples_marginal.y_mask_is_not_pad
+        z_mask_is_not_pad       = samples_marginal.z_mask_is_not_pad
+        shift_y_mask_is_not_pad = y_mask_is_not_pad[:, :, 1:]
+        shift_z_mask_is_not_pad = z_mask_is_not_pad[:, :, 1:]
 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Learning rate
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         assert torch.all(
             ITGSWRV_ids[:, 0] != self._tokenizer.pad_token_id
         )
@@ -856,9 +876,9 @@ class _RefineLM(pl.LightningModule):
         utils.check_equal(len(optimizer.param_groups), 1)
         CONSOLE.print_zero_rank(f"\n[bold]Learning rate:[/] {lr:.3}")
 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute the logits
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         assert (ITGSWRV_ids[:, 0] != self._tokenizer.pad_token_id).all()
         
         ITGSWRV_logits = self._model(
@@ -872,9 +892,9 @@ class _RefineLM(pl.LightningModule):
                 attention_mask = ITGSWRV_attention_mask,
             ).logits
 
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Shift the logits and MITGSWRV: Masked Inputs Then Generated Scratchpads With Reference Value
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         shift_MITGSWRV_log_softmax, shift_MITGSWRV_is_pad, shift_MITGSWRV = prep_logits_and_MITGSWRV(
             vocab_size         = vocab_size,
             ITGSWRV_logits     = ITGSWRV_logits, 
@@ -897,10 +917,9 @@ class _RefineLM(pl.LightningModule):
         )
 
 
-        ###############################################################
+        #######################################################################
         # Extract the log-probs for the labels for y and z
-        ###############################################################
-
+        #######################################################################
         utils.check_equal(shift_MITGSWRV_log_softmax .shape, (batch_size, num_scratchpads, shift_seq_len))
         utils.check_equal(shift_MITGSWRV_is_pad      .shape, (batch_size, num_scratchpads, shift_seq_len))
         utils.check_equal(shift_y_mask_is_not_pad    .shape, (batch_size, num_scratchpads, shift_seq_len))
@@ -916,11 +935,10 @@ class _RefineLM(pl.LightningModule):
             z_log_probs_fixed = shift_MITGSWRV_log_softmax_fixed_model * mask_z
         
 
-        ###############################################################
+        #######################################################################
         # -> Log-likelihoods for y and for z
         # -> Importance Sampling Ratio
-        ###############################################################                
-
+        #######################################################################                
         utils.check_equal(z_log_probs       .shape, (batch_size, num_scratchpads, shift_seq_len))
         utils.check_equal(z_log_probs_fixed .shape, (batch_size, num_scratchpads, shift_seq_len))
 
@@ -939,20 +957,20 @@ class _RefineLM(pl.LightningModule):
         #######################################################################
         # Do MLE on the strongest scratchpad
         #######################################################################
-        if loss_mode == LossModes.STRONGEST_MLE:
-
+        if self._step_3_loss_mode == constants.LossModes.STRONGEST_MLE:
+            assert False
             most_helpful_log_probs = z_log_probs_per_seq.gather(
                 dim=-1, 
                 index=most_helpful_idx.unsqueeze(-1),
             ).squeeze(-1)
             
-            ref_final_ITGSWRV_input_ids      = ref_special_gather(tensor=ITGSWRV_ids,            most_helpful_idx=most_helpful_idx, batch_size=batch_size)
-            ref_final_ITGSWRV_attention_mask = ref_special_gather(tensor=ITGSWRV_attention_mask, most_helpful_idx=most_helpful_idx, batch_size=batch_size)
-            ref_final_MITGSWRV_ids           = ref_special_gather(tensor=MITGSWRV_ids,           most_helpful_idx=most_helpful_idx, batch_size=batch_size)
+            ref_final_ITGSWRV_input_ids      = _ref_special_gather(tensor=ITGSWRV_ids,            most_helpful_idx=most_helpful_idx, batch_size=batch_size)
+            ref_final_ITGSWRV_attention_mask = _ref_special_gather(tensor=ITGSWRV_attention_mask, most_helpful_idx=most_helpful_idx, batch_size=batch_size)
+            ref_final_MITGSWRV_ids           = _ref_special_gather(tensor=MITGSWRV_ids,           most_helpful_idx=most_helpful_idx, batch_size=batch_size)
 
-            final_ITGSWRV_input_ids      = special_gather(tensor=ITGSWRV_ids,            most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
-            final_ITGSWRV_attention_mask = special_gather(tensor=ITGSWRV_attention_mask, most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
-            final_MITGSWRV_ids           = special_gather(tensor=MITGSWRV_ids,           most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
+            final_ITGSWRV_input_ids      = _special_gather(tensor=ITGSWRV_ids,            most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
+            final_ITGSWRV_attention_mask = _special_gather(tensor=ITGSWRV_attention_mask, most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
+            final_MITGSWRV_ids           = _special_gather(tensor=MITGSWRV_ids,           most_helpful_idx=most_helpful_idx, batch_size=batch_size, num_scratchpads=num_scratchpads)
 
             assert -100 not in MITGSWRV_ids
             assert (ref_final_ITGSWRV_input_ids      == final_ITGSWRV_input_ids).all()
@@ -974,7 +992,7 @@ class _RefineLM(pl.LightningModule):
                 labels         = final_MITGSWRV_ids,
             ).loss
 
-        elif loss_mode == LossModes.MARGINAL_KL_W_FIXED:
+        elif self._step_3_loss_mode == constants.LossModes.MARGINAL_KL_W_FIXED:
 
             """
             Things to explore:
@@ -984,25 +1002,34 @@ class _RefineLM(pl.LightningModule):
             - KL instead of l2
             """
 
-            seq_z_log_probs = z_log_probs.sum(dim=-1)  # (batch_size, num_scratchpads)
-            seq_z_log_probs_fixed = z_log_probs_fixed.sum(dim=-1)  # (batch_size, num_scratchpads)
-            import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed  # (batch_size, num_scratchpads)
-            beta = 1/200
+            z_log_probs_seq = z_log_probs.sum(dim=-1)  # (batch_size, num_scratchpads)
+            # z_log_probs_fixed_seq = z_log_probs_fixed.sum(dim=-1).detach()  # (batch_size, num_scratchpads)
+            # import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed  # (batch_size, num_scratchpads)
+            
+            MARGINAL_KL_W_FIXED_BETA = 0
+            MARGINAL_KL_W_FIXED_REWARD_TEMPERATURE = 10.
 
-            y_prob_term = y_log_probs_fixed_per_seq.detach().softmax(dim=-1)
-            rl_reward = (seq_z_log_probs.exp() * y_prob_term).mean()  # Maybe substract the greedy reward to get the advantage
-            ppo_importance_sampling_penalty = z_log_probs.exp() * beta * (z_log_probs - z_log_probs_fixed)
+            y_prob_term_seq = (y_log_probs_fixed_per_seq.detach() * MARGINAL_KL_W_FIXED_REWARD_TEMPERATURE).softmax(dim=-1)
+            rl_reward_seq   = (z_log_probs_seq.exp()              * y_prob_term_seq).sum(-1)  # Marginal likelihood
+            ppo_importance_sampling_penalty_seq = MARGINAL_KL_W_FIXED_BETA * (z_log_probs - z_log_probs_fixed.detach()).sum(-1) ** 2
 
-            loss = ppo_importance_sampling_penalty.mean() - rl_reward.mean()
+            utils.check_equal(rl_reward_seq.ndim, 1)
 
-            self.log("rl_reward",                        rl_reward.item(),                        batch_size=self._batch_size[mode],  **self._logging_conf)
-            self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty.item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
-            self.log("loss",                             loss.item(),                             batch_size=self._batch_size[mode],  **self._logging_conf)
-            self.log("log_loss",                         loss.log().item(),                       batch_size=self._batch_size[mode],  **self._logging_conf)
+            assert not z_log_probs_fixed.requires_grad
+            assert rl_reward_seq.requires_grad
+            assert ppo_importance_sampling_penalty_seq.requires_grad
+
+            loss = ppo_importance_sampling_penalty_seq.sum(-1).mean(-1) - rl_reward_seq.mean(-1)
+
+            self.log("rl_reward",                        rl_reward_seq.mean().item(),                                batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty_seq.sum(-1).mean().item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("loss",                             loss.item(),                                                batch_size=self._batch_size[mode],  **self._logging_conf)
 
             utils.check_equal(loss.ndim, 0)
 
-        elif loss_mode == LossModes.PPO:
+            y_prob_term = y_prob_term_seq
+
+        elif self._step_3_loss_mode == constants.LossModes.PPO:
 
             """
             Things to explore:
@@ -1013,47 +1040,50 @@ class _RefineLM(pl.LightningModule):
             """
             
             experience = ppo.make_experience(
-                all_tokens_input_ids      =,
-                all_tokens_attention_mask =,
-                query_tensors             = batch["generation_input_ids"],
-                response_tensors          =,
-                scores                    = scores,
+                all_tokens_input_ids      = ITGS_ids,
+                all_tokens_attention_mask = ITGS_attention_mask,
+                query_tensors             = torch.repeat_interleave(batch["generation_input_ids"].unsqueeze(1), dim=1, repeats=num_scratchpads),
+                response_tensors          = GS_ids,
+                scores                    = y_log_probs_fixed_per_seq,
                 logprobs_generated        = z_log_probs,
                 logprobs_generated_fixed  = z_log_probs_fixed,
-                init_kl_coef              = init_kl_coef,
+                init_kl_coef              = 0.2,                  # from https://github.com/CarperAI/trlx/blob/e96c815dc152e230d9ad2ec10f8b84215df671d0/configs/ppo_config.yml#L39
                 value_model               = self._value_model,
+
+                batch_size                = batch_size,
+                num_scratchpads           = num_scratchpads,
                 
                 # Arguments for logging
                 batch_idx                 = batch_idx,
                 logger                    = self.logger,    
                 logger_kwargs             = self._logging_conf, 
-            ):
-
-            experience_unzipped = utils.dict_unzip(experience)
-            experience_unzipped = {
-                k: torch.cat(v) for k, v in experience_unzipped.items()
-            }
-
-            loss = ppo.loss(
-                experience_unzipped["logprobs"],
-                experience_unzipped["rewards"]，
-                experience_unzipped["values"]，
-                model,               # ?
-                experience_unzipped["query_tensors"],    
-                experience_unzipped["response_tensors"], 
-                config,     
             )
 
+            loss = ppo.loss(
+                model            = self._model,
+                value_model      = self._value_model,
+                all_logprobs     = experience["logprobs"],
+                all_rewards      = experience["rewards"],
+                all_values       = experience["values"],
+                query_tensors    = experience["query_tensors"],    
+                response_tensors = experience["response_tensors"], 
+                vf_coef          = 0.2,  # https://github.com/CarperAI/trlx/blob/e96c815dc152e230d9ad2ec10f8b84215df671d0/configs/ppo_config.yml#L46
+                cliprange_value  = 0.2,  # https://github.com/CarperAI/trlx/blob/e96c815dc152e230d9ad2ec10f8b84215df671d0/configs/ppo_config.yml#L44
+                cliprange        = 0.2,  # https://github.com/CarperAI/trlx/blob/e96c815dc152e230d9ad2ec10f8b84215df671d0/configs/ppo_config.yml#L45
+                gamma            = 1,    # https://github.com/CarperAI/trlx/blob/e96c815dc152e230d9ad2ec10f8b84215df671d0/configs/ppo_config.yml#L42
+                lambda_          = 0.95, # https://github.com/CarperAI/trlx/blob/e96c815dc152e230d9ad2ec10f8b84215df671d0/configs/ppo_config.yml#L39
+                num_scratchpads  = num_scratchpads,
+                batch_size       = self._batch_size[mode],
+            )
 
-            self.log("rl_reward",                        rl_reward.item(),                        batch_size=self._batch_size[mode],  **self._logging_conf)
-            self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty.item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
             self.log("loss",                             loss.item(),                             batch_size=self._batch_size[mode],  **self._logging_conf)
             self.log("log_loss",                         loss.log().item(),                       batch_size=self._batch_size[mode],  **self._logging_conf)
 
+            y_prob_term = y_log_probs_fixed_per_seq.exp().detach()
+
             utils.check_equal(loss.ndim, 0)
         else:
-            raise ValueError(f"Unknown loss mode {loss_mode}")
-
+            raise ValueError(f"Unknown loss mode {self._step_3_loss_mode}")
 
         with torch.no_grad():
             y_part_prob = y_prob_term
@@ -1064,22 +1094,22 @@ class _RefineLM(pl.LightningModule):
 
         if SHOW_SMALL_GENERATION_TABLE:
             show_small_generation_table(
-                scores=scores,
-                tokenizer=self._tokenizer,
-                inputs_outputs=input_ids_then_scratchpads.view(batch_size, num_scratchpads, -1),
-                demo_input_sp=demo_input_sp,
-                demo_input_idx=demo_input_idx,
+                scores         = scores,
+                tokenizer      = self._tokenizer,
+                demo_input_sp  = demo_input_sp,
+                demo_input_idx = demo_input_idx,
+                inputs_outputs = input_ids_then_scratchpads.view(batch_size, num_scratchpads, -1),
             )
 
         if SHOW_MULTI_SCRATCHPAD_TABLE:                    
             show_multi_scratchpad_table(
-                y_prob=y_part_prob,
-                z_prob=z_part_prob,
-                labels=batch["labels"], 
-                tokenizer=self._tokenizer,
-                shift_MITGSWRV=shift_MITGSWRV,
-                demo_input_idx=demo_input_idx,
-                num_scratchpads=num_scratchpads,
+                y_prob          = y_part_prob,
+                z_prob          = z_part_prob,
+                labels          = batch["labels"], 
+                tokenizer       = self._tokenizer,
+                shift_MITGSWRV  = shift_MITGSWRV,
+                demo_input_idx  = demo_input_idx,
+                num_scratchpads = num_scratchpads,
             )
 
         if SHOW_SCRATCHPAD_PADDING_TABLE :                    
@@ -1127,7 +1157,8 @@ class _RefineLM(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         mode = self._decide_training_mode()
-        
+        utils.check_equal("cuda", self._model.device.type)
+
 
         if mode == constants.PipelineModes.MLE_TRAINING:
             return self._training_step_mle(batch, batch_idx)
@@ -1160,39 +1191,23 @@ class _RefineLM(pl.LightningModule):
         return dps
 
 
-    def _generate(self, *, batch, generation_kwargs, batch_mode, model):
-        assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
+    def _generate(self, *, batch, generation_kwargs, model):
+        utils.check_contained("generation_input_ids", batch.keys())
+        utils.check_equal(batch["generation_input_ids"].ndim, 2)
+        assert torch.all(batch["generation_input_ids"][:, -1] != self._tokenizer.pad_token_id), (
+            "Batches need to be padded left for batch generation. Found a pad token at the end of a sequence."
+        )
         
-        generation_inputs = batch["generation_input_ids"]
+        generation_inputs = batch["generation_input_ids"]        
+        generation_attention_mask = batch["generation_attention_mask"]
         
-        if batch_mode:
-            generation_attention_mask = batch["generation_attention_mask"]
-            
-            raw_generation_outputs = model.generate(
-                input_ids=generation_inputs, 
-                attention_mask=generation_attention_mask, 
-                **generation_kwargs,
-            )
-            raw_generation_outputs = raw_generation_outputs[:, generation_inputs.shape[1]:]
-        else:
-            raw_generation_outputs_list =  []
-            for input_ids in generation_inputs:
-                input_ids = input_ids[input_ids != self._tokenizer.pad_token_id]
-                output = model.generate(
-                    input_ids=input_ids.reshape(1, -1),
-                    **generation_kwargs,
-                )
-                utils.check_equal(output.shape[0], 1)
-                raw_generation_outputs_list.append(
-                    output[0][input_ids.shape[0]:]
-                )
-            raw_generation_outputs = pad(
-                seq=raw_generation_outputs_list, 
-                pad_token_id=self._tokenizer.pad_token_id, 
-                direction="left"
-            )
-
-        return raw_generation_outputs
+        inputs_outputs = model.generate(
+            input_ids=generation_inputs, 
+            attention_mask=generation_attention_mask, 
+            **generation_kwargs,
+        )
+    
+        return inputs_outputs
 
 
     def on_train_epoch_start(self) -> None:
@@ -1206,81 +1221,148 @@ class _RefineLM(pl.LightningModule):
             self.trainer.val_check_interval = VAL_CHECK_INTERVAL
         self.trainer.reset_train_dataloader()
 
-        # If we're starting epoch n (like 1), and we have 
-        # self._switch_to_maginal_after["epochs"] == n (like 1), 
-        # then we need to make a copy of the model 
 
+        assert "steps" not in self._switch_to_maginal_after, self._switch_to_maginal_after
 
         is_changing_epoch = ("epochs" in self._switch_to_maginal_after 
             and self._switch_to_maginal_after["epochs"] == self.current_epoch
         )
-        is_changing_step = ("steps" in self._switch_to_maginal_after 
-            and self._switch_to_maginal_after["steps"] == self.global_step)
 
-        if is_changing_epoch or is_changing_step:
+        if is_changing_epoch:
             ###################################################################
             # Create the fixed model
             ###################################################################
             assert self._fixed_model is None, "We should only assign this once"
             CONSOLE.print_zero_rank(f"[red bold]MAKING A COPY OF THE MODEL")
-            self._fixed_model = clone_hf_model(self._model).eval().to(self._model.device)
+            
+            utils.check_equal("cuda", self._model.device.type)
+            self._fixed_model = _clone_hf_model(self._model).eval().to(self._model.device)
             for param in self._fixed_model.parameters():
                 param.requires_grad = False
 
             ###################################################################
             # Create the value model
             ###################################################################
-            model_copy = clone_hf_model(self._model).to(self._model.device)
+            model_copy = _clone_hf_model(self._model).to(self._model.device)
             model_copy.config.num_labels = 1
-            self._value_model = transformers.GPT2ForTokenClassification(model_copy.config, num_labels=1)
-            self._value_model.transformer = model_copy
+
+            self._value_model = ppo.GPT2ForTokenClassificationWithActivationOnTop(torch.tanh, model_copy.config)
+            self._value_model.transformer = model_copy.transformer
+            utils.check_isinstance(self._value_model.transformer, transformers.GPT2Model)
+            self._value_model.to(self._model.device)
             utils.check_equal(self._value_model.classifier.out_features, 1)
+
+            ###################################################################
+            # Change the learning rate of the optimizer
+            ###################################################################
+            for param_group in self.trainer.optimizers[0].param_groups:
+                param_group["lr"] = self._step_3_lr
 
 
     def validation_step(self, batch: Dict[str, torch.LongTensor], batch_idx):  # type: ignore[override]
+        utils.rich_print_zero_rank(f"\n\n[red bold]VALIDATION STEP!")
+        utils.check_equal("cuda", self._model.device.type)
+
         assert "labels" in batch, (
             "Labels must be in batch. We must mask the input section with -100"
         )
         mode: Final[str] = constants.PipelineModes.VALIDATION
         
-        # if self._fixed_model is None:
-        gen_outputs = self._generate(
-            model=self._model,
-            batch=batch, 
-            batch_mode=True,
-            generation_kwargs=self._generation_kwargs[mode], 
+
+        if self._fixed_model is None:
+            gen_outputs = self._generate(
+                model             = self._model,
+                batch             = batch, 
+                generation_kwargs = self._generation_kwargs[mode], 
+            )
+            generated_tokens = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
+
+            ###################################################################
+            # Compute Scratchpad Accuracy
+            ###################################################################
+            pos_clss = (generated_tokens == self._tokenizer.cls_token_id).long() * torch.arange(generated_tokens.shape[1]).unsqueeze(0).to(generated_tokens.device)
+            last_cls_pos = (pos_clss).max(dim=1).values.unsqueeze(-1)
+            del pos_clss
+            is_scratchpad = torch.arange(generated_tokens.shape[1]).repeat(
+                (generated_tokens.shape[0], 1)).to(generated_tokens.device) < last_cls_pos
+            gen_scratchpads = remove_padding(generated_tokens, is_scratchpad)
+            scratchpad_texts = _get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], self._tokenizer)
+            scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts), dtype=bool)
+            scratchpads_acc = np.mean(scratchpad_matches)
+
+
+            ###################################################################
+            # Compute Accuracy p(y | x, z) only
+            ###################################################################
+            gen_values     = remove_padding(generated_tokens, is_scratchpad.logical_not())
+            values_texts   = _get_values_texts(gen_values, batch["value"], tokenizer=self._tokenizer)
+            values_matches = np.fromiter((gen == ref for gen, ref in values_texts), dtype=bool)
+            values_acc     = np.mean(values_matches)
+
+            gen_outputs = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
+        else:
+            utils.check_equal("cuda", self._fixed_model.device.type)
+            ###################################################################
+            # Compute the scratchpad with the learnable model
+            ###################################################################
+            config_scratchpad                 = self._generation_kwargs[mode].copy()
+            config_scratchpad["eos_token_id"] = self._tokenizer.cls_token_id
+            gen_outputs = self._generate(
+                model             = self._model,
+                batch             = batch, 
+                generation_kwargs = config_scratchpad, 
+            )
+
+            ###################################################################
+            # Compute The accuracy of Scratchpads
+            ###################################################################
+            gen_scratchpads = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
+            scratchpad_texts = _get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], tokenizer=self._tokenizer)
+            scratchpad_matches = [gen == ref for gen, ref in scratchpad_texts]
+            scratchpads_acc = np.mean(scratchpad_matches)
+
+            ###################################################################
+            # Compute the answer after the scratchpad
+            ###################################################################
+            config_answer  = self._generation_kwargs[mode].copy()
+            
+            unpadded       = remove_padding(gen_outputs, gen_outputs != self._tokenizer.pad_token_id)
+            padded         = pad           (unpadded, pad_token_id=self._tokenizer.pad_token_id, direction="left")
+            attention_mask = generate_mask (unpadded, "left")
+
+            new_batch = dict(
+                generation_input_ids      = padded        .to(self._fixed_model.device),
+                generation_attention_mask = attention_mask.to(self._fixed_model.device),
+            )
+            gen_values = self._generate(
+                model             = self._fixed_model,
+                generation_kwargs = config_answer, 
+                batch             = new_batch, 
+            )[:, new_batch["generation_input_ids"].shape[1]:]
+
+            ###################################################################
+            # Compute Accuracy p(y | x, z) only
+            ###################################################################
+            values_texts   = _get_values_texts(gen_values, batch["value"], tokenizer=self._tokenizer)
+            values_matches = np.fromiter((gen == ref for gen, ref in values_texts), dtype=bool)
+            values_acc     = np.mean(values_matches)
+
+            gen_outputs = torch.cat([gen_scratchpads, gen_values], dim=1)
+
+        stats = build_match_stat_matrixes(
+            scratchpad_matches=scratchpad_matches, 
+            value_matches=values_matches
         )
-        # else:
-        #     config_scratch_pad = self._generation_kwargs[mode].copy()
-        #     config_scratch_pad["eos_token_id"] = self._tokenizer.cls_token_id
-        #     gen_outputs = self._generate(
-        #         model=self._model,
-        #         batch=batch, 
-        #         batch_mode=True,
-        #         generation_kwargs=config_scratch_pad, 
-        #     )
-            
-        #     config_answer = self._generation_kwargs[mode].copy()
-        #     unpadded = remove_padding(gen_outputs)
-        #     padded = pad(unpadded, "left", self._tokenizer.pad_token_id)
-        #     attention_mask = mask(padded, self._tokenizer.pad_token_id)
-        #     new_batch = dict(
-        #         input_ids=padded,
-        #         attention_mask=attention_mask,
-        #     )
 
-        #     gen_outputs = self._generate(
-        #         model=self._model,
-        #         batch=new_batch, 
-        #         batch_mode=True,
-        #         generation_kwargs=config_scratch_pad, 
-        #     )
-
-
-            
+        if utils.is_rank_zero():
+            stats_table = table.Table("Key", "Value")
+            for k, v in stats.items():
+                stats_table.add_row(f"[bold]{k}", f"{v:.0%}")
+                self.log(f"val/{k}", v, batch_size=self._batch_size[mode], **self._logging_conf)
+            utils.rich_print_zero_rank(stats_table)
 
         dps_generation = self._decode_per_sample(gen_outputs)
-        dps_labels = self._decode_per_sample(batch["input_ids"])
+        dps_labels     = self._decode_per_sample(batch["input_ids"])
 
         for_comparison = [(
             _clean_for_accuracy_computation(gen, self._tokenizer).strip(), 
@@ -1330,11 +1412,18 @@ class _RefineLM(pl.LightningModule):
 
         ppl_outputs = self._model(**{k: batch[k]for k in ["input_ids", "attention_mask", "labels"]})
 
-        self.log("val_em"  , em_accuracy,      batch_size=self._batch_size[mode], **self._logging_conf)
-        self.log("val_answ", final_answer_acc, batch_size=self._batch_size[mode], **self._logging_conf)
-        self.log("val_loss", ppl_outputs.loss, batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val/em"  ,          em_accuracy,             batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val/answ",          final_answer_acc,        batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val/loss",          ppl_outputs.loss.item(), batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val/scratchpad_em", scratchpads_acc,         batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val/values_acc", values_acc,         batch_size=self._batch_size[mode], **self._logging_conf)
 
-        utils.rich_print_zero_rank(f"val_em: {em_accuracy:.3%} val_answ: {final_answer_acc:.3%}")
+        utils.rich_print_zero_rank(
+            f"val_scratchpad_em: {scratchpads_acc:0.2%}, "
+            f"values_acc: {values_acc}, "
+            f"val_em: {em_accuracy:.2%}, "
+            f"val_answ: {final_answer_acc:.2%}"
+        )
         
         assert not torch.any(torch.isnan(ppl_outputs.loss)), "Loss is NaN"        
         return ppl_outputs
@@ -1343,7 +1432,7 @@ class _RefineLM(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         batch = cast(Dict[str, torch.LongTensor], batch)
         mode = constants.PipelineModes.VALIDATION
-        generated_decoded, label = self._generate(batch, self._generation_kwargs[mode])
+        generated_decoded, label = self._generate(self._model, batch, self._generation_kwargs[mode])
         _print_predictions(generated_decoded, label)
 
 
@@ -1419,21 +1508,6 @@ class _RefineLM(pl.LightningModule):
 
     def on_save_checkpoint(self, ckpt):
         return 
-
-
-def unpad_concatenate_repad(*, 
-    tensors: list[torch.LongTensor], 
-    attention_masks: list[torch.LongTensor],
-    new_padding_direction: str, 
-    pad_token_id: int
-):
-    for tensor in tensors:
-        utils.check_equal(tensor.ndims, 2), tensor.shape
-    lists_of_lists = [remove_padding(x, mask) for x, mask in more_itertools.zip_equal(tensors, attention_masks)]
-    concatenated = [list(itertools.chain.from_iterable(list_of_lists)) for list_of_lists in zip(*lists_of_lists)]
-    mask = generate_mask(concatenated, pad_token_id, new_padding_direction)
-    padded = pad(concatenated, pad_token_id, new_padding_direction)
-    return padded, mask
 
 
 def _clean_for_accuracy_computation(text, tokenizer):
@@ -1755,8 +1829,8 @@ class DictDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return self._len
 
-
-def pad(seq : Sequence[Sequence[int]], pad_token_id: int, direction: str) -> torch.LongTensor:
+@beartype
+def pad(seq : Sequence, pad_token_id: int, direction: str) -> torch.LongTensor:
     max_len = max(len(x) for x in seq)
     output = []
     for i, x in enumerate(seq):
@@ -1776,7 +1850,8 @@ def pad(seq : Sequence[Sequence[int]], pad_token_id: int, direction: str) -> tor
     return torch.LongTensor(output)
 
 
-def generate_mask(list_of_list: list[list[int]], direction: str) -> torch.LongTensor:
+@beartype
+def generate_mask(list_of_list: list, direction: str) -> torch.LongTensor:
     assert isinstance(list_of_list, list), type(list_of_list)
 
     mask: list[torch.Tensor] = []
@@ -1974,6 +2049,8 @@ class DDPInfo:
                 "Only ddp is supported for now."
             )
 
+            assert "SLURM_NNODES" in os.environ, f"You probably didn't launch with `srun`, but still setp the strategy to `{distribute_strategy}`."
+
             self.num_nodes = int(os.environ["SLURM_NNODES"])
             self.num_devices = "auto"
             self.global_rank = int(os.environ["SLURM_PROCID"])
@@ -2161,6 +2238,7 @@ class EntryPoints:
         lm_masking_mode=DEFAULT_LM_MASKING_MODE,
         switch_to_maginal_after: Optional[dict[str, int]] = DEFAULT_SWITCH_TO_MARGINAL_AFTER,
         new_wandb_run_id: bool = False,
+        step_3_loss_mode: str = DEFAULT_STEP_3_LOSS_MODE,
 
         #######################################################################
         # Model config
@@ -2175,6 +2253,7 @@ class EntryPoints:
         is_adamw: bool = DEFAULT_USE_ADAMW,
         weight_decay: Optional[float] = DEFAULT_WEIGHT_DECAY,
         learning_rate: float = DEFAULT_LEARNING_RATE,
+        step_3_lr: float = DEFAULT_STEP_3_LR,
         scheduler_type=DEFAULT_SCHEDULER_TYPE,
         accumulate_grad_batches: int = DEFAULT_GRADIENT_ACCUM,
 
@@ -2240,6 +2319,8 @@ class EntryPoints:
             is_gpt2_model=is_gpt2_model,
             lm_masking_mode=lm_masking_mode,
             learning_rate=learning_rate,
+            step_3_loss_mode=step_3_loss_mode, 
+            step_3_lr=step_3_lr,
             model_mode=model_mode,
             num_devices=ddp_info.num_devices,
             num_nodes=ddp_info.num_nodes,
@@ -2261,6 +2342,8 @@ class EntryPoints:
             # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
             CONSOLE.print_zero_rank("\n[red bold]WATCH OUT:[/] Not loading meta info from checkpoint.")
             meta_info = arg_meta_info
+            
+
             
             if new_wandb_run_id:
                 wandb_run_id_to_use = None
@@ -2284,6 +2367,8 @@ class EntryPoints:
                     arguments=all_arguments,
                 ),
             )
+            if utils.global_rank() == 0:
+                wandb.run.log_code(SCRIPT_DIR)
 
             if ddp_info.global_rank == 0:
                 assert wandb.run
@@ -2333,6 +2418,8 @@ class EntryPoints:
             generation_kwargs=meta_info["generation_kwargs"],
             is_adamw=meta_info["is_adamw"],
             learning_rate=meta_info["learning_rate"],
+            step_3_loss_mode=meta_info["step_3_loss_mode"],
+            step_3_lr=meta_info["step_3_lr"],
             lm_masking_mode=meta_info["lm_masking_mode"],
             meta_info=meta_info,
             model=base_model,

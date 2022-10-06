@@ -74,3 +74,9 @@ class LMMaskingMode(str, enum.Enum):
     """
     PLAIN_AUTOREGRESSIVE = "PLAIN_AUTOREGRESSIVE"
     MASK_INPUT = "mask_input"
+
+
+class LossModes(str, enum.Enum):
+    PPO = "ppo"
+    STRONGEST_MLE = "strongest_mle"
+    MARGINAL_KL_W_FIXED = "marginal_kl_w_fixed"

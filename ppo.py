@@ -10,11 +10,24 @@ Sources:
 import time
 from typing import *
 
+from beartype import beartype
 import torch
 import transformers
 import wandb
 
-import general_utils
+import general_utils as utils
+
+class GPT2ForTokenClassificationWithActivationOnTop(transformers.GPT2ForTokenClassification):
+    @beartype
+    def __init__(self, activation_fn: Callable[[torch.Tensor], torch.Tensor], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._activation_fn = activation_fn
+
+    def forward(self, *args, **kwargs):
+        logits = super().forward(*args, **kwargs).logits
+        if self._activation_fn:
+            return self._activation_fn(logits)
+        return logits
 
 
 def whiten(values, shift_mean=True):
@@ -54,19 +67,94 @@ def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Te
     return log_py
 
 
+
+
+def make_experience(
+    *,
+    all_tokens_input_ids:      torch.Tensor,
+    all_tokens_attention_mask: torch.Tensor,
+    query_tensors:             torch.Tensor,
+    response_tensors:          torch.Tensor,
+    scores:                    torch.Tensor,
+    logprobs_generated:        torch.Tensor,
+    logprobs_generated_fixed:  torch.Tensor,
+    value_model:               transformers.GPT2PreTrainedModel,
+    init_kl_coef:              float,
+
+    num_scratchpads:           int,
+    batch_size:                int,
+
+
+    # Arguments for logging
+    batch_idx:            int,
+    logger,    
+    logger_kwargs:        dict[str, Any], 
+):
+    """
+        Computes the KL reward and the value of the response.
+    """
+    
+    all_tokens_input_ids      = all_tokens_input_ids     .reshape(num_scratchpads * batch_size, -1)
+    all_tokens_attention_mask = all_tokens_attention_mask.reshape(num_scratchpads * batch_size, -1)
+    scores                    = scores                   .reshape(num_scratchpads * batch_size, -1)
+    logprobs_generated        = logprobs_generated       .reshape(num_scratchpads * batch_size, -1)
+    logprobs_generated_fixed  = logprobs_generated_fixed .reshape(num_scratchpads * batch_size, -1)
+    query_tensors             = query_tensors            .reshape(num_scratchpads * batch_size, -1)
+    response_tensors          = response_tensors         .reshape(num_scratchpads * batch_size, -1)
+
+
+    #######################################################################
+    # Compute the logits and the values with the trainable and fixed models
+    #######################################################################
+    # Precompute logprobs, values
+    with torch.no_grad():
+        v = value_model(
+            input_ids=all_tokens_input_ids, 
+            attention_mask=all_tokens_attention_mask,
+        ).logits
+        utils.check_equal(v.shape[-1], 1)
+        v = v.squeeze(-1)
+
+    start       = query_tensors.shape[1] - 1
+    end         = query_tensors.shape[1] + response_tensors.shape[1] - 1
+    all_values  = v[:, start - 1:end - 1]
+
+    #######################################################################
+    # Compute rewards
+    #######################################################################
+    kls                 = logprobs_generated - logprobs_generated_fixed
+    non_score_rewards   = - init_kl_coef * kls
+    all_rewards         = non_score_rewards.clone()
+    utils.check_equal(scores.shape, (all_rewards.shape[0], 1))
+    scores = scores.squeeze(-1)
+    all_rewards[:, -1] += scores
+    
+    return dict(
+        response_tensors = response_tensors,
+        query_tensors    = query_tensors,
+        logprobs         = logprobs_generated,
+        values           = all_values,
+        rewards          = all_rewards,
+    )
+    
+    
+
 def loss(
-    all_logprobs,      # floats, with_grad, batch_size x seq_len x vocab_size
-    all_rewards,       # floats, with_grad?, batch_size x seq_len 
-    all_values,        # floats, with_grad?, batch_size x seq_len
-    model,
-    value_model,
-    query_tensors,     # long, (no grad), [batch_size, seq_len]
-    response_tensors,  # long, (no_grad), [batch_size, max_seq_len]
-    gamma: float,            # namespace
-    lambda_: float,
-    cliprange_value: float,
-    cliprange: float,
-    vf_coef: float,
+    all_logprobs:     torch.Tensor,
+    all_rewards:      torch.Tensor,
+    all_values:       torch.Tensor,
+    query_tensors:    torch.Tensor,
+    response_tensors: torch.Tensor,
+
+    model:            transformers.GPT2LMHeadModel,
+    value_model:      transformers.GPT2ForTokenClassification,
+    gamma:            float,           
+    lambda_:          float,
+    cliprange_value:  float,
+    cliprange:        float,
+    vf_coef:          float,
+    num_scratchpads:  int,
+    batch_size:       int,
 ):
     """
     Parameters:
@@ -85,6 +173,15 @@ def loss(
         - response_tensors: [answer]
     """
 
+    all_logprobs     = all_logprobs    .reshape(num_scratchpads * batch_size, all_rewards.shape[-1]).detach()
+    all_values       = all_values      .reshape(num_scratchpads * batch_size, -1).detach()
+    all_rewards      = all_rewards     .reshape(num_scratchpads * batch_size, -1).detach()
+    query_tensors    = query_tensors   .reshape(num_scratchpads * batch_size, -1).detach()
+    response_tensors = response_tensors.reshape(num_scratchpads * batch_size, -1).detach()
+
+    utils.check_equal(all_values.shape[-1], response_tensors.shape[-1])
+    utils.check_equal(all_rewards.shape, all_logprobs.shape[:2])
+
     ###########################################################################
     # Compute the advantages
     ###########################################################################
@@ -100,7 +197,7 @@ def loss(
     
     advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
 
-    returns = advantages + all_values
+    returns = (advantages + all_values)
     advantages = whiten(advantages)
     advantages = advantages.detach()
 
@@ -108,8 +205,10 @@ def loss(
     # Compute the prediction
     ###########################################################################
     all_tokens = torch.cat((query_tensors, response_tensors), dim=1)
-    logits = model      (all_tokens)
-    vpred  = value_model(all_tokens)
+    logits = model(all_tokens).logits
+    vpred  = value_model(all_tokens).logits
+    utils.check_equal(vpred.shape[-1], 1)
+    vpred = vpred.squeeze(-1)
 
     ###########################################################################
     # Compute the loss of the value function
@@ -123,10 +222,9 @@ def loss(
         all_values + cliprange_value,
     )
 
-    vf_losses1 = (vpred        - returns) ** 2
-    vf_losses2 = (vpredclipped - returns) ** 2
+    vf_losses1 = (vpred        - returns.detach()) ** 2
+    vf_losses2 = (vpredclipped - returns.detach()) ** 2
     vf_loss = .5 * torch.mean(torch.max(vf_losses1, vf_losses2))
-
 
     ###########################################################################
     # Compute the loss of the policy (policy gradient loss)
@@ -134,9 +232,10 @@ def loss(
     # Only the generation part of the values / logprobs is needed
     logprob = logprobs_from_logits(logits[:, :-1, :], all_tokens[:, 1:])
     logprob = logprob[:, - gen_len:]
-    ratio = torch.exp(logprob - all_logprobs)
+    ratio = torch.exp(logprob - all_logprobs[:, -gen_len:].detach())
+    
 
-    pg_losses = - advantages * ratio
+    pg_losses  = - advantages * ratio
     pg_losses2 = - advantages * torch.clamp(
         ratio,
         1.0 - cliprange,
@@ -144,63 +243,9 @@ def loss(
     )
     pg_loss = torch.mean(torch.max(pg_losses, pg_losses2))
 
-
     ###########################################################################
     # Final loss
     ###########################################################################
     model_loss = pg_loss + vf_coef * vf_loss
 
     return model_loss
-
-
-def make_experience(
-    *,
-    all_tokens_input_ids:      torch.Tensor,
-    all_tokens_attention_mask: torch.Tensor,
-    query_tensors:             torch.Tensor,
-    response_tensors:          torch.Tensor,
-    scores:                    torch.Tensor,
-    logprobs_generated:        torch.Tensor,
-    logprobs_generated_fixed:  torch.Tensor,
-    value_model:               transformers.GPT2PreTrainedModel,
-    init_kl_coef:              float,
-    
-    # Arguments for logging
-    batch_idx:            int,
-    logger,    
-    logger_kwargs:        dict[str, Any], 
-):
-    """
-        Computes the KL reward and the value of the response.
-    """
-
-    #######################################################################
-    # Compute the logits and the values with the trainable and fixed models
-    #######################################################################
-    # Precompute logprobs, values
-    with torch.no_grad():
-        v = value_model(
-            input_ids=all_tokens_input_ids, 
-            attention_mask=all_tokens_attention_mask,
-        )
-
-    start       = query_tensors.shape[1] - 1
-    end         = query_tensors.shape[1] + response_tensors.shape[1] - 1
-    all_values  = v[:, start - 1:end - 1]
-
-    #######################################################################
-    # Compute rewards
-    #######################################################################
-    kls                 = logprobs_generated - logprobs_generated_fixed
-    non_score_rewards   = - init_kl_coef * kls
-    all_rewards         = non_score_rewards.clone()
-    all_rewards[:, -1] += scores
-    
-    return dict(
-        response_tensor = response_tensors,
-        query_tensor    = query_tensors,
-        logprobs        = logprobs_generated,
-        values          = all_values,
-        rewards         = all_rewards,
-    )
-    
