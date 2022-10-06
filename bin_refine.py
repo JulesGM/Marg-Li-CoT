@@ -612,36 +612,41 @@ def _get_values_texts(gen_values, ref_values, tokenizer):
 
 
 def build_match_stat_matrixes(scratchpad_matches, value_matches):
-    p_good_sp_baad_v = np.mean(np.logical_and(scratchpad_matches,                 np.logical_not(value_matches))) # p(good_sp, baad_v | x)
-    p_baad_sp_good_v = np.mean(np.logical_and(np.logical_not(scratchpad_matches), value_matches))               # p(baad_sp, good_v | x)
-    p_good_sp_good_v = np.mean(np.logical_and(scratchpad_matches,                 value_matches))               # p(good_sp, good_v | x)
-    p_baad_sp_baad_v = np.mean(np.logical_and(np.logical_not(scratchpad_matches), np.logical_not(value_matches))) # p(baad_sp, baad_v | x)
+    p_good_sp_baad_va = np.mean(np.logical_and(               scratchpad_matches ,  np.logical_not(value_matches)))  # p(good_sp, baad_v | x)
+    p_baad_sp_good_va = np.mean(np.logical_and(np.logical_not(scratchpad_matches),                 value_matches) )  # p(baad_sp, good_v | x)
+    p_good_sp_good_va = np.mean(np.logical_and(               scratchpad_matches ,                 value_matches) )  # p(good_sp, good_v | x)
+    p_baad_sp_baad_va = np.mean(np.logical_and(np.logical_not(scratchpad_matches),  np.logical_not(value_matches)))  # p(baad_sp, baad_v | x)
 
-    p_good_sp_knowing_good_v = p_good_sp_good_v / (p_good_sp_good_v + p_baad_sp_good_v) # p(good_sp | good_v, x)
-    p_good_sp_knowing_baad_v = p_good_sp_baad_v / (p_good_sp_baad_v + p_baad_sp_baad_v) # p(good_sp | baad_v, x)
-    p_baad_sp_knowing_good_v = p_baad_sp_good_v / (p_good_sp_good_v + p_baad_sp_good_v) # p(baad_sp | good_v, x)
-    p_baad_sp_knowing_baad_v = p_baad_sp_baad_v / (p_good_sp_baad_v + p_baad_sp_baad_v) # p(baad_sp | baad_v, x)
+    p_good_va = p_good_sp_good_va + p_baad_sp_good_va
+    p_baad_va = p_good_sp_baad_va + p_baad_sp_baad_va
+    p_good_sp = p_good_sp_good_va + p_good_sp_baad_va
+    p_baad_sp = p_baad_sp_good_va + p_baad_sp_baad_va
 
-    p_good_v_knowing_good_sp = p_good_sp_good_v / (p_good_sp_good_v + p_good_sp_baad_v) # p(good_v | good_sp, x)
-    p_good_v_knowing_baad_sp = p_baad_sp_good_v / (p_baad_sp_good_v + p_baad_sp_baad_v) # p(good_v | baad_sp, x)
-    p_baad_v_knowing_good_sp = p_good_sp_baad_v / (p_good_sp_good_v + p_good_sp_baad_v) # p(baad_v | good_sp, x)
-    p_baad_v_knowing_baad_sp = p_baad_sp_baad_v / (p_baad_sp_good_v + p_baad_sp_baad_v) # p(baad_v | baad_sp, x)
+    p_good_sp_knowing_good_va = p_good_sp_good_va / p_good_va  # p(good_sp | good_va, x)
+    p_good_sp_knowing_baad_va = p_good_sp_baad_va / p_baad_va  # p(good_sp | baad_va, x)
+    p_baad_sp_knowing_good_va = p_baad_sp_good_va / p_good_va  # p(baad_sp | good_va, x)
+    p_baad_sp_knowing_baad_va = p_baad_sp_baad_va / p_baad_va  # p(baad_sp | baad_va, x)
+
+    p_good_va_knowing_good_sp = p_good_sp_good_va / p_good_sp  # p(good_va | good_sp, x)
+    p_good_va_knowing_baad_sp = p_baad_sp_good_va / p_baad_sp  # p(good_va | baad_sp, x)
+    p_baad_va_knowing_good_sp = p_good_sp_baad_va / p_good_sp  # p(baad_va | good_sp, x)
+    p_baad_va_knowing_baad_sp = p_baad_sp_baad_va / p_baad_sp  # p(baad_va | baad_sp, x)
 
     return dict(
-        p_good_sp_baad_v=p_good_sp_baad_v,
-        p_baad_sp_good_v=p_baad_sp_good_v,
-        p_good_sp_good_v=p_good_sp_good_v,
-        p_baad_sp_baad_v=p_baad_sp_baad_v,
+        p_good_sp_baad_va=p_good_sp_baad_va,
+        p_baad_sp_good_va=p_baad_sp_good_va,
+        p_good_sp_good_va=p_good_sp_good_va,
+        p_baad_sp_baad_va=p_baad_sp_baad_va,
 
-        p_good_sp_knowing_good_v=p_good_sp_knowing_good_v,
-        p_good_sp_knowing_baad_v=p_good_sp_knowing_baad_v,
-        p_baad_sp_knowing_good_v=p_baad_sp_knowing_good_v,
-        p_baad_sp_knowing_baad_v=p_baad_sp_knowing_baad_v,
+        p_good_sp_knowing_good_va=p_good_sp_knowing_good_va,
+        p_good_sp_knowing_baad_va=p_good_sp_knowing_baad_va,
+        p_baad_sp_knowing_good_va=p_baad_sp_knowing_good_va,
+        p_baad_sp_knowing_baad_va=p_baad_sp_knowing_baad_va,
 
-        p_good_v_knowing_good_sp=p_good_v_knowing_good_sp,
-        p_good_v_knowing_baad_sp=p_good_v_knowing_baad_sp,
-        p_baad_v_knowing_good_sp=p_baad_v_knowing_good_sp,
-        p_baad_v_knowing_baad_sp=p_baad_v_knowing_baad_sp,
+        p_good_va_knowing_good_sp=p_good_va_knowing_good_sp,
+        p_good_va_knowing_baad_sp=p_good_va_knowing_baad_sp,
+        p_baad_va_knowing_good_sp=p_baad_va_knowing_good_sp,
+        p_baad_va_knowing_baad_sp=p_baad_va_knowing_baad_sp,
     )
 
 
