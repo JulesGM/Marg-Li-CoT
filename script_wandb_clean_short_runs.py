@@ -14,7 +14,7 @@ pretty_traceback.install()
 
 FILL_CHAR = " "
 NORMALIZED_LEN = 2
-NUM_MINUTES_TO_KEEP = 30
+NUM_MINUTES_TO_KEEP = 10
 PROJECT = "julesgm/SAG"
 
 

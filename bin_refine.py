@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
+"""
+
+Some notes:
+
+- Without a wandb_run_id -> Will not resume.
+- With a wandb_run_id -> Will resume.
+- With a wandb_run_id and new_wandb_run_id -> Will resume and create a new wandb run.
+
+"""
+
 print("Importing modules.")
 import collections
 import dataclasses
@@ -56,9 +66,10 @@ DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_STEP_3_LR = 0.0001
 DEFAULT_STEP_3_LOSS_MODE = constants.LossModes.MARGINAL_KL_W_FIXED 
 
-DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=3)
+DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=1)
 LIMIT_VAL_BATCHES = 10
-VAL_CHECK_INTERVAL = 30
+VAL_CHECK_INTERVAL = 1 / 3
+VAL_CHECK_INTERVAL_STEP_3 = 30
 
 DEFAULT_NUM_BEAMS = 20
 MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
@@ -71,7 +82,8 @@ DEFAULT_SCHEDULER_TYPE = constants.SchedulerTypes.LINEAR_WARMUP_CONSTANT
 WARMUP_EPOCHS = 1
 MAX_EPOCHS = 53
 
-DEFAULT_WANDB_ID: Optional[str] = None # "4sr5c621" 
+DEFAULT_WANDB_ID: Optional[str] = "23pxj5xe" 
+DEFAULT_FIXED_ANSWER_MODEL_WANDB_RUN_ID: Optional[str] = "1iis607f"
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
 
 DATA_MODE = constants.DataModes.HDF5_PRETOK
@@ -93,32 +105,35 @@ DEFAULT_CUSTOM_MODEL_CONFIG = dict(
 DEFAULT_GENERATION_KWARGS = {
     constants.PipelineModes.VALIDATION: 
     dict(
-        num_beams=1,
-        sample=False,
-        min_length=0,
-        use_cache=True,
-        do_sample=False,
-        constraints=None,
-        max_new_tokens=80,
-        length_penalty=1.0,
-        repetition_penalty=None,
+        num_beams=          1,
+        min_length=         0,
+        use_cache=          True,
+        do_sample=          False,
+        constraints=        None,
+        max_new_tokens=     80,
+        length_penalty=     1.0,
+        repetition_penalty= None,
     ),
     constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING: 
     dict(
-        min_length=0,
-        do_sample=False,
-        max_new_tokens=80, # This is a very important knob
+        min_length=     0,
+        do_sample=      False,
+        max_new_tokens= 80, # This is a very important knob
         
         # Not changing
-        use_cache=True,
-        constraints=None,
-        repetition_penalty=None,
-        num_beams=DEFAULT_NUM_BEAMS, 
-        num_return_sequences=DEFAULT_NUM_BEAMS, 
+        use_cache=            True,
+        constraints=          None,
+        repetition_penalty=   None,
+        num_beams=            DEFAULT_NUM_BEAMS, 
+        num_return_sequences= DEFAULT_NUM_BEAMS, 
         # diversity_penalty=0.25, # This needs to be tuned
         # num_beam_groups=DEFAULT_NUM_BEAMS,
     ),
 }
+
+
+# TODO: this is just a test, delete it
+GLOBAL_MODEL_CONTAINER = None
 
 
 ###############################################################################################
@@ -245,7 +260,7 @@ def prep_samples_marginal(
     label_pad_token_id:  int, 
     inputs_pad_token_id: int,
     batch_size:          int, 
-    num_scratchpads:     int, 
+    num_scratchpads:     int,   
 ) -> SamplesMarginal:
     
     utils.check_equal(label_pad_token_id, inputs_pad_token_id)
@@ -612,6 +627,7 @@ def _get_values_texts(gen_values, ref_values, tokenizer):
 
 
 def build_match_stat_matrixes(scratchpad_matches, value_matches):
+
     p_good_sp_baad_va = np.mean(np.logical_and(               scratchpad_matches ,  np.logical_not(value_matches)))  # p(good_sp, baad_v | x)
     p_baad_sp_good_va = np.mean(np.logical_and(np.logical_not(scratchpad_matches),                 value_matches) )  # p(baad_sp, good_v | x)
     p_good_sp_good_va = np.mean(np.logical_and(               scratchpad_matches ,                 value_matches) )  # p(good_sp, good_v | x)
@@ -627,26 +643,32 @@ def build_match_stat_matrixes(scratchpad_matches, value_matches):
     p_baad_sp_knowing_good_va = p_baad_sp_good_va / p_good_va  # p(baad_sp | good_va, x)
     p_baad_sp_knowing_baad_va = p_baad_sp_baad_va / p_baad_va  # p(baad_sp | baad_va, x)
 
-    p_good_va_knowing_good_sp = p_good_sp_good_va / p_good_sp  # p(good_va | good_sp, x)
-    p_good_va_knowing_baad_sp = p_baad_sp_good_va / p_baad_sp  # p(good_va | baad_sp, x)
+
     p_baad_va_knowing_good_sp = p_good_sp_baad_va / p_good_sp  # p(baad_va | good_sp, x)
     p_baad_va_knowing_baad_sp = p_baad_sp_baad_va / p_baad_sp  # p(baad_va | baad_sp, x)
 
-    return dict(
-        p_good_sp_baad_va=p_good_sp_baad_va,
-        p_baad_sp_good_va=p_baad_sp_good_va,
-        p_good_sp_good_va=p_good_sp_good_va,
-        p_baad_sp_baad_va=p_baad_sp_baad_va,
+    # Most important stat
+    p_good_va_knowing_good_sp = p_good_sp_good_va / p_good_sp  # p(good_va | good_sp, x)
+    # Second most important stat
+    p_good_va_knowing_baad_sp = p_baad_sp_good_va / p_baad_sp  # p(good_va | baad_sp, x)
 
-        p_good_sp_knowing_good_va=p_good_sp_knowing_good_va,
-        p_good_sp_knowing_baad_va=p_good_sp_knowing_baad_va,
-        p_baad_sp_knowing_good_va=p_baad_sp_knowing_good_va,
-        p_baad_sp_knowing_baad_va=p_baad_sp_knowing_baad_va,
+    return dict(
+        # p_good_sp_baad_va=p_good_sp_baad_va,
+        # p_good_sp_good_va=p_good_sp_good_va,
+        # p_baad_sp_good_va=p_baad_sp_good_va,
+        # p_baad_sp_baad_va=p_baad_sp_baad_va,
+
+        # p_good_sp_knowing_good_va=p_good_sp_knowing_good_va,
+        # p_good_sp_knowing_baad_va=p_good_sp_knowing_baad_va,
+        # p_baad_sp_knowing_good_va=p_baad_sp_knowing_good_va,
+        # p_baad_sp_knowing_baad_va=p_baad_sp_knowing_baad_va,
 
         p_good_va_knowing_good_sp=p_good_va_knowing_good_sp,
         p_good_va_knowing_baad_sp=p_good_va_knowing_baad_sp,
-        p_baad_va_knowing_good_sp=p_baad_va_knowing_good_sp,
-        p_baad_va_knowing_baad_sp=p_baad_va_knowing_baad_sp,
+        # p_baad_va_knowing_good_sp=p_baad_va_knowing_good_sp,
+        # p_baad_va_knowing_baad_sp=p_baad_va_knowing_baad_sp,
+
+        learnability_ratio=p_good_va_knowing_good_sp / p_good_va_knowing_baad_sp,
     )
 
 
@@ -685,6 +707,7 @@ class _RefineLM(pl.LightningModule):
         self._value_model:              Optional[transformers.GPT2PreTrainedModel] = None
         self._tokenizer:                Final[transformers.PreTrainedTokenizer]    = tokenizer
         self._fixed_model:              Optional[transformers.GPT2LMHeadModel]     = None
+        self._fixed_answer_model:       Optional[transformers.GPT2LMHeadModel]     = None
         self._model:                    Final[transformers.GPT2LMHeadModel]        = model
         self._wandb_logger:             Final[pl.loggers.WandbLogger]              = wandb_logger
         self._generation_kwargs:        Final[dict[str, Any]]                      = generation_kwargs
@@ -701,6 +724,7 @@ class _RefineLM(pl.LightningModule):
                 "epochs" in switch_to_maginal_after, 
                 "steps" in switch_to_maginal_after,
             )
+
 
         ################################################################################
         # Related to datasets
@@ -747,7 +771,7 @@ class _RefineLM(pl.LightningModule):
 
         self.log(
             "train_loss", 
-            outputs.loss, 
+            outputs.loss.item(), 
             batch_size=self._batch_size[constants.PipelineModes.MLE_TRAINING], 
             **self._logging_conf
         )
@@ -776,6 +800,7 @@ class _RefineLM(pl.LightningModule):
 
         utils.check_equal(self.      _model.device.type, "cuda")
         utils.check_equal(self._fixed_model.device.type, "cuda")
+        utils.check_equal(self._fixed_answer_model.device.type, "cuda")
 
         #######################################################################
         # Useful constants
@@ -897,6 +922,16 @@ class _RefineLM(pl.LightningModule):
                 attention_mask = ITGSWRV_attention_mask,
             ).logits
 
+        if self._fixed_answer_model is not self._fixed_model:
+            with torch.no_grad():
+                ITGSWRV_logits_fixed_answer_model = self._fixed_answer_model(
+                    input_ids      = ITGSWRV_ids,
+                    attention_mask = ITGSWRV_attention_mask,
+                ).logits
+        else:
+            ITGSWRV_logits_fixed_answer_model = ITGSWRV_logits_fixed_model
+
+
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Shift the logits and MITGSWRV: Masked Inputs Then Generated Scratchpads With Reference Value
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -920,6 +955,19 @@ class _RefineLM(pl.LightningModule):
             label_pad_token_id = label_pad_token_id,
             tokenizer          = self._tokenizer,
         )
+        
+        if ITGSWRV_logits_fixed_answer_model is ITGSWRV_logits_fixed_model:
+            shift_MITGSWRV_log_softmax_fixed_answer_model = shift_MITGSWRV_log_softmax_fixed_model.clone()
+        else:
+            shift_MITGSWRV_log_softmax_fixed_answer_model, _, _ = prep_logits_and_MITGSWRV(
+                vocab_size         = vocab_size,
+                ITGSWRV_logits     = ITGSWRV_logits_fixed_answer_model,
+                batch_size         = batch_size,
+                MITGSWRV_ids       = MITGSWRV_ids,
+                num_scratchpads    = num_scratchpads,
+                label_pad_token_id = label_pad_token_id,
+                tokenizer          = self._tokenizer,
+            )
 
 
         #######################################################################
@@ -936,8 +984,8 @@ class _RefineLM(pl.LightningModule):
         z_log_probs = shift_MITGSWRV_log_softmax * mask_z
         
         with torch.no_grad():
-            y_log_probs_fixed = shift_MITGSWRV_log_softmax_fixed_model * mask_y
-            z_log_probs_fixed = shift_MITGSWRV_log_softmax_fixed_model * mask_z
+            y_log_probs_fixed = shift_MITGSWRV_log_softmax_fixed_answer_model * mask_y
+            z_log_probs_fixed = shift_MITGSWRV_log_softmax_fixed_model        * mask_z
         
 
         #######################################################################
@@ -1011,7 +1059,7 @@ class _RefineLM(pl.LightningModule):
             # z_log_probs_fixed_seq = z_log_probs_fixed.sum(dim=-1).detach()  # (batch_size, num_scratchpads)
             # import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed  # (batch_size, num_scratchpads)
             
-            MARGINAL_KL_W_FIXED_BETA = 0
+            MARGINAL_KL_W_FIXED_BETA = 0.
             MARGINAL_KL_W_FIXED_REWARD_TEMPERATURE = 10.
 
             y_prob_term_seq = (y_log_probs_fixed_per_seq.detach() * MARGINAL_KL_W_FIXED_REWARD_TEMPERATURE).softmax(dim=-1)
@@ -1200,7 +1248,8 @@ class _RefineLM(pl.LightningModule):
         utils.check_contained("generation_input_ids", batch.keys())
         utils.check_equal(batch["generation_input_ids"].ndim, 2)
         assert torch.all(batch["generation_input_ids"][:, -1] != self._tokenizer.pad_token_id), (
-            "Batches need to be padded left for batch generation. Found a pad token at the end of a sequence."
+            "Batches need to be padded left for batch "
+            "generation. Found a pad token at the end of a sequence."
         )
         
         generation_inputs = batch["generation_input_ids"]        
@@ -1223,12 +1272,32 @@ class _RefineLM(pl.LightningModule):
         
         mode = self._decide_training_mode()
         if mode == constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING:
-            self.trainer.val_check_interval = VAL_CHECK_INTERVAL
+            self.trainer.val_check_interval = VAL_CHECK_INTERVAL_STEP_3
         self.trainer.reset_train_dataloader()
 
 
-        assert "steps" not in self._switch_to_maginal_after, self._switch_to_maginal_after
+        #######################################################################
+        # Tests on loading a future model.
+        #######################################################################
+        diff_python_ref = not self._fixed_answer_model is GLOBAL_MODEL_CONTAINER
+        diff_data_ptr = []
+        for k, v in self._fixed_answer_model.named_parameters().items():
+            diff_data_ptr.append(GLOBAL_MODEL_CONTAINER[k].data_ptr() != v.data_ptr())
+        diff_data_values = []
+        for k, v in self._fixed_answer_model.named_parameters().items():
+            diff_data_values.append(not torch.allclose(GLOBAL_MODEL_CONTAINER[k], v))
+        
+        if diff_python_ref or any(diff_data_ptr) or any(diff_data_values):
+            utils.rich_print_zero_rank(
+                f"[bold red]\nFailed to load the model from the future:\n"
+                f"\t- diff_python_ref:  {diff_python_ref},\n"
+                f"\t- diff_data_ptr:    {any(diff_data_ptr)},\n"
+                f"\t- diff_data_values: {any(diff_data_values)}[/bold red]\n"
+            )
+            raise RuntimeError()
 
+
+        assert "steps" not in self._switch_to_maginal_after, self._switch_to_maginal_after
         is_changing_epoch = ("epochs" in self._switch_to_maginal_after 
             and self._switch_to_maginal_after["epochs"] == self.current_epoch
         )
@@ -1237,21 +1306,27 @@ class _RefineLM(pl.LightningModule):
             ###################################################################
             # Create the fixed model
             ###################################################################
-            assert self._fixed_model is None, "We should only assign this once"
-            CONSOLE.print_zero_rank(f"[red bold]MAKING A COPY OF THE MODEL")
+            
+            CONSOLE.print_zero_rank(
+                f"[red bold]MAKING A COPY OF THE MODEL")
             
             utils.check_equal("cuda", self._model.device.type)
-            self._fixed_model = _clone_hf_model(self._model).eval().to(self._model.device)
+            self._fixed_model = _clone_hf_model(self._model
+                ).eval().to(self._model.device)
             for param in self._fixed_model.parameters():
                 param.requires_grad = False
-
+        
+            if self._fixed_answer_model is None:
+                self._fixed_answer_model = self._fixed_model
+            
             ###################################################################
             # Create the value model
             ###################################################################
             model_copy = _clone_hf_model(self._model).to(self._model.device)
             model_copy.config.num_labels = 1
 
-            self._value_model = ppo.GPT2ForTokenClassificationWithActivationOnTop(torch.tanh, model_copy.config)
+            self._value_model = ppo.GPT2ForTokenClassificationWithActivationOnTop(
+                torch.tanh, model_copy.config)
             self._value_model.transformer = model_copy.transformer
             utils.check_isinstance(self._value_model.transformer, transformers.GPT2Model)
             self._value_model.to(self._model.device)
@@ -1323,14 +1398,13 @@ class _RefineLM(pl.LightningModule):
             ###################################################################
             gen_scratchpads = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
             scratchpad_texts = _get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], tokenizer=self._tokenizer)
-            scratchpad_matches = [gen == ref for gen, ref in scratchpad_texts]
+            scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts))
             scratchpads_acc = np.mean(scratchpad_matches)
 
             ###################################################################
             # Compute the answer after the scratchpad
             ###################################################################
             config_answer  = self._generation_kwargs[mode].copy()
-            
             unpadded       = remove_padding(gen_outputs, gen_outputs != self._tokenizer.pad_token_id)
             padded         = pad           (unpadded, pad_token_id=self._tokenizer.pad_token_id, direction="left")
             attention_mask = generate_mask (unpadded, "left")
@@ -1340,7 +1414,7 @@ class _RefineLM(pl.LightningModule):
                 generation_attention_mask = attention_mask.to(self._fixed_model.device),
             )
             gen_values = self._generate(
-                model             = self._fixed_model,
+                model             = self._fixed_answer_model,
                 generation_kwargs = config_answer, 
                 batch             = new_batch, 
             )[:, new_batch["generation_input_ids"].shape[1]:]
@@ -1356,7 +1430,8 @@ class _RefineLM(pl.LightningModule):
 
         stats = build_match_stat_matrixes(
             scratchpad_matches=scratchpad_matches, 
-            value_matches=values_matches
+            value_matches=values_matches,
+            
         )
 
         if utils.is_rank_zero():
@@ -1420,8 +1495,8 @@ class _RefineLM(pl.LightningModule):
         self.log("val/em"  ,          em_accuracy,             batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val/answ",          final_answer_acc,        batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val/loss",          ppl_outputs.loss.item(), batch_size=self._batch_size[mode], **self._logging_conf)
+        self.log("val/values_acc",    values_acc,              batch_size=self._batch_size[mode], **self._logging_conf)
         self.log("val/scratchpad_em", scratchpads_acc,         batch_size=self._batch_size[mode], **self._logging_conf)
-        self.log("val/values_acc", values_acc,         batch_size=self._batch_size[mode], **self._logging_conf)
 
         utils.rich_print_zero_rank(
             f"val_scratchpad_em: {scratchpads_acc:0.2%}, "
@@ -2227,176 +2302,167 @@ def _make_config_path(checkpoints_root_dir: Path, run_name: str, wandb_run_id: s
 DATA_DIR = SCRIPT_DIR / "data"
 
 
-class EntryPoints:
-    @classmethod
-    @beartype
-    def main(
-        cls,
-        *, 
-        seed: int = 453345,
-        generation_kwargs=DEFAULT_GENERATION_KWARGS,
-        dataset_path: Union[Path, str] = DATA_DIR / "basic_arithmetic/80_3_6_200000",  # DATA_DIR / "basic_arithmetic/349_6_6_200000"
-        path_log_results=DEFAULT_CHECKPOINTS_DIR / "logs",
-        batch_sizes=None,
-        strategy=DEFAULT_DISTRIBUTE_STRATEGIES,
-        is_gpt2_model=True,
-        lm_masking_mode=DEFAULT_LM_MASKING_MODE,
-        switch_to_maginal_after: Optional[dict[str, int]] = DEFAULT_SWITCH_TO_MARGINAL_AFTER,
-        new_wandb_run_id: bool = False,
-        step_3_loss_mode: str = DEFAULT_STEP_3_LOSS_MODE,
+@beartype
+def main(
+    cls,
+    *, 
+    seed: int = 453345,
+    generation_kwargs=DEFAULT_GENERATION_KWARGS,
+    dataset_path: Union[Path, str] = DATA_DIR / "basic_arithmetic/80_3_6_200000",  # DATA_DIR / "basic_arithmetic/349_6_6_200000"
+    path_log_results=DEFAULT_CHECKPOINTS_DIR / "logs",
+    batch_sizes=None,
+    strategy=DEFAULT_DISTRIBUTE_STRATEGIES,
+    is_gpt2_model=True,
+    lm_masking_mode=DEFAULT_LM_MASKING_MODE,
+    new_wandb_run_id: bool = False,
+    step_3_loss_mode: str = DEFAULT_STEP_3_LOSS_MODE,
+    switch_to_maginal_after: Optional[dict[str, int]] = DEFAULT_SWITCH_TO_MARGINAL_AFTER,
 
-        #######################################################################
-        # Model config
-        #######################################################################
-        model_mode=DEFAULT_MODEL_MODE,
-        transformers_model_name: str = DEFAULT_HUGGING_FACE,
-        custom_model_config=DEFAULT_CUSTOM_MODEL_CONFIG,
-        
-        #######################################################################
-        # Optimization and regularization
-        #######################################################################
-        is_adamw: bool = DEFAULT_USE_ADAMW,
-        weight_decay: Optional[float] = DEFAULT_WEIGHT_DECAY,
-        learning_rate: float = DEFAULT_LEARNING_RATE,
-        step_3_lr: float = DEFAULT_STEP_3_LR,
-        scheduler_type=DEFAULT_SCHEDULER_TYPE,
-        accumulate_grad_batches: int = DEFAULT_GRADIENT_ACCUM,
+    #######################################################################
+    # Model config
+    #######################################################################
+    model_mode=DEFAULT_MODEL_MODE,
+    transformers_model_name: str = DEFAULT_HUGGING_FACE,
+    custom_model_config=DEFAULT_CUSTOM_MODEL_CONFIG,
+    
+    #######################################################################
+    # Optimization and regularization
+    #######################################################################
+    is_adamw: bool = DEFAULT_USE_ADAMW,
+    weight_decay: Optional[float] = DEFAULT_WEIGHT_DECAY,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
+    step_3_lr: float = DEFAULT_STEP_3_LR,
+    scheduler_type=DEFAULT_SCHEDULER_TYPE,
+    accumulate_grad_batches: int = DEFAULT_GRADIENT_ACCUM,
 
-        #######################################################################
-        # Related to resuming
-        #######################################################################
-        wandb_run_id: Optional[str] = DEFAULT_WANDB_ID,
-        checkpoints_folder: Union[Path, str] = DEFAULT_CHECKPOINTS_DIR,
-        wandb_config_path: Union[Path, str] = DEFAULT_WANDB_CONFIG_PATH,
-    ):
-        all_arguments = locals().copy()
-        
-        if utils.is_rank_zero():
-            utils.check_and_print_args(all_arguments, cls.main, True, SCRIPT_DIR)
+    #######################################################################
+    # Related to resuming
+    #######################################################################
+    wandb_run_id: Optional[Union[str, Path]] = DEFAULT_WANDB_ID,
+    # This is if we pretrain a separate model & want to use it for step 3 as the fixed model:
+    fixed_answer_model_wandb_run_id: Optional[Union[str, Path]] = DEFAULT_FIXED_ANSWER_MODEL_WANDB_RUN_ID,  
+    checkpoints_folder: Union[Path, str] = DEFAULT_CHECKPOINTS_DIR,
+    wandb_config_path: Union[Path, str] = DEFAULT_WANDB_CONFIG_PATH,
+):
+    all_arguments = locals().copy()
+    
+    if utils.is_rank_zero():
+        utils.check_and_print_args(all_arguments, cls.main, True, SCRIPT_DIR)
 
-        if TOKENIZER_MODE == constants.TokenizerModes.ARITHMETIC:
-            assert DATA_MODE == constants.DataModes.JSONL, (
-                f"We only support JSONL for arithmetic tokenizer, as things "
-                "are pre-tokenized in the h5 mode. {DATA_MODE}"
-            )
-
-        wandb_config_path = Path(wandb_config_path)
-        assert wandb_config_path.exists(), wandb_config_path
-        wandb_config = utils.load_json(wandb_config_path)
-
-        dataset_path = Path(dataset_path)
-        assert dataset_path.exists(), dataset_path
-
-        checkpoints_folder = Path(checkpoints_folder)
-        assert checkpoints_folder.exists(), checkpoints_folder
-        assert checkpoints_folder.is_dir(), checkpoints_folder
-
-        assert not (model_mode == constants.ModelModes.PRETRAINED and custom_model_config), (
-            "If you are not using a pretrained model, you can't use a custom model config."
+    if TOKENIZER_MODE == constants.TokenizerModes.ARITHMETIC:
+        assert DATA_MODE == constants.DataModes.JSONL, (
+            f"We only support JSONL for arithmetic tokenizer, as things "
+            "are pre-tokenized in the h5 mode. {DATA_MODE}"
         )
 
-        torch.use_deterministic_algorithms(mode=DETERMINISTIC)
-        run_name = dataset_path.name
-        last_ckpt_info = _get_last_checkpoint_path(
-            checkpoints_folder, None, wandb_run_id)
-        resuming = wandb_run_id is not None
+    wandb_config_path = Path(wandb_config_path)
+    assert wandb_config_path.exists(), wandb_config_path
+    wandb_config = utils.load_json(wandb_config_path)
+
+    dataset_path = Path(dataset_path)
+    assert dataset_path.exists(), dataset_path
+
+    checkpoints_folder = Path(checkpoints_folder)
+    assert checkpoints_folder.exists(), checkpoints_folder
+    assert checkpoints_folder.is_dir(), checkpoints_folder
+
+    assert not (model_mode == constants.ModelModes.PRETRAINED and custom_model_config), (
+        "If you are not using a pretrained model, you can't use a custom model config."
+    )
+
+    torch.use_deterministic_algorithms(mode=DETERMINISTIC)
+    run_name = dataset_path.name
+    last_ckpt_info = _get_last_checkpoint_path(
+        checkpoints_folder, None, wandb_run_id)
+    resuming = wandb_run_id is not None
+    
+    if resuming:
+        assert last_ckpt_info is not None, last_ckpt_info
+
+    if resuming:
+        latest_checkpoint = last_ckpt_info.path
+        CONSOLE.print_zero_rank(f"\n[bold]Will resume from:[/] \"{latest_checkpoint}\"")
+    else:
+        latest_checkpoint = None
+        CONSOLE.print_zero_rank(f"\n[bold]Not resuming: Will start from scratch.")
+
+    ddp_info = _setup_ddp(strategy)
+    arg_meta_info = _build_meta_info(
+        accumulate_grad_batches=accumulate_grad_batches,
+        batch_sizes=batch_sizes,
+        checkpoints_folder=checkpoints_folder,
+        custom_model_config=custom_model_config,
+        dataset_path=dataset_path,
+        generation_kwargs=generation_kwargs,
+        is_adamw=is_adamw,
+        is_gpt2_model=is_gpt2_model,
+        lm_masking_mode=lm_masking_mode,
+        learning_rate=learning_rate,
+        step_3_loss_mode=step_3_loss_mode, 
+        step_3_lr=step_3_lr,
+        model_mode=model_mode,
+        num_devices=ddp_info.num_devices,
+        num_nodes=ddp_info.num_nodes,
+        path_log_results=path_log_results,
+        run_name=run_name,
+        scheduler_type=scheduler_type,
+        seed=seed, 
+        transformers_model_name=transformers_model_name,
+        wandb_run_id=wandb_run_id,
+        weight_decay=weight_decay,
+        switch_to_maginal_after=switch_to_maginal_after,
+    )
+    
+    # Load the pretrained model. If a checkpoint is used, it will
+    # be loaded with the trainer.fit call, further in the code.
+    
+    base_model = None
+    tokenizer = None
+    datasets = None
+
+    if resuming:
+        CONSOLE.print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint)
+        # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
+        CONSOLE.print_zero_rank("\n[red bold]WATCH OUT:[/] Not loading meta info from checkpoint.")
+        meta_info = arg_meta_info
         
-        if resuming:
-            assert last_ckpt_info is not None, last_ckpt_info
-
-        if resuming:
-            latest_checkpoint = last_ckpt_info.path
-            CONSOLE.print_zero_rank(f"\n[bold]Will resume from:[/] \"{latest_checkpoint}\"")
+        if new_wandb_run_id:
+            wandb_run_id_to_use = None
         else:
-            latest_checkpoint = None
-            CONSOLE.print_zero_rank(f"\n[bold]Not resuming: Will start from scratch.")
+            wandb_run_id_to_use = wandb_run_id
+            
 
-        ddp_info = _setup_ddp(strategy)
-
-        arg_meta_info = _build_meta_info(
-            accumulate_grad_batches=accumulate_grad_batches,
-            batch_sizes=batch_sizes,
-            checkpoints_folder=checkpoints_folder,
-            custom_model_config=custom_model_config,
-            dataset_path=dataset_path,
-            generation_kwargs=generation_kwargs,
-            is_adamw=is_adamw,
-            is_gpt2_model=is_gpt2_model,
-            lm_masking_mode=lm_masking_mode,
-            learning_rate=learning_rate,
-            step_3_loss_mode=step_3_loss_mode, 
-            step_3_lr=step_3_lr,
-            model_mode=model_mode,
-            num_devices=ddp_info.num_devices,
-            num_nodes=ddp_info.num_nodes,
-            path_log_results=path_log_results,
-            run_name=run_name,
-            scheduler_type=scheduler_type,
-            seed=seed, 
-            transformers_model_name=transformers_model_name,
-            wandb_run_id=wandb_run_id,
-            weight_decay=weight_decay,
-            switch_to_maginal_after=switch_to_maginal_after,
+        del arg_meta_info
+        logger = pl.loggers.WandbLogger(
+            resume=False if new_wandb_run_id else "must", 
+            id=wandb_run_id_to_use,
+            project=wandb_config["project"],
+            entity=wandb_config["entity"],
+            log_model=False,
+            name=meta_info["run_name"],
+            config=dict(
+                num_nodes=ddp_info.num_nodes,
+                num_devices=ddp_info.num_devices,
+                meta_info=meta_info,
+                precision=PRECISION,
+                arguments=all_arguments,
+            ),
         )
-        
-        # Load the pretrained model. If a checkpoint is used, it will
-        # be loaded with the trainer.fit call, further in the code.
-        
-        if resuming:
-            CONSOLE.print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint)
-            # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
-            CONSOLE.print_zero_rank("\n[red bold]WATCH OUT:[/] Not loading meta info from checkpoint.")
-            meta_info = arg_meta_info
-            
+        if utils.global_rank() == 0:
+            wandb.run.log_code(SCRIPT_DIR)
 
-            
-            if new_wandb_run_id:
-                wandb_run_id_to_use = None
-            else:
-                wandb_run_id_to_use = wandb_run_id
-                
+        if ddp_info.global_rank == 0:
+            assert wandb.run
+            wandb.run.log_code(SCRIPT_DIR)
 
-            del arg_meta_info
-            logger = pl.loggers.WandbLogger(
-                resume=False if new_wandb_run_id else "must", 
-                id=wandb_run_id_to_use,
-                project=wandb_config["project"],
-                entity=wandb_config["entity"],
-                log_model=False,
-                name=meta_info["run_name"],
-                config=dict(
-                    num_nodes=ddp_info.num_nodes,
-                    num_devices=ddp_info.num_devices,
-                    meta_info=meta_info,
-                    precision=PRECISION,
-                    arguments=all_arguments,
-                ),
-            )
-            if utils.global_rank() == 0:
-                wandb.run.log_code(SCRIPT_DIR)
-
-            if ddp_info.global_rank == 0:
-                assert wandb.run
-                wandb.run.log_code(SCRIPT_DIR)
-        else:
-            CONSOLE.print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
-            meta_info, logger, wandb_run_id = _set_initial_state(
-                checkpoints_root_dir=checkpoints_folder,
-                arg_meta_info=arg_meta_info, 
-                global_rank=ddp_info.global_rank,
-                wandb_project=wandb_config["project"],
-                wandb_entity=wandb_config["entity"],
-            )
-            del arg_meta_info
-        
-        if batch_sizes is None:
-            batch_sizes = _compute_batch_size_defaults(
-                ddp_info.local_rank, transformers_model_name, batch_sizes, ACCELERATOR, 
-            )
-        
         tokenizer = _setup_tokenizer(
-            meta_info["transformers_model_name"], 
-            is_gpt2_model=meta_info["is_gpt2_model"],
+                meta_info["transformers_model_name"], 
+                is_gpt2_model=meta_info["is_gpt2_model"],
+            )
+        
+        CONSOLE.print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"")
+        datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
+            [constants.CVSets.TRAINING, constants.CVSets.VALIDATION]
         )
 
         base_model = _setup_base_model(
@@ -2406,17 +2472,76 @@ class EntryPoints:
             model_mode=meta_info["model_mode"], 
             tokenizer=tokenizer,
         )
+
+        pl_object = _RefineLM.load_from_checkpoint(
+            latest_checkpoint,
+            datasets=datasets,
+            model=base_model,
+            tokenizer=tokenizer,
+        )
+
+        if fixed_answer_model_wandb_run_id:
+            latest_checkpoint_fixed = _get_last_checkpoint_path(
+                checkpoints_folder, None, fixed_answer_model_wandb_run_id)
+            
+            fixed_answer_refine_lm = _RefineLM.load_from_checkpoint(
+                latest_checkpoint_fixed.path,
+                datasets=datasets,
+                model=base_model,
+                tokenizer=tokenizer,
+            )
+            
+            fixed_answer_model_lm = fixed_answer_refine_lm._model
+            for p in fixed_answer_model_lm.parameters():
+                p.requires_grad = False
+            pl_object._fixed_answer_model = fixed_answer_model_lm
+            
+    else:
+        pl_object = None
+
+        CONSOLE.print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
+        meta_info, logger, wandb_run_id = _set_initial_state(
+            checkpoints_root_dir=checkpoints_folder,
+            arg_meta_info=arg_meta_info, 
+            global_rank=ddp_info.global_rank,
+            wandb_project=wandb_config["project"],
+            wandb_entity=wandb_config["entity"],
+        )
+        del arg_meta_info
+    
+    if batch_sizes is None:
+        batch_sizes = _compute_batch_size_defaults(
+            ddp_info.local_rank, transformers_model_name, batch_sizes, ACCELERATOR, 
+        )
+
+    if tokenizer is None:
+        tokenizer = _setup_tokenizer(
+            meta_info["transformers_model_name"], 
+            is_gpt2_model=meta_info["is_gpt2_model"],
+        )
+
+    if base_model is None:
+        base_model = _setup_base_model(
+            custom_model_config=meta_info["custom_model_config"], 
+            hf_name=meta_info["transformers_model_name"], 
+            is_gpt2_model=meta_info["is_gpt2_model"],
+            model_mode=meta_info["model_mode"], 
+            tokenizer=tokenizer,
+        )
+
+    if datasets is None:
         CONSOLE.print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"")
         datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
             [constants.CVSets.TRAINING, constants.CVSets.VALIDATION]
         )
 
-        CONSOLE.print(f"\n[bold]Strategy:[/] {strategy}")
-        CONSOLE.print(f"\n[bold]ddp_info:[/] {vars(ddp_info)}\n")
+    CONSOLE.print(f"\n[bold]Strategy:[/] {strategy}")
+    CONSOLE.print(f"\n[bold]ddp_info:[/] {vars(ddp_info)}\n")
 
-        ###############################################################
-        # Build the pt-lightning dataloader
-        ###############################################################
+    ###############################################################
+    # Build the pt-lightning dataloader
+    ###############################################################
+    if pl_object is None:
         pl_object = _RefineLM(
             batch_sizes=batch_sizes,
             datasets=datasets,
@@ -2437,158 +2562,161 @@ class EntryPoints:
             
         )
 
-        ###############################################################
-        # All of the follwing arguments are very stable
-        ###############################################################
-        trainer = pl.Trainer(
-            accumulate_grad_batches=meta_info["accumulate_grad_batches"],
-            logger=logger,
-            num_nodes=ddp_info.num_nodes,
-            devices=ddp_info.num_devices,
-            gradient_clip_val=GRADIENT_CLIP_VAL,
-            default_root_dir=str(checkpoints_folder),
-            
-            # Accelerators 
-            deterministic=DETERMINISTIC,
-            strategy=strategy,
-            accelerator=ACCELERATOR,
-            precision=PRECISION,
-
-            # Looping stuff
-            max_epochs=MAX_EPOCHS,
-            limit_train_batches=LIMIT_TRAIN_BATCHES,
-            limit_val_batches=LIMIT_VAL_BATCHES,
-            reload_dataloaders_every_n_epochs=1,
-
-            callbacks=[
-                pl.callbacks.LearningRateMonitor(logging_interval="step"),
-                pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
-                    dirpath=(checkpoints_folder / meta_info["run_name"] / wandb_run_id) if wandb_run_id else "this is nonsense",
-                    every_n_epochs=1, 
-                    save_on_train_epoch_end=True, 
-                    save_last=True
-                ),
-            ]
-        )
+    ###############################################################
+    # All of the follwing arguments are very stable
+    ###############################################################
+    trainer = pl.Trainer(
+        accumulate_grad_batches=meta_info["accumulate_grad_batches"],
+        logger=logger,
+        num_nodes=ddp_info.num_nodes,
+        devices=ddp_info.num_devices,
+        gradient_clip_val=GRADIENT_CLIP_VAL,
+        default_root_dir=str(checkpoints_folder),
         
-        if resuming:
-            assert latest_checkpoint
-            trainer.fit(pl_object, ckpt_path=str(latest_checkpoint))
-        else:
-            trainer.fit(pl_object)
+        # Accelerators 
+        deterministic=DETERMINISTIC,
+        strategy=strategy,
+        accelerator=ACCELERATOR,
+        precision=PRECISION,
+
+        # Looping stuff
+        max_epochs=MAX_EPOCHS,
+        val_check_interval=VAL_CHECK_INTERVAL,
+        limit_train_batches=LIMIT_TRAIN_BATCHES,
+        limit_val_batches=LIMIT_VAL_BATCHES,
+        reload_dataloaders_every_n_epochs=1,
+
+        callbacks=[
+            pl.callbacks.LearningRateMonitor(logging_interval="step"),
+            pl.callbacks.ModelCheckpoint( # type: ignore[arg-type]
+                dirpath=(checkpoints_folder / meta_info["run_name"] / wandb_run_id) if wandb_run_id else "this is nonsense",
+                every_n_epochs=1, 
+                save_on_train_epoch_end=True, 
+                save_last=True
+            ),
+        ]
+    )
+    
+    if resuming: 
+        trainer.fit(pl_object, ckpt_path=latest_checkpoint)
+    else:
+        trainer.fit(pl_object,)
 
 
-    train = main
+@classmethod
+def json(cls, name: str, path: Path) -> Dict[str, Any]:
+    """
+    Run by loading a json file.
+    """
+
+    all_arguments = locals().copy()
+    utils.check_and_print_args(all_arguments, cls.main, True)
+
+    entrypoint_names = {
+        k for k in cls.__dict__.keys() - {'json'} if not k.startswith("_")}
+    assert hasattr(cls, name), f"{cls.__name__}.{name} doesn't exist. Valid options are: {entrypoint_names}"
+
+    with open(path, "r") as f:
+        args = json.load(f)
+    
+    return getattr(cls, name)(**args)
 
 
-    @classmethod
-    def json(cls, name: str, path: Path) -> Dict[str, Any]:
-        """
-        Run by loading a json file.
-        """
+@beartype
+def predict(
+    cls, 
+    *,
+    wandb_run_id: str = DEFAULT_WANDB_ID,
+    run_name: Optional[str] = None,
+    qty: int = 1,
+    dataset_path: Path = DATA_DIR / "basic_arithmetic/80_3_6_200000",
+    checkpoints_root_dir: Path = DEFAULT_CHECKPOINTS_DIR, 
+    distribute_strategy: Optional[str] = None,
+    batch_sizes: Optional[dict[str, int]] = None,
+    lm_masking_mode = DEFAULT_LM_MASKING_MODE,
+) -> None:
+    """
+    Run by loading a json file.
+    """
+    all_arguments = locals().copy()
+    utils.check_and_print_args(all_arguments, cls.predict, True)
+    
+    mode = constants.CVSets.VALIDATION
+    last_ckpt_info = _get_last_checkpoint_path(
+        checkpoints_root_dir, run_name, wandb_run_id)
+    run_name = last_ckpt_info.run_name
+    meta_info = utils.load_json(_make_config_path(
+        checkpoints_root_dir=checkpoints_root_dir, 
+        run_name=run_name, 
+        wandb_run_id=wandb_run_id,
+    ))
+    tokenizer = _setup_tokenizer(
+        meta_info["transformers_model_name"], 
+        is_gpt2_model=meta_info["is_gpt2_model"]
+    )  
+    base_model = _setup_base_model(
+        custom_model_config=meta_info["custom_model_config"], 
+        hf_name=meta_info["transformers_model_name"], 
+        is_gpt2_model=meta_info["is_gpt2_model"],
+        model_mode=meta_info["model_mode"], 
+        tokenizer=tokenizer,
+    )
+    datasets = _text_mode_build_dataset(
+        dataset_path, tokenizer, cv_sets=[constants.CVSets.VALIDATION])
+    ddp_info = _setup_ddp(distribute_strategy)
 
-        all_arguments = locals().copy()
-        utils.check_and_print_args(all_arguments, cls.main, True)
-
-        entrypoint_names = {
-            k for k in cls.__dict__.keys() - {'json'} if not k.startswith("_")}
-        assert hasattr(cls, name), f"{cls.__name__}.{name} doesn't exist. Valid options are: {entrypoint_names}"
-
-        with open(path, "r") as f:
-            args = json.load(f)
-        
-        return getattr(cls, name)(**args)
-
-
-    @classmethod
-    @beartype
-    def predict(
-        cls, 
-        *,
-        wandb_run_id: str = DEFAULT_WANDB_ID,
-        run_name: Optional[str] = None,
-        qty: int = 1,
-        dataset_path: Path = DATA_DIR / "basic_arithmetic/80_3_6_200000",
-        checkpoints_root_dir: Path = DEFAULT_CHECKPOINTS_DIR, 
-        distribute_strategy: Optional[str] = None,
-        batch_sizes: Optional[dict[str, int]] = None,
-        lm_masking_mode = DEFAULT_LM_MASKING_MODE,
-    ) -> None:
-        """
-        Run by loading a json file.
-        """
-        all_arguments = locals().copy()
-        utils.check_and_print_args(all_arguments, cls.predict, True)
-        
-        mode = constants.CVSets.VALIDATION
-        last_ckpt_info = _get_last_checkpoint_path(
-            checkpoints_root_dir, run_name, wandb_run_id)
-        run_name = last_ckpt_info.run_name
-        meta_info = utils.load_json(_make_config_path(
-            checkpoints_root_dir=checkpoints_root_dir, 
-            run_name=run_name, 
-            wandb_run_id=wandb_run_id,
-        ))
-        tokenizer = _setup_tokenizer(
+    if batch_sizes is None:
+        batch_sizes = _compute_batch_size_defaults(
+            ddp_info.local_rank, 
             meta_info["transformers_model_name"], 
-            is_gpt2_model=meta_info["is_gpt2_model"]
-        )  
-        base_model = _setup_base_model(
-            custom_model_config=meta_info["custom_model_config"], 
-            hf_name=meta_info["transformers_model_name"], 
-            is_gpt2_model=meta_info["is_gpt2_model"],
-            model_mode=meta_info["model_mode"], 
-            tokenizer=tokenizer,
-        )
-        datasets = _text_mode_build_dataset(
-            dataset_path, tokenizer, cv_sets=[constants.CVSets.VALIDATION])
-        ddp_info = _setup_ddp(distribute_strategy)
-
-        if batch_sizes is None:
-            batch_sizes = _compute_batch_size_defaults(
-                ddp_info.local_rank, 
-                meta_info["transformers_model_name"], 
-                batch_sizes,
-                accelerator=ACCELERATOR,
-            )
-
-        pl_object = _RefineLM(
-            model=base_model,
-            datasets=datasets,
-            tokenizer=tokenizer,
-            batch_sizes=batch_sizes,
-            generation_kwargs=meta_info["generation_kwargs"],
-            learning_rate=meta_info["learning_rate"],
-            path_log_results=meta_info["path_log_results"],
-            is_adamw=meta_info["is_adamw"],
-            weight_decay=meta_info["weight_decay"],
-            scheduler_type=meta_info["scheduler_type"],
-            meta_info=meta_info,
-            lm_masking_mode=lm_masking_mode,
-            switch_to_maginal_after=None,
-            wandb_logger=None,
-        )
-
-        trainer = pl.Trainer(
-            precision=PRECISION,
+            batch_sizes,
             accelerator=ACCELERATOR,
-            deterministic=DETERMINISTIC,
-            devices=ddp_info.num_devices,
-            num_nodes=ddp_info.num_nodes,
-            strategy=distribute_strategy,
-            default_root_dir=str(checkpoints_root_dir),
-            limit_predict_batches=math.ceil(qty / batch_sizes[mode]),
         )
 
-        trainer.validate(
-            pl_object,
-            ckpt_path=str(last_ckpt_info.path),
-        )
+    pl_object = _RefineLM(
+        model=base_model,
+        datasets=datasets,
+        tokenizer=tokenizer,
+        batch_sizes=batch_sizes,
+        generation_kwargs=meta_info["generation_kwargs"],
+        learning_rate=meta_info["learning_rate"],
+        path_log_results=meta_info["path_log_results"],
+        is_adamw=meta_info["is_adamw"],
+        weight_decay=meta_info["weight_decay"],
+        scheduler_type=meta_info["scheduler_type"],
+        meta_info=meta_info,
+        lm_masking_mode=lm_masking_mode,
+        switch_to_maginal_after=None,
+        wandb_logger=None,
+    )
+
+    # THIS IS FOR PREDICT
+    trainer = pl.Trainer(
+        precision=PRECISION,
+        accelerator=ACCELERATOR,
+        deterministic=DETERMINISTIC,
+        devices=ddp_info.num_devices,
+        num_nodes=ddp_info.num_nodes,
+        strategy=distribute_strategy,
+        default_root_dir=str(checkpoints_root_dir),
+        limit_predict_batches=math.ceil(qty / batch_sizes[mode]),
+        val_check_interval=VAL_CHECK_INTERVAL,
+    )
+
+    trainer.validate(
+        pl_object,
+        ckpt_path=str(last_ckpt_info.path),
+    )
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Defaulting to the `main` entrypoint.")
-        EntryPoints.main()
+        main()
     else:
-        fire.Fire(EntryPoints)
+        fire.Fire(dict(
+            main=main, 
+            train=main,
+            predict=predict,
+            json=json, 
+        ))
