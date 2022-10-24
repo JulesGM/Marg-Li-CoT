@@ -5,18 +5,74 @@ import re
 import rich.table as table
 from typing import *
 
+from beartype import beartype
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import transformers
 
 import console
 import constants
-import train_utils
 
 import general_utils as utils
 
 
 CONSOLE = console.Console(force_terminal=True, force_interactive=True, width=200)
+
+@beartype
+def pad(seq : Sequence, pad_token_id: int, direction: str) -> torch.LongTensor:
+    max_len = max(len(x) for x in seq)
+    output = []
+    for i, x in enumerate(seq):
+        if not isinstance(x, list):
+            assert isinstance(x, (torch.Tensor, np.ndarray)), type(x)
+            x = x.tolist()
+
+        if direction == "left":
+            output.append([pad_token_id] * (max_len - len(x)) + x)
+
+        elif direction == "right":
+            output.append(x + [pad_token_id] * (max_len - len(x)))
+
+        else:
+            raise ValueError(direction)
+
+    return torch.LongTensor(output)
+
+
+@beartype
+def generate_mask(list_of_list: list, direction: str) -> torch.LongTensor:
+    assert isinstance(list_of_list, list), type(list_of_list)
+
+    mask: list[torch.Tensor] = []
+    for x in list_of_list:
+        mask.append(torch.ones(len(x), dtype=torch.long))
+    attention_mask = pad(mask, 0, direction)
+    return attention_mask
+
+
+def prep_mle_train_and_valid(*, examples, eos_token_id: int, scratchpad_eos_token_id: int, lm_masking_mode: str, pad_token_id: int) -> None:
+    # We take a mini bit of slowness vs bug potential any day of the week right now
+    examples = examples.copy()
+
+    for example in examples:
+        # Transormations
+        example["input_ids"] = example["input"].tolist()       + example["scratchpad"].tolist() + [scratchpad_eos_token_id] + example["value"].tolist() + [eos_token_id]
+        if lm_masking_mode == constants.LMMaskingMode.MASK_INPUT:
+            example["labels"] = [-100] * len(example["input"]) + example["scratchpad"].tolist() + [scratchpad_eos_token_id] + example["value"].tolist() + [eos_token_id]
+        elif lm_masking_mode == constants.LMMaskingMode.PLAIN_AUTOREGRESSIVE:
+            example["labels"] = example["input_ids"].copy()
+        else:
+            raise ValueError(lm_masking_mode)
+
+    examples = utils.dict_unzip(examples)
+    examples = cast(dict[str, Union[Sequence[Any], torch.Tensor]], examples)
+
+    examples["attention_mask"] = generate_mask(examples["input_ids"], "right")  # NEEDS TO BE BEFORE PAD
+    examples["input_ids"] = pad(examples["input_ids"], pad_token_id, "right")
+    examples["labels"] = pad(examples["labels"], -100, "right")
+
+    return examples
 
 @dataclasses.dataclass
 class ValitationCollator:
@@ -43,7 +99,7 @@ class ValitationCollator:
 
         """
         
-        examples = train_utils.prep_mle_train_and_valid(
+        examples = prep_mle_train_and_valid(
             examples=raw_examples, 
             eos_token_id=self._tokenizer.eos_token_id, 
             pad_token_id=self._tokenizer.pad_token_id,
@@ -51,8 +107,8 @@ class ValitationCollator:
             lm_masking_mode=self._lm_masking_mode,
         )
 
-        examples["generation_input_ids"] = train_utils.pad(examples["input"], self._tokenizer.pad_token_id, "left")
-        examples["generation_attention_mask"] = train_utils.generate_mask(examples["input"], "left")
+        examples["generation_input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
+        examples["generation_attention_mask"] = generate_mask(examples["input"], "left")
     
         return examples
 
@@ -132,8 +188,8 @@ def shared_validation_step(lightning_module, batch, batch_idx, chainer):
         del pos_clss
         is_scratchpad = torch.arange(generated_tokens.shape[1]).repeat(
             (generated_tokens.shape[0], 1)).to(generated_tokens.device) < last_cls_pos
-        gen_scratchpads = train_utils.remove_padding(generated_tokens, is_scratchpad)
-        scratchpad_texts = train_utils._get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], lightning_module._tokenizer)
+        gen_scratchpads = remove_padding(generated_tokens, is_scratchpad)
+        scratchpad_texts = get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], lightning_module._tokenizer)
         scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts), dtype=bool)
         scratchpads_acc = np.mean(scratchpad_matches)
 
@@ -141,8 +197,8 @@ def shared_validation_step(lightning_module, batch, batch_idx, chainer):
         ###################################################################
         # Compute Accuracy p(y | x, z) only
         ###################################################################
-        gen_values     = train_utils.remove_padding(generated_tokens, is_scratchpad.logical_not())
-        values_texts   = train_utils._get_values_texts(gen_values, batch["value"], tokenizer=lightning_module._tokenizer)
+        gen_values     = remove_padding(generated_tokens, is_scratchpad.logical_not())
+        values_texts   = get_values_texts(gen_values, batch["value"], tokenizer=lightning_module._tokenizer)
         values_matches = np.fromiter((gen == ref for gen, ref in values_texts), dtype=bool)
         values_acc     = np.mean(values_matches)
 
@@ -164,17 +220,17 @@ def shared_validation_step(lightning_module, batch, batch_idx, chainer):
         # Compute The accuracy of Scratchpads
         ###################################################################
         gen_scratchpads = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
-        scratchpad_texts = train_utils._get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], tokenizer=lightning_module._tokenizer)
-        scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts))
+        scratchpad_texts = get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], tokenizer=lightning_module._tokenizer)
+        scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts), dtype=bool)
         scratchpads_acc = np.mean(scratchpad_matches)
 
         ###################################################################
         # Compute the answer after the scratchpad
         ###################################################################
         config_answer  = lightning_module._generation_kwargs[mode].copy()
-        unpadded       = train_utils.remove_padding(gen_outputs, gen_outputs != lightning_module._tokenizer.pad_token_id)
-        padded         = train_utils.pad           (unpadded, pad_token_id=lightning_module._tokenizer.pad_token_id, direction="left")
-        attention_mask = train_utils.generate_mask (unpadded, "left")
+        unpadded       = remove_padding(gen_outputs, gen_outputs != lightning_module._tokenizer.pad_token_id)
+        padded         = pad           (unpadded, pad_token_id=lightning_module._tokenizer.pad_token_id, direction="left")
+        attention_mask = generate_mask (unpadded, "left")
 
         new_batch = dict(
             generation_input_ids      = padded        .to(lightning_module._fixed_model.device),
@@ -189,7 +245,7 @@ def shared_validation_step(lightning_module, batch, batch_idx, chainer):
         ###################################################################
         # Compute Accuracy p(y | x, z) only
         ###################################################################
-        values_texts   = train_utils._get_values_texts(gen_values, batch["value"], tokenizer=lightning_module._tokenizer)
+        values_texts   = get_values_texts(gen_values, batch["value"], tokenizer=lightning_module._tokenizer)
         values_matches = np.fromiter((gen == ref for gen, ref in values_texts), dtype=bool)
         values_acc     = np.mean(values_matches)
 
@@ -208,8 +264,8 @@ def shared_validation_step(lightning_module, batch, batch_idx, chainer):
             lightning_module.log(f"val/{k}", v, batch_size=lightning_module._batch_size[mode], **lightning_module._logging_conf)
         utils.rich_print_zero_rank(stats_table)
 
-    dps_generation = lightning_module._decode_per_sample(gen_outputs)
-    dps_labels     = lightning_module._decode_per_sample(batch["input_ids"])
+    dps_generation = decode_per_sample(lightning_module._tokenizer, gen_outputs)
+    dps_labels     = decode_per_sample(lightning_module._tokenizer, batch["input_ids"])
 
     for_comparison = [(
         _clean_for_accuracy_computation(gen, lightning_module._tokenizer).strip(), 

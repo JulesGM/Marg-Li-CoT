@@ -1,10 +1,14 @@
 import dataclasses
+import itertools
 from pathlib import Path
 import random
 from typing import *
 
-import torch
+
+import more_itertools
 import pytorch_lightning as pl
+import rich.table as table
+import torch
 import transformers
 
 import general_utils as utils
@@ -41,6 +45,7 @@ class RLTraining(pl.LightningModule):
         self,
         *,
         batch_sizes: Dict[str, int],
+        chainer,
         datasets: Dict[str, torch.utils.data.Dataset],
         generation_kwargs: dict[str, Any],
         learning_rate: float,
@@ -57,26 +62,27 @@ class RLTraining(pl.LightningModule):
         shuffle_training_data,
         shuffle_validation_data,
         scheduler_fn,
-        dataloader_num_workers=0,
         fixed_scratchpad_model,
         fixed_answer_model,
+        dataloader_num_workers=0,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["model", "datasets", "tokenizer"])
+        self.save_hyperparameters(ignore=["model", "datasets", "tokenizer", "scheduler_fn"])
 
         utils.check_contained(
             loss_mode, 
             constants.LossModes.__members__.values()
         )
-        self.loss_mode                                                     = loss_mode
+        self._chainer                                                              = chainer                                       
+        self._loss_mode                                                            = loss_mode
         self._datasets:                 Final[Dict[str, torch.utils.data.Dataset]] = datasets
         self._value_model:              Optional[transformers.GPT2PreTrainedModel] = None
         self._tokenizer:                Final[transformers.PreTrainedTokenizer]    = tokenizer
         
         self._fixed_model:              Optional[transformers.GPT2LMHeadModel]     = fixed_scratchpad_model
         self._fixed_answer_model:       Optional[transformers.GPT2LMHeadModel]     = fixed_answer_model
-
         self._model:                    Final[transformers.GPT2LMHeadModel]        = model
+
         self._wandb_logger:             Final[pl.loggers.WandbLogger]              = wandb_logger
         self._generation_kwargs:        Final[dict[str, Any]]                      = generation_kwargs
         self._batch_size:               Final[dict[str, int]]                      = batch_sizes
@@ -86,7 +92,7 @@ class RLTraining(pl.LightningModule):
         self._logging_conf:             Final[dict[str, bool]]                     = dict(
             prog_bar=True, on_step=True, on_epoch=True, logger=True, sync_dist=True
         )
-        self._scheduler_fn                                                         = scheduler_fn
+        self._scheduler_function                                                   = scheduler_fn
 
 
 
@@ -95,7 +101,7 @@ class RLTraining(pl.LightningModule):
         ################################################################################
         self._shuffle_train:       Final[bool]           = shuffle_training_data
         self._shuffle_val:         Final[bool]           = shuffle_validation_data
-        self._training_collators:   Final[str]            = constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING
+        self._training_collator:   Final[str]            = MarginalLikelihoodTrainingCollator(self._tokenizer, self._lm_masking_mode)
 
         ################################################################################
         # Rel. to logging results for answer overlap estim.
@@ -112,6 +118,9 @@ class RLTraining(pl.LightningModule):
         self._is_adamw:       Final[bool]            = is_adamw
         self._scheduler_type: Final[str]             = scheduler_type
         self._scheduler                              = None
+
+    def get_model(self):
+        return self._model
 
 
     def forward(self, *args, **kwargs):
@@ -202,7 +211,7 @@ class RLTraining(pl.LightningModule):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Sample preparation for per scratchpad stuff
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        samples_marginal = train_utils.prep_samples_marginal(
+        samples_marginal = prep_samples_marginal(
             batch               = batch, 
             batch_size          = batch_size, 
             eos_token_id        = self._tokenizer.eos_token_id, 
@@ -257,14 +266,14 @@ class RLTraining(pl.LightningModule):
                 attention_mask = ITGSWRV_attention_mask,
             ).logits
 
-        if self._fixed_answer_model is not self._fixed_model:
-            with torch.no_grad():
-                ITGSWRV_logits_fixed_answer_model = self._fixed_answer_model(
-                    input_ids      = ITGSWRV_ids,
-                    attention_mask = ITGSWRV_attention_mask,
-                ).logits
-        else:
-            ITGSWRV_logits_fixed_answer_model = ITGSWRV_logits_fixed_model
+        # if self._fixed_answer_model is not self._fixed_model:
+        with torch.no_grad():
+            ITGSWRV_logits_fixed_answer_model = self._fixed_answer_model(
+                input_ids      = ITGSWRV_ids,
+                attention_mask = ITGSWRV_attention_mask,
+            ).logits
+        # else:
+        #     ITGSWRV_logits_fixed_answer_model = ITGSWRV_logits_fixed_model
 
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -291,18 +300,18 @@ class RLTraining(pl.LightningModule):
             tokenizer          = self._tokenizer,
         )
         
-        if ITGSWRV_logits_fixed_answer_model is ITGSWRV_logits_fixed_model:
-            shift_MITGSWRV_log_softmax_fixed_answer_model = shift_MITGSWRV_log_softmax_fixed_model.clone()
-        else:
-            shift_MITGSWRV_log_softmax_fixed_answer_model, _, _ = prep_logits_and_MITGSWRV(
-                vocab_size         = vocab_size,
-                ITGSWRV_logits     = ITGSWRV_logits_fixed_answer_model,
-                batch_size         = batch_size,
-                MITGSWRV_ids       = MITGSWRV_ids,
-                num_scratchpads    = num_scratchpads,
-                label_pad_token_id = label_pad_token_id,
-                tokenizer          = self._tokenizer,
-            )
+        # if ITGSWRV_logits_fixed_answer_model is ITGSWRV_logits_fixed_model:
+        #     shift_MITGSWRV_log_softmax_fixed_answer_model = shift_MITGSWRV_log_softmax_fixed_model.clone()
+        # else:
+        shift_MITGSWRV_log_softmax_fixed_answer_model, _, _ = prep_logits_and_MITGSWRV(
+            vocab_size         = vocab_size,
+            ITGSWRV_logits     = ITGSWRV_logits_fixed_answer_model,
+            batch_size         = batch_size,
+            MITGSWRV_ids       = MITGSWRV_ids,
+            num_scratchpads    = num_scratchpads,
+            label_pad_token_id = label_pad_token_id,
+            tokenizer          = self._tokenizer,
+        )
 
 
         #######################################################################
@@ -490,7 +499,7 @@ class RLTraining(pl.LightningModule):
             )
 
         if SHOW_MULTI_SCRATCHPAD_TABLE:                    
-            train_utils.show_multi_scratchpad_table(
+            show_multi_scratchpad_table(
                 y_prob          = y_part_prob,
                 z_prob          = z_part_prob,
                 labels          = batch["labels"], 
@@ -542,7 +551,7 @@ class RLTraining(pl.LightningModule):
 
 
     def validation_step(self, batch: Dict[str, torch.LongTensor], batch_idx):  # type: ignore[override]
-        return train_utils.shared_validation_step(self, batch, batch_idx)
+        return train_utils.shared_validation_step(self, batch, batch_idx, chainer=self._chainer)
 
 
     def predict_step(self, batch, batch_idx):
@@ -583,7 +592,7 @@ class RLTraining(pl.LightningModule):
     def train_dataloader(self):        
         return torch.utils.data.DataLoader(
             self._datasets[constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING],
-            collate_fn=self._training_collators[constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING],
+            collate_fn=self._training_collator,
             batch_size=self._batch_size[constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING],
             num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_train,
@@ -789,3 +798,114 @@ def prep_samples_marginal(
         y_mask_is_not_pad      = padded_y_mask_is_not_pad, 
         z_mask_is_not_pad      = padded_z_mask_is_not_pad,
     )
+
+
+@dataclasses.dataclass
+class MarginalLikelihoodTrainingCollator:
+    _tokenizer: transformers.PreTrainedTokenizer
+    _lm_masking_mode: str
+
+    def __call__(self, raw_examples):
+        """
+        - We have the questions, we have the answers. Nothing else.
+
+        Input ids: [question, chainer]
+        Labels: [answer]
+
+        loss: likelihoodOf[question, chainer, Generate(question), answer]
+
+        """
+
+        # We can only prepare the inputs for generation. 
+        # These need to be padded to the left.
+        examples = train_utils.prep_mle_train_and_valid(
+            examples=raw_examples, 
+            eos_token_id=self._tokenizer.eos_token_id,
+            scratchpad_eos_token_id=self._tokenizer.cls_token_id, 
+            pad_token_id=self._tokenizer.pad_token_id,
+            lm_masking_mode=self._lm_masking_mode,
+        )
+        
+        examples["generation_attention_mask"] = train_utils.generate_mask(examples["input"], "left")
+        examples["generation_input_ids"] = train_utils.pad(examples["input"], self._tokenizer.pad_token_id, "left")
+
+        return examples
+
+
+
+def _show_multi_scratchpad_table_format_text(ids, tokenizer) -> str:
+    return tokenizer.decode(ids
+                ).replace("<|pad|>", "").replace("<|endoftext|>", "<eos>"
+                ).replace("<|cls|>", "<cls>") 
+
+
+def show_multi_scratchpad_table(
+    *,
+    labels,
+    y_prob, 
+    z_prob, 
+    tokenizer, 
+    shift_MITGSWRV,
+    demo_input_idx,
+    num_scratchpads, 
+):
+    
+    y_prob = y_prob.clone().detach()
+    z_prob = z_prob.clone().detach()
+
+    table_ = table.Table("Text", "y score", "z score", "y rank", "z rank")
+
+    label_text = _show_multi_scratchpad_table_format_text([x for x in labels[demo_input_idx] if x > 0], tokenizer)
+    table_.add_row(f"[bold magenta]{label_text}[/]", "", "", "", "", end_section=True)
+
+    sort_y = torch.tensor(sorted(range(num_scratchpads), key=lambda i: y_prob[demo_input_idx, i], reverse=True))
+    y_prob_entry = y_prob[demo_input_idx, sort_y]
+    z_prob_entry = z_prob[demo_input_idx, sort_y]
+
+    argsort = sorted(range(num_scratchpads), key=lambda i: z_prob_entry[i], reverse=True)
+    ranks_z = {}
+    for i, pos in enumerate(argsort):
+        ranks_z[pos] = i
+
+    for rank_y in range(num_scratchpads):
+        maybe_color = ""
+        if rank_y == 0 and ranks_z[rank_y] == 0:
+            maybe_color = "[green bold]"
+        elif rank_y == 0:
+            maybe_color = "[blue bold]"
+        elif ranks_z[rank_y] == 0:
+            maybe_color = "[yellow bold]"
+
+        maybe_close = ""        
+        if maybe_color:
+            maybe_close = "[/]"
+
+        y_prob_color_coeff = int(y_prob_entry[rank_y].item() * 255)
+        y_prob_color = f"white on #{y_prob_color_coeff:02x}{y_prob_color_coeff:02x}{y_prob_color_coeff:02x}"
+
+        z_prob_color_coeff = int(z_prob_entry[rank_y].item() * 255)
+        z_prob_color = f"white on #{z_prob_color_coeff:02x}{z_prob_color_coeff:02x}{z_prob_color_coeff:02x}"
+
+        generated_text = _show_multi_scratchpad_table_format_text(shift_MITGSWRV[demo_input_idx, rank_y], tokenizer) 
+
+        output_str = []
+        for lab, gen in itertools.zip_longest(label_text, generated_text, fillvalue=" "):
+            if lab == gen:
+                output_str.append(gen)
+            else:
+                output_str.append(f"[red]{gen}[/red]")
+        diff_colored = "".join(output_str)
+        
+        if generated_text == label_text:
+            diff_colored = f"[white on green]{generated_text}[/white on green]"
+
+
+        table_.add_row(
+            maybe_color + diff_colored + maybe_close,
+            f"[{y_prob_color}]{y_prob_entry[rank_y].item():.3}", 
+            f"[{z_prob_color}]{z_prob_entry[rank_y].item():.3}",
+            str(rank_y),
+            str(ranks_z[rank_y])
+        )
+        
+    CONSOLE.print_zero_rank(table_)

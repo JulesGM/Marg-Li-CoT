@@ -43,9 +43,12 @@ import transformers  # type: ignore[import]
 import wandb
 
 import console
-import general_shared_constants as constants
+import constants
 import general_utils as utils
 
+import marginal
+import pretrain
+import train_utils
 
 Sequence.register(torch.Tensor)
 
@@ -66,7 +69,7 @@ DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_STEP_3_LR = 0.0001
 DEFAULT_STEP_3_LOSS_MODE = constants.LossModes.MARGINAL_KL_W_FIXED 
 
-DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = dict(epochs=1)
+DEFAULT_SWITCH_TO_MARGINAL_AFTER: Final[Optional[dict[str, int]]] = 1
 LIMIT_VAL_BATCHES = 10
 VAL_CHECK_INTERVAL = 1 / 3
 VAL_CHECK_INTERVAL_STEP_3 = 30
@@ -82,8 +85,8 @@ DEFAULT_SCHEDULER_TYPE = constants.SchedulerTypes.LINEAR_WARMUP_CONSTANT
 WARMUP_EPOCHS = 1
 MAX_EPOCHS = 53
 
-DEFAULT_WANDB_ID: Optional[str] = "23pxj5xe" 
-DEFAULT_FIXED_ANSWER_MODEL_WANDB_RUN_ID: Optional[str] = "1iis607f"
+DEFAULT_WANDB_ID: Optional[str] = "22luh7ae"  # 22luh7ae, 1 epoch
+DEFAULT_FIXED_ANSWER_MODEL_WANDB_RUN_ID: Optional[str] = "22luh7ae" # "14i2wrva"
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
 
 DATA_MODE = constants.DataModes.HDF5_PRETOK
@@ -226,83 +229,6 @@ def show_scratchpad_padding_table(
         )
     CONSOLE.print_zero_rank(table_)
 
-
-def _show_multi_scratchpad_table_format_text(ids, tokenizer) -> str:
-    return tokenizer.decode(ids
-                ).replace("<|pad|>", "").replace("<|endoftext|>", "<eos>"
-                ).replace("<|cls|>", "<cls>") 
-
-
-def show_multi_scratchpad_table(
-    *,
-    labels,
-    y_prob, 
-    z_prob, 
-    tokenizer, 
-    shift_MITGSWRV,
-    demo_input_idx,
-    num_scratchpads, 
-):
-    
-    y_prob = y_prob.clone().detach()
-    z_prob = z_prob.clone().detach()
-
-    table_ = table.Table("Text", "y score", "z score", "y rank", "z rank")
-
-    label_text = _show_multi_scratchpad_table_format_text([x for x in labels[demo_input_idx] if x > 0], tokenizer)
-    table_.add_row(f"[bold magenta]{label_text}[/]", "", "", "", "", end_section=True)
-
-    sort_y = torch.tensor(sorted(range(num_scratchpads), key=lambda i: y_prob[demo_input_idx, i], reverse=True))
-    y_prob_entry = y_prob[demo_input_idx, sort_y]
-    z_prob_entry = z_prob[demo_input_idx, sort_y]
-
-    argsort = sorted(range(num_scratchpads), key=lambda i: z_prob_entry[i], reverse=True)
-    ranks_z = {}
-    for i, pos in enumerate(argsort):
-        ranks_z[pos] = i
-
-    for rank_y in range(num_scratchpads):
-        maybe_color = ""
-        if rank_y == 0 and ranks_z[rank_y] == 0:
-            maybe_color = "[green bold]"
-        elif rank_y == 0:
-            maybe_color = "[blue bold]"
-        elif ranks_z[rank_y] == 0:
-            maybe_color = "[yellow bold]"
-
-        maybe_close = ""        
-        if maybe_color:
-            maybe_close = "[/]"
-
-        y_prob_color_coeff = int(y_prob_entry[rank_y].item() * 255)
-        y_prob_color = f"white on #{y_prob_color_coeff:02x}{y_prob_color_coeff:02x}{y_prob_color_coeff:02x}"
-
-        z_prob_color_coeff = int(z_prob_entry[rank_y].item() * 255)
-        z_prob_color = f"white on #{z_prob_color_coeff:02x}{z_prob_color_coeff:02x}{z_prob_color_coeff:02x}"
-
-        generated_text = _show_multi_scratchpad_table_format_text(shift_MITGSWRV[demo_input_idx, rank_y], tokenizer) 
-
-        output_str = []
-        for lab, gen in itertools.zip_longest(label_text, generated_text, fillvalue=" "):
-            if lab == gen:
-                output_str.append(gen)
-            else:
-                output_str.append(f"[red]{gen}[/red]")
-        diff_colored = "".join(output_str)
-        
-        if generated_text == label_text:
-            diff_colored = f"[white on green]{generated_text}[/white on green]"
-
-
-        table_.add_row(
-            maybe_color + diff_colored + maybe_close,
-            f"[{y_prob_color}]{y_prob_entry[rank_y].item():.3}", 
-            f"[{z_prob_color}]{z_prob_entry[rank_y].item():.3}",
-            str(rank_y),
-            str(ranks_z[rank_y])
-        )
-        
-    CONSOLE.print_zero_rank(table_)
 
 
 def show_small_generation_table(
@@ -589,7 +515,7 @@ def _load_data(
                 mask_key = key + "_attention_mask"
                 tokenized_data[set_][key] = []
 
-                tokenized_data[set_][key] = remove_padding(cached[key], cached[mask_key] == 1)
+                tokenized_data[set_][key] = train_utils.remove_padding(cached[key], cached[mask_key] == 1)
 
             for key in tqdm(text_keys, desc="Tokenizing", disable=not verbose):
                 tokenized_data[set_][key] = cached[key]
@@ -622,96 +548,6 @@ class DictDataset(torch.utils.data.Dataset):
 
     def __len__(self) -> int:
         return self._len
-
-@beartype
-def pad(seq : Sequence, pad_token_id: int, direction: str) -> torch.LongTensor:
-    max_len = max(len(x) for x in seq)
-    output = []
-    for i, x in enumerate(seq):
-        if not isinstance(x, list):
-            assert isinstance(x, (torch.Tensor, np.ndarray)), type(x)
-            x = x.tolist()
-
-        if direction == "left":
-            output.append([pad_token_id] * (max_len - len(x)) + x)
-
-        elif direction == "right":
-            output.append(x + [pad_token_id] * (max_len - len(x)))
-
-        else:
-            raise ValueError(direction)
-
-    return torch.LongTensor(output)
-
-
-@beartype
-def generate_mask(list_of_list: list, direction: str) -> torch.LongTensor:
-    assert isinstance(list_of_list, list), type(list_of_list)
-
-    mask: list[torch.Tensor] = []
-    for x in list_of_list:
-        mask.append(torch.ones(len(x), dtype=torch.long))
-    attention_mask = pad(mask, 0, direction)
-    return attention_mask
-
-
-def prep_mle_train_and_valid(*, examples, eos_token_id: int, scratchpad_eos_token_id: int, lm_masking_mode: str, pad_token_id: int) -> None:
-    # We take a mini bit of slowness vs bug potential any day of the week right now
-    examples = examples.copy()
-
-    for example in examples:
-        # Transormations
-        example["input_ids"] = example["input"].tolist()       + example["scratchpad"].tolist() + [scratchpad_eos_token_id] + example["value"].tolist() + [eos_token_id]
-        if lm_masking_mode == constants.LMMaskingMode.MASK_INPUT:
-            example["labels"] = [-100] * len(example["input"]) + example["scratchpad"].tolist() + [scratchpad_eos_token_id] + example["value"].tolist() + [eos_token_id]
-        elif lm_masking_mode == constants.LMMaskingMode.PLAIN_AUTOREGRESSIVE:
-            example["labels"] = example["input_ids"].copy()
-        else:
-            raise ValueError(lm_masking_mode)
-
-    examples = utils.dict_unzip(examples)
-    examples = cast(dict[str, Union[Sequence[Any], torch.Tensor]], examples)
-
-    examples["attention_mask"] = generate_mask(examples["input_ids"], "right")  # NEEDS TO BE BEFORE PAD
-    examples["input_ids"] = pad(examples["input_ids"], pad_token_id, "right")
-    examples["labels"] = pad(examples["labels"], -100, "right")
-
-    return examples
-
-
-@dataclasses.dataclass
-class MarginalLikelihoodTrainingCollator:
-    _tokenizer: transformers.PreTrainedTokenizer
-    _lm_masking_mode: str
-
-    def __call__(self, raw_examples):
-        """
-        - We have the questions, we have the answers. Nothing else.
-
-        Input ids: [question, chainer]
-        Labels: [answer]
-
-        loss: likelihoodOf[question, chainer, Generate(question), answer]
-
-        """
-
-        # We can only prepare the inputs for generation. 
-        # These need to be padded to the left.
-        examples = prep_mle_train_and_valid(
-            examples=raw_examples, 
-            eos_token_id=self._tokenizer.eos_token_id,
-            scratchpad_eos_token_id=self._tokenizer.cls_token_id, 
-            pad_token_id=self._tokenizer.pad_token_id,
-            lm_masking_mode=self._lm_masking_mode,
-        )
-        
-        examples["generation_attention_mask"] = generate_mask(examples["input"], "left")
-        examples["generation_input_ids"] = pad(examples["input"], self._tokenizer.pad_token_id, "left")
-
-        return examples
-
-
-
 
 
 def _text_mode_build_dataset(
@@ -781,7 +617,7 @@ class DDPInfo:
                 "Only ddp is supported for now."
             )
 
-            assert "SLURM_NNODES" in os.environ, f"You probably didn't launch with `srun`, but still setp the strategy to `{distribute_strategy}`."
+            assert "SLURM_NNODES" in os.environ, f"You probably didn't launch with `srun`, but still set the strategy to `{distribute_strategy}`."
 
             self.num_nodes = int(os.environ["SLURM_NNODES"])
             self.num_devices = "auto"
@@ -829,14 +665,13 @@ def _setup_tokenizer(hf_name: str, is_gpt2_model) -> transformers.PreTrainedToke
         raise ValueError(f"Unsupported tokenizer mode: {TOKENIZER_MODE}")
 
 
-def _setup_base_model(
+def _initialize_base_model(
     *,
     custom_model_config: Optional[dict[str, int]], 
     hf_name: str, 
     is_gpt2_model: bool,
     model_mode: str,
     tokenizer: transformers.PreTrainedTokenizer,
-    verbose: bool = True
 ) -> transformers.GPT2LMHeadModel:
     """
     ------------------------------------------
@@ -951,12 +786,159 @@ def _make_config_path(checkpoints_root_dir: Path, run_name: str, wandb_run_id: s
     return checkpoints_root_dir / run_name / wandb_run_id / f"last.json"
 
 
+
+def _setup_resuming_wandb_logger(
+    use_new_wandb_run_id, wandb_run_id, wandb_config, meta_info, ddp_info, all_arguments
+):
+    if use_new_wandb_run_id:
+            wandb_run_id_to_use = None
+    else:
+        wandb_run_id_to_use = wandb_run_id
+
+    logger = pl.loggers.WandbLogger(
+        resume=False if use_new_wandb_run_id else "must", 
+        id=wandb_run_id_to_use,
+        project=wandb_config["project"],
+        entity=wandb_config["entity"],
+        log_model=False,
+        name=meta_info["run_name"],
+        config=dict(
+            num_nodes=ddp_info.num_nodes,
+            num_devices=ddp_info.num_devices,
+            meta_info=meta_info,
+            precision=PRECISION,
+            arguments=all_arguments,
+        ),
+    )
+
+    if utils.global_rank() == 0:
+        wandb.run.log_code(SCRIPT_DIR)
+
+    if ddp_info.global_rank == 0:
+        assert wandb.run
+        wandb.run.log_code(SCRIPT_DIR)
+    
+    return logger
+
+
+def _init_in_rl_mode(
+    latest_checkpoint_path,
+    datasets,
+    base_model,
+    tokenizer,
+    fixed_answer_model_wandb_run_id,
+    checkpoints_folder,
+    meta_info,
+    batch_sizes,
+    logger,
+):
+    #######################################################################
+    # Initialize in RL mode.
+    #######################################################################
+    CONSOLE.print_zero_rank(f"[bold red]Done Training")
+
+    scratchpad_model = pretrain.PreTrain.load_from_checkpoint(
+        latest_checkpoint_path,
+        datasets=datasets,
+        model=base_model,
+        tokenizer=tokenizer,
+        scheduler_fn=SCHEDULER_FN,
+    )
+
+    fixed_model = train_utils.clone_hf_model(scratchpad_model._model)
+    train_utils.fix_model_params_in_place(fixed_model)
+    
+    fixed_answer_model = None
+    if fixed_answer_model_wandb_run_id:
+        latest_checkpoint_fixed = _get_last_checkpoint_path(
+            checkpoints_folder, None, fixed_answer_model_wandb_run_id)
+        
+        fixed_answer_refine_lm = pretrain.PreTrain.load_from_checkpoint(
+            latest_checkpoint_fixed.path,
+            datasets=datasets,
+            model=base_model,
+            tokenizer=tokenizer,
+            scheduler_fn=SCHEDULER_FN,
+        )
+        
+        fixed_answer_model = train_utils.clone_hf_model(fixed_answer_refine_lm._model)
+        train_utils.fix_model_params_in_place(fixed_answer_model)
+    
+    if fixed_answer_model is None:
+        assert False, "This approach does not currently work"
+        fixed_answer_model = fixed_model.clone()
+        train_utils.fix_model_params_in_place(fixed_answer_model) # likely useless
+
+    return marginal.RLTraining(
+        fixed_scratchpad_model  = fixed_model,
+        fixed_answer_model      = fixed_answer_model, 
+        model                   = base_model,
+
+        loss_mode               = meta_info["step_3_loss_mode"],
+        chainer                 = CHAINER,
+        batch_sizes             = batch_sizes,
+        datasets                = datasets,
+        generation_kwargs       = meta_info["generation_kwargs"],
+        is_adamw                = meta_info["is_adamw"],
+        learning_rate           = meta_info["learning_rate"],
+        lm_masking_mode         = meta_info["lm_masking_mode"],
+        meta_info               = meta_info,
+        path_log_results        = meta_info["path_log_results"],
+        scheduler_type          = constants.SchedulerTypes.CONSTANT,
+        scheduler_fn            = SCHEDULER_FN,
+        shuffle_training_data   = SHUFFLE_TRAINING_DATA,
+        shuffle_validation_data = SHUFFLE_VALIDATION_DATA,
+        tokenizer               = tokenizer,
+        wandb_logger            = logger,
+        weight_decay            = meta_info["weight_decay"],
+    )
+
+
+def _init_in_mle_mode(batch_sizes, datasets, meta_info, base_model, tokenizer, logger):
+    return pretrain.PreTrain(
+            batch_sizes             = batch_sizes,
+            chainer                 = meta_info["chainer"],
+            datasets                = datasets,
+            generation_kwargs       = meta_info["generation_kwargs"],
+            is_adamw                = meta_info["is_adamw"],
+            learning_rate           = meta_info["learning_rate"],
+            lm_masking_mode         = meta_info["lm_masking_mode"],
+            meta_info               = meta_info,
+            model                   = base_model,
+            path_log_results        = meta_info["path_log_results"],
+            scheduler_type          = meta_info["scheduler_type"],
+            scheduler_fn            = SCHEDULER_FN,
+            shuffle_training_data   = SHUFFLE_TRAINING_DATA,
+            shuffle_validation_data = SHUFFLE_VALIDATION_DATA,
+            tokenizer               = tokenizer,
+            wandb_logger            = logger,
+            weight_decay            = meta_info["weight_decay"],
+        )
+
+
+def _should_init_rl_mode(meta_info, latest_checkpoint_path):
+    #######################################################################
+    # Figure out if we need to resume in MLE or RL mode.
+    #######################################################################
+    # Warning:
+    # We only support starting RL mode from it's start, we don't support
+    # resuming from a checkpoint in RL mode. That's an important distinction.
+    #######################################################################
+    ckpt = torch.load(latest_checkpoint_path, map_location="cpu")
+    epoch = ckpt["epoch"]
+    global_step = ckpt["global_step"]
+    CONSOLE.print_zero_rank(f"\n[bold]Epoch in checkpoint:[/] {epoch}, [bold]global step in checkpoint:[/] {global_step}")
+    del ckpt
+    assert epoch <= meta_info["switch_to_maginal_after"] - 1, epoch
+
+    return epoch == meta_info["switch_to_maginal_after"] - 1 and global_step > 0
+
+
 DATA_DIR = SCRIPT_DIR / "data"
 
 
 @beartype
 def main(
-    cls,
     *, 
     seed: int = 453345,
     generation_kwargs=DEFAULT_GENERATION_KWARGS,
@@ -966,7 +948,7 @@ def main(
     strategy=DEFAULT_DISTRIBUTE_STRATEGIES,
     is_gpt2_model=True,
     lm_masking_mode=DEFAULT_LM_MASKING_MODE,
-    new_wandb_run_id: bool = False,
+    use_new_wandb_run_id: bool = False,
     step_3_loss_mode: str = DEFAULT_STEP_3_LOSS_MODE,
     switch_to_maginal_after: Optional[dict[str, int]] = DEFAULT_SWITCH_TO_MARGINAL_AFTER,
 
@@ -999,7 +981,7 @@ def main(
     all_arguments = locals().copy()
     
     if utils.is_rank_zero():
-        utils.check_and_print_args(all_arguments, cls.main, True, SCRIPT_DIR)
+        utils.check_and_print_args(all_arguments, main, False, SCRIPT_DIR)
 
     if TOKENIZER_MODE == constants.TokenizerModes.ARITHMETIC:
         assert DATA_MODE == constants.DataModes.JSONL, (
@@ -1013,8 +995,8 @@ def main(
 
     dataset_path = Path(dataset_path)
     assert dataset_path.exists(), dataset_path
-
     checkpoints_folder = Path(checkpoints_folder)
+
     assert checkpoints_folder.exists(), checkpoints_folder
     assert checkpoints_folder.is_dir(), checkpoints_folder
 
@@ -1032,16 +1014,17 @@ def main(
         assert last_ckpt_info is not None, last_ckpt_info
 
     if resuming:
-        latest_checkpoint = last_ckpt_info.path
-        CONSOLE.print_zero_rank(f"\n[bold]Will resume from:[/] \"{latest_checkpoint}\"")
+        latest_checkpoint_path = last_ckpt_info.path
+        CONSOLE.print_zero_rank(f"\n[bold]Will resume from:[/] \"{latest_checkpoint_path}\"")
     else:
-        latest_checkpoint = None
+        latest_checkpoint_path = None
         CONSOLE.print_zero_rank(f"\n[bold]Not resuming: Will start from scratch.")
 
     ddp_info = _setup_ddp(strategy)
     arg_meta_info = _build_meta_info(
         accumulate_grad_batches=accumulate_grad_batches,
         batch_sizes=batch_sizes,
+        chainer=CHAINER,
         checkpoints_folder=checkpoints_folder,
         custom_model_config=custom_model_config,
         dataset_path=dataset_path,
@@ -1071,53 +1054,55 @@ def main(
     base_model = None
     tokenizer = None
     datasets = None
+    pl_object = None
+
+        
+    if batch_sizes is None:
+        batch_sizes = _compute_batch_size_defaults(
+            ddp_info.local_rank, 
+            transformers_model_name, 
+            batch_sizes, 
+            ACCELERATOR, 
+        )
 
     if resuming:
-        CONSOLE.print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint)
-        # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
-        CONSOLE.print_zero_rank("\n[red bold]WATCH OUT:[/] Not loading meta info from checkpoint.")
-        meta_info = arg_meta_info
+        CONSOLE.print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint_path)
         
-        if new_wandb_run_id:
-            wandb_run_id_to_use = None
-        else:
-            wandb_run_id_to_use = wandb_run_id
-            
-
+        #######################################################################
+        # Deal with argument conf vs checkpoint conf
+        #######################################################################
+        # TODO: fix this logic wrt what actually gets loaded in the checkpoint.
+        # The thing is that, we used to do this by hand, but lighthing does a lot of it already.
+        # It's likely not necessary.
+        # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
+        meta_info = arg_meta_info
         del arg_meta_info
-        logger = pl.loggers.WandbLogger(
-            resume=False if new_wandb_run_id else "must", 
-            id=wandb_run_id_to_use,
-            project=wandb_config["project"],
-            entity=wandb_config["entity"],
-            log_model=False,
-            name=meta_info["run_name"],
-            config=dict(
-                num_nodes=ddp_info.num_nodes,
-                num_devices=ddp_info.num_devices,
-                meta_info=meta_info,
-                precision=PRECISION,
-                arguments=all_arguments,
-            ),
+        
+        #######################################################################
+        # Setup the Wandb logger. 
+        # Depending on the value of the arg, we may
+        # resume from the run of the checkpoint, or start a new run.
+        #######################################################################
+        logger = _setup_resuming_wandb_logger(
+            use_new_wandb_run_id, 
+            wandb_run_id, 
+            wandb_config, 
+            meta_info, 
+            ddp_info, 
+            all_arguments,
         )
-        if utils.global_rank() == 0:
-            wandb.run.log_code(SCRIPT_DIR)
 
-        if ddp_info.global_rank == 0:
-            assert wandb.run
-            wandb.run.log_code(SCRIPT_DIR)
-
+        
         tokenizer = _setup_tokenizer(
                 meta_info["transformers_model_name"], 
                 is_gpt2_model=meta_info["is_gpt2_model"],
             )
         
-        CONSOLE.print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"")
         datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
             [constants.CVSets.TRAINING, constants.CVSets.VALIDATION]
         )
 
-        base_model = _setup_base_model(
+        base_model = _initialize_base_model(
             custom_model_config=meta_info["custom_model_config"], 
             hf_name=meta_info["transformers_model_name"], 
             is_gpt2_model=meta_info["is_gpt2_model"],
@@ -1125,33 +1110,32 @@ def main(
             tokenizer=tokenizer,
         )
 
-        pl_object = _RefineLM.load_from_checkpoint(
-            latest_checkpoint,
-            datasets=datasets,
-            model=base_model,
-            tokenizer=tokenizer,
-        )
-
-        if fixed_answer_model_wandb_run_id:
-            latest_checkpoint_fixed = _get_last_checkpoint_path(
-                checkpoints_folder, None, fixed_answer_model_wandb_run_id)
-            
-            fixed_answer_refine_lm = _RefineLM.load_from_checkpoint(
-                latest_checkpoint_fixed.path,
-                datasets=datasets,
-                model=base_model,
-                tokenizer=tokenizer,
+        if _should_init_rl_mode(meta_info, latest_checkpoint_path):
+            pl_object = _init_in_rl_mode(
+                latest_checkpoint_path,
+                datasets,
+                base_model,
+                tokenizer,
+                fixed_answer_model_wandb_run_id,
+                checkpoints_folder,
+                meta_info,
+                batch_sizes,
+                logger,
             )
-            
-            fixed_answer_model_lm = fixed_answer_refine_lm._model
-            for p in fixed_answer_model_lm.parameters():
-                p.requires_grad = False
-            pl_object._fixed_answer_model = fixed_answer_model_lm
-            
+        else:
+            pl_object = _init_in_mle_mode(
+                batch_sizes, 
+                datasets, 
+                meta_info, 
+                base_model, 
+                tokenizer, 
+                logger,
+            )
+
     else:
+        CONSOLE.print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
         pl_object = None
 
-        CONSOLE.print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
         meta_info, logger, wandb_run_id = _set_initial_state(
             checkpoints_root_dir=checkpoints_folder,
             arg_meta_info=arg_meta_info, 
@@ -1160,20 +1144,13 @@ def main(
             wandb_entity=wandb_config["entity"],
         )
         del arg_meta_info
-    
-    if batch_sizes is None:
-        batch_sizes = _compute_batch_size_defaults(
-            ddp_info.local_rank, transformers_model_name, batch_sizes, ACCELERATOR, 
-        )
 
-    if tokenizer is None:
         tokenizer = _setup_tokenizer(
             meta_info["transformers_model_name"], 
             is_gpt2_model=meta_info["is_gpt2_model"],
         )
 
-    if base_model is None:
-        base_model = _setup_base_model(
+        base_model = _initialize_base_model(
             custom_model_config=meta_info["custom_model_config"], 
             hf_name=meta_info["transformers_model_name"], 
             is_gpt2_model=meta_info["is_gpt2_model"],
@@ -1181,38 +1158,25 @@ def main(
             tokenizer=tokenizer,
         )
 
-    if datasets is None:
         CONSOLE.print_zero_rank(f"\n[bold]Run name:[/bold] [green]\"{meta_info['run_name']}\"")
         datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
             [constants.CVSets.TRAINING, constants.CVSets.VALIDATION]
         )
 
-    CONSOLE.print(f"\n[bold]Strategy:[/] {strategy}")
-    CONSOLE.print(f"\n[bold]ddp_info:[/] {vars(ddp_info)}\n")
-
-    ###############################################################
-    # Build the pt-lightning dataloader
-    ###############################################################
-    if pl_object is None:
-        pl_object = _RefineLM(
-            batch_sizes=batch_sizes,
-            datasets=datasets,
-            generation_kwargs=meta_info["generation_kwargs"],
-            is_adamw=meta_info["is_adamw"],
-            learning_rate=meta_info["learning_rate"],
-            step_3_loss_mode=meta_info["step_3_loss_mode"],
-            step_3_lr=meta_info["step_3_lr"],
-            lm_masking_mode=meta_info["lm_masking_mode"],
-            meta_info=meta_info,
-            model=base_model,
-            path_log_results=meta_info["path_log_results"],
-            scheduler_type=meta_info["scheduler_type"],
-            switch_to_maginal_after=meta_info["switch_to_maginal_after"],
-            tokenizer=tokenizer,
-            wandb_logger=logger,
-            weight_decay=meta_info["weight_decay"],
-            
+        pl_object = _init_in_mle_mode(
+            batch_sizes, 
+            datasets, 
+            meta_info, 
+            base_model, 
+            tokenizer, 
+            logger,
         )
+
+
+    assert pl_object
+    CONSOLE.print_zero_rank(f"\n[bold]PL_OBJECT_TYPE:[/bold] {type(pl_object)}")
+    CONSOLE.print_zero_rank(f"\n[bold]Strategy:[/] {strategy}")
+    CONSOLE.print(f"\n[bold]ddp_info:[/] {vars(ddp_info)}\n")
 
     ###############################################################
     # All of the follwing arguments are very stable
@@ -1232,11 +1196,10 @@ def main(
         precision=PRECISION,
 
         # Looping stuff
-        max_epochs=MAX_EPOCHS,
-        val_check_interval=VAL_CHECK_INTERVAL,
+        max_epochs=switch_to_maginal_after,
+        val_check_interval=VAL_CHECK_INTERVAL if isinstance(pl_object, pretrain.PreTrain) else VAL_CHECK_INTERVAL_STEP_3,
         limit_train_batches=LIMIT_TRAIN_BATCHES,
         limit_val_batches=LIMIT_VAL_BATCHES,
-        reload_dataloaders_every_n_epochs=1,
 
         callbacks=[
             pl.callbacks.LearningRateMonitor(logging_interval="step"),
@@ -1249,8 +1212,8 @@ def main(
         ]
     )
     
-    if resuming: 
-        trainer.fit(pl_object, ckpt_path=latest_checkpoint)
+    if resuming and isinstance(pl_object, pretrain.PreTrain): 
+        trainer.fit(pl_object, ckpt_path=latest_checkpoint_path)
     else:
         trainer.fit(pl_object,)
 
@@ -1276,7 +1239,6 @@ def json(cls, name: str, path: Path) -> Dict[str, Any]:
 
 @beartype
 def predict(
-    cls, 
     *,
     wandb_run_id: str = DEFAULT_WANDB_ID,
     run_name: Optional[str] = None,
@@ -1291,7 +1253,7 @@ def predict(
     Run by loading a json file.
     """
     all_arguments = locals().copy()
-    utils.check_and_print_args(all_arguments, cls.predict, True)
+    utils.check_and_print_args(all_arguments, None)
     
     mode = constants.CVSets.VALIDATION
     last_ckpt_info = _get_last_checkpoint_path(
@@ -1306,7 +1268,7 @@ def predict(
         meta_info["transformers_model_name"], 
         is_gpt2_model=meta_info["is_gpt2_model"]
     )  
-    base_model = _setup_base_model(
+    base_model = _initialize_base_model(
         custom_model_config=meta_info["custom_model_config"], 
         hf_name=meta_info["transformers_model_name"], 
         is_gpt2_model=meta_info["is_gpt2_model"],
@@ -1325,7 +1287,7 @@ def predict(
             accelerator=ACCELERATOR,
         )
 
-    pl_object = _RefineLM(
+    pl_object = pretrain.PreTrain(
         model=base_model,
         datasets=datasets,
         tokenizer=tokenizer,

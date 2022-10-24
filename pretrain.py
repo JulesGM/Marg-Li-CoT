@@ -46,6 +46,7 @@ class PreTrain(pl.LightningModule):
         self,
         *,
         batch_sizes: Dict[str, int],
+        chainer: str,
         datasets: Dict[str, torch.utils.data.Dataset],
         generation_kwargs: dict[str, Any],
         learning_rate: float,
@@ -64,7 +65,8 @@ class PreTrain(pl.LightningModule):
         dataloader_num_workers: int = 0,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["model", "datasets", "tokenizer"])
+        self.save_hyperparameters(ignore=["model", "datasets", "tokenizer", "scheduler_fn"])
+        self._chainer:                  Final[str]                                 = chainer
         self._datasets:                 Final[Dict[str, torch.utils.data.Dataset]] = datasets
         self._value_model:              Optional[transformers.GPT2PreTrainedModel] = None
         self._tokenizer:                Final[transformers.PreTrainedTokenizer]    = tokenizer
@@ -78,14 +80,14 @@ class PreTrain(pl.LightningModule):
         self._logging_conf:             Final[dict[str, bool]]                     = dict(
             prog_bar=True, on_step=True, on_epoch=True, logger=True, sync_dist=True
         )
-        self.scheduler_fn:              Final[Callable]                            = scheduler_fn
+        self._scheduler_fn:              Final[Callable]                            = scheduler_fn
 
         ################################################################################
         # Related to datasets
         ################################################################################
         self._shuffle_train:       Final[bool]           = shuffle_training_data
         self._shuffle_val:         Final[bool]           = shuffle_validation_data
-        self._training_collators:  Final[dict[str, Any]] = MLETrainingCollator(self._tokenizer, self._lm_masking_mode),
+        self._training_collator:  Final[dict[str, Any]] = MLETrainingCollator(self._tokenizer, self._lm_masking_mode)
         
 
         ################################################################################
@@ -103,6 +105,10 @@ class PreTrain(pl.LightningModule):
         self._is_adamw:       Final[bool]            = is_adamw
         self._scheduler_type: Final[str]             = scheduler_type
         self._scheduler                              = None
+
+
+    def get_model(self):
+        return self._model
 
 
     def forward(self, *args, **kwargs):
@@ -155,7 +161,7 @@ class PreTrain(pl.LightningModule):
 
 
     def validation_step(self, batch: Dict[str, torch.LongTensor], batch_idx):  # type: ignore[override]
-        return train_utils.shared_validation_step(self, batch, batch_idx)
+        return train_utils.shared_validation_step(self, batch, batch_idx, chainer=self._chainer)
 
 
     def predict_step(self, batch, batch_idx):
@@ -208,7 +214,7 @@ class PreTrain(pl.LightningModule):
 
         return torch.utils.data.DataLoader(
             self._datasets[constants.PipelineModes.MLE_TRAINING],
-            collate_fn=self._training_collators[constants.PipelineModes.MLE_TRAINING],
+            collate_fn=self._training_collator,
             batch_size=self._batch_size[constants.PipelineModes.MLE_TRAINING],
             num_workers=self._dataloader_num_workers,
             shuffle=self._shuffle_train,
