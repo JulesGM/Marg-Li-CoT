@@ -44,17 +44,16 @@ def we_are_on_slurm():
 
 def reset_env_maybe_show(
     *, 
-    env,
     do_show,
     sim_name
 ):
     if do_show:
         env = gym.make(sim_name, render_mode="human")
-        observation, _ = env.reset()
+        observation = env.reset()
         env.render()
     else:
         env = gym.make(sim_name)
-        observation, _ = env.reset()
+        observation = env.reset()
     return observation, env
 
 

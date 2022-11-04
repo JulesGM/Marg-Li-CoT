@@ -6,6 +6,7 @@ from typing import *
 
 
 import more_itertools
+import numpy as np
 import pytorch_lightning as pl
 import rich.table as table
 import torch
@@ -44,6 +45,10 @@ class RLTraining(pl.LightningModule):
     def __init__(
         self,
         *,
+        model: transformers.GPT2LMHeadModel,
+        fixed_scratchpad_model,
+        fixed_answer_model,
+        
         batch_sizes: Dict[str, int],
         chainer,
         datasets: Dict[str, torch.utils.data.Dataset],
@@ -51,7 +56,6 @@ class RLTraining(pl.LightningModule):
         learning_rate: float,
         loss_mode: str,
         meta_info: dict,
-        model: transformers.GPT2LMHeadModel,
         is_adamw: bool,
         lm_masking_mode: str,
         path_log_results: Path,
@@ -62,12 +66,17 @@ class RLTraining(pl.LightningModule):
         shuffle_training_data,
         shuffle_validation_data,
         scheduler_fn,
-        fixed_scratchpad_model,
-        fixed_answer_model,
         dataloader_num_workers=0,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["model", "datasets", "tokenizer", "scheduler_fn"])
+        self.save_hyperparameters(ignore=[
+            "model", 
+            "datasets", 
+            "tokenizer", 
+            "scheduler_fn", 
+            "fixed_answer_model",
+            "fixed_scratchpad_model", 
+        ])
 
         utils.check_contained(
             loss_mode, 
@@ -95,7 +104,6 @@ class RLTraining(pl.LightningModule):
         self._scheduler_function                                                   = scheduler_fn
 
 
-
         ################################################################################
         # Related to datasets
         ################################################################################
@@ -119,9 +127,66 @@ class RLTraining(pl.LightningModule):
         self._scheduler_type: Final[str]             = scheduler_type
         self._scheduler                              = None
 
+        
+    def inference(self, batch, mode):
+        utils.check_equal("cuda", self._fixed_model.device.type)
+        ###################################################################
+        # Compute the scratchpad with the learnable model
+        ###################################################################
+        config_scratchpad                 = self._generation_kwargs[mode].copy()
+        config_scratchpad["eos_token_id"] = self._tokenizer.cls_token_id
+        gen_outputs = self._generate(
+            model             = self._model,
+            batch             = batch, 
+            generation_kwargs = config_scratchpad, 
+        )
+
+        ###################################################################
+        # Compute The accuracy of Scratchpads
+        ###################################################################
+        gen_scratchpads = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
+        scratchpad_texts = train_utils.get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], tokenizer=self._tokenizer)
+        scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts), dtype=bool)
+        scratchpads_acc = np.mean(scratchpad_matches)
+
+        ###################################################################
+        # Compute the answer after the scratchpad
+        ###################################################################
+        config_answer  = self._generation_kwargs[mode].copy()
+        unpadded       = train_utils.remove_padding(gen_outputs, gen_outputs != self._tokenizer.pad_token_id)
+        padded         = train_utils.pad           (unpadded, pad_token_id=self._tokenizer.pad_token_id, direction="left")
+        attention_mask = train_utils.generate_mask (unpadded, "left")
+
+        new_batch = dict(
+            generation_input_ids      = padded        .to(self._fixed_model.device),
+            generation_attention_mask = attention_mask.to(self._fixed_model.device),
+        )
+        gen_values = self._generate(
+            model             = self._fixed_answer_model,
+            generation_kwargs = config_answer, 
+            batch             = new_batch, 
+        )[:, new_batch["generation_input_ids"].shape[1]:]
+
+        ###################################################################
+        # Compute Accuracy p(y | x, z) only
+        ###################################################################
+        values_texts   = train_utils.get_values_texts(gen_values, batch["value"], tokenizer=self._tokenizer)
+        values_matches = np.fromiter((gen == ref for gen, ref in values_texts), dtype=bool)
+        values_acc     = np.mean(values_matches)
+
+        gen_outputs = torch.cat([gen_scratchpads, gen_values], dim=1)
+        
+        return dict(
+            scratchpad_matches = scratchpad_matches, 
+            scratchpads_acc    = scratchpads_acc, 
+            values_matches     = values_matches, 
+            gen_outputs        = gen_outputs,
+            values_acc         = values_acc, 
+        )
+
+
     def get_model(self):
         return self._model
-
 
     def forward(self, *args, **kwargs):
         return self._model(*args, **kwargs)
@@ -354,6 +419,7 @@ class RLTraining(pl.LightningModule):
         #######################################################################
         # Do MLE on the strongest scratchpad
         #######################################################################
+        CONSOLE.print_zero_rank(f"\n[bold blue]{self._loss_mode}\n")
         if self._loss_mode == constants.LossModes.STRONGEST_MLE:
             assert False
             most_helpful_log_probs = z_log_probs_per_seq.gather(
@@ -399,28 +465,44 @@ class RLTraining(pl.LightningModule):
             - KL instead of l2
             """
 
-            z_log_probs_seq = z_log_probs.sum(dim=-1)  # (batch_size, num_scratchpads)
-            # z_log_probs_fixed_seq = z_log_probs_fixed.sum(dim=-1).detach()  # (batch_size, num_scratchpads)
+            z_log_probs_seq  = z_log_probs      .sum(dim=-1)  # (batch_size, num_scratchpads)
+            # z_log_probs_seq -= z_log_probs_fixed.sum(dim=-1).detach()  # (batch_size, num_scratchpads)
             # import_ratio_w_fixed_z = seq_z_log_probs - seq_z_log_probs_fixed  # (batch_size, num_scratchpads)
             
-            MARGINAL_KL_W_FIXED_BETA = 0.
-            MARGINAL_KL_W_FIXED_REWARD_TEMPERATURE = 10.
 
-            y_prob_term_seq = (y_log_probs_fixed_per_seq.detach() * MARGINAL_KL_W_FIXED_REWARD_TEMPERATURE).softmax(dim=-1)
-            rl_reward_seq   = (z_log_probs_seq.exp()              * y_prob_term_seq).sum(-1)  # Marginal likelihood
-            ppo_importance_sampling_penalty_seq = MARGINAL_KL_W_FIXED_BETA * (z_log_probs - z_log_probs_fixed.detach()).sum(-1) ** 2
+            MARGINAL_KL_W_FIXED_BETA = 0
+            Y_TERM_BETA = 0
 
-            utils.check_equal(rl_reward_seq.ndim, 1)
+            MARGINAL_KL_W_FIXED_REWARD_TEMPERATURE = 3
+            
+            y_prob_term_seq = (y_log_probs_fixed_per_seq.detach() * MARGINAL_KL_W_FIXED_REWARD_TEMPERATURE).softmax(-1)
+            assert y_prob_term_seq.ndim == 2, y_prob_term_seq.shape
+
+            rl_reward_per_seq = (z_log_probs_seq.exp() * y_prob_term_seq)
+            rl_reward_per_question = rl_reward_per_seq.sum(-1)  # Marginal likelihood. Give higher probability to sequences that are more likely to be correct
+            assert rl_reward_per_question.ndim == 1, rl_reward_per_question.shape
+            rl_requard_per_batch = rl_reward_per_question.mean()
+            assert rl_requard_per_batch.ndim == 0, rl_requard_per_batch.shape
+
+            ppo_importance_sampling_penalty_seq = (z_log_probs - z_log_probs_fixed.detach()).sum(-1)
+            
+            assert z_log_probs_fixed.ndim == 3, z_log_probs_fixed.shape
+            assert z_log_probs      .ndim == 3, z_log_probs      .shape
+            assert ppo_importance_sampling_penalty_seq.ndim == 2, ppo_importance_sampling_penalty_seq.shape
+
+            ppo_importance_sampling_penalty_per_question = ppo_importance_sampling_penalty_seq.mean(-1)
+            assert ppo_importance_sampling_penalty_per_question.ndim == 1, ppo_importance_sampling_penalty_per_question.shape
+            ppo_importance_sampling_penalty_per_batch = ppo_importance_sampling_penalty_per_question.mean()
+
+            loss = MARGINAL_KL_W_FIXED_BETA * ppo_importance_sampling_penalty_per_batch - Y_TERM_BETA * rl_requard_per_batch.mean(-1)
 
             assert not z_log_probs_fixed.requires_grad
-            assert rl_reward_seq.requires_grad
+            assert rl_requard_per_batch.requires_grad
             assert ppo_importance_sampling_penalty_seq.requires_grad
 
-            loss = ppo_importance_sampling_penalty_seq.sum(-1).mean(-1) - rl_reward_seq.mean(-1)
-
-            self.log("rl_reward",                        rl_reward_seq.mean().item(),                                batch_size=self._batch_size[mode],  **self._logging_conf)
-            self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty_seq.sum(-1).mean().item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
-            self.log("loss",                             loss.item(),                                                batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("rl_reward",                        rl_requard_per_batch.mean().item(),                          batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("ppo_importance_sampling_penalty",  ppo_importance_sampling_penalty_seq.mean(-1).mean().item(),  batch_size=self._batch_size[mode],  **self._logging_conf)
+            self.log("loss",                             loss.item(),                                                 batch_size=self._batch_size[mode],  **self._logging_conf)
 
             utils.check_equal(loss.ndim, 0)
 
@@ -435,6 +517,7 @@ class RLTraining(pl.LightningModule):
             - Beta values
             - KL instead of l2
             """
+            assert False
             
             experience = ppo.make_experience(
                 all_tokens_input_ids      = ITGS_ids,
@@ -500,6 +583,7 @@ class RLTraining(pl.LightningModule):
 
         if SHOW_MULTI_SCRATCHPAD_TABLE:                    
             show_multi_scratchpad_table(
+                rl_loss         = rl_reward_per_seq,
                 y_prob          = y_part_prob,
                 z_prob          = z_part_prob,
                 labels          = batch["labels"], 
@@ -841,6 +925,7 @@ def _show_multi_scratchpad_table_format_text(ids, tokenizer) -> str:
 
 def show_multi_scratchpad_table(
     *,
+    rl_loss,
     labels,
     y_prob, 
     z_prob, 
@@ -849,18 +934,21 @@ def show_multi_scratchpad_table(
     demo_input_idx,
     num_scratchpads, 
 ):
-    
+
+    rl_loss = rl_loss.clone().detach()    
     y_prob = y_prob.clone().detach()
     z_prob = z_prob.clone().detach()
 
-    table_ = table.Table("Text", "y score", "z score", "y rank", "z rank")
+    table_ = table.Table("Text", "rl_loss", "y score", "z score", "y rank", "z rank")
 
     label_text = _show_multi_scratchpad_table_format_text([x for x in labels[demo_input_idx] if x > 0], tokenizer)
     table_.add_row(f"[bold magenta]{label_text}[/]", "", "", "", "", end_section=True)
 
     sort_y = torch.tensor(sorted(range(num_scratchpads), key=lambda i: y_prob[demo_input_idx, i], reverse=True))
+    
     y_prob_entry = y_prob[demo_input_idx, sort_y]
     z_prob_entry = z_prob[demo_input_idx, sort_y]
+    rl_loss_entry = rl_loss[demo_input_idx, sort_y]
 
     argsort = sorted(range(num_scratchpads), key=lambda i: z_prob_entry[i], reverse=True)
     ranks_z = {}
@@ -902,8 +990,9 @@ def show_multi_scratchpad_table(
 
         table_.add_row(
             maybe_color + diff_colored + maybe_close,
-            f"[{y_prob_color}]{y_prob_entry[rank_y].item():.3}", 
-            f"[{z_prob_color}]{z_prob_entry[rank_y].item():.3}",
+            f"{rl_loss_entry[rank_y].item():0.2}",
+            f"[{y_prob_color}]{y_prob_entry[rank_y].item():.2}", 
+            f"[{z_prob_color}]{z_prob_entry[rank_y].item():.2}",
             str(rank_y),
             str(ranks_z[rank_y])
         )

@@ -162,100 +162,21 @@ def fix_model_params_in_place(model):
     for param in model.parameters():
         param.requires_grad = False
 
+
 def shared_validation_step(lightning_module, batch, batch_idx, chainer):
     utils.rich_print_zero_rank(f"\n\n[red bold]VALIDATION STEP!")
     utils.check_equal("cuda", lightning_module._model.device.type)
-
-    assert "labels" in batch, (
-        "Labels must be in batch. We must mask the input section with -100"
-    )
+    assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
     mode: Final[str] = constants.PipelineModes.VALIDATION
+    
+    inference_outputs = lightning_module.inference(batch, constants.PipelineModes.VALIDATION)
+    scratchpad_matches = inference_outputs["scratchpad_matches"]
+    scratchpads_acc    = inference_outputs["scratchpads_acc"]
+    values_matches     = inference_outputs["values_matches"]
+    gen_outputs        = inference_outputs["gen_outputs"]
+    values_acc         = inference_outputs["values_acc"]
 
-
-    if not hasattr(lightning_module, "_fixed_model") or lightning_module._fixed_model is None:
-        gen_outputs = lightning_module._generate(
-            model             = lightning_module._model,
-            batch             = batch, 
-            generation_kwargs = lightning_module._generation_kwargs[mode], 
-        )
-        generated_tokens = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
-
-        ###################################################################
-        # Compute Scratchpad Accuracy
-        ###################################################################
-        pos_clss = (generated_tokens == lightning_module._tokenizer.cls_token_id).long() * torch.arange(generated_tokens.shape[1]).unsqueeze(0).to(generated_tokens.device)
-        last_cls_pos = (pos_clss).max(dim=1).values.unsqueeze(-1)
-        del pos_clss
-        is_scratchpad = torch.arange(generated_tokens.shape[1]).repeat(
-            (generated_tokens.shape[0], 1)).to(generated_tokens.device) < last_cls_pos
-        gen_scratchpads = remove_padding(generated_tokens, is_scratchpad)
-        scratchpad_texts = get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], lightning_module._tokenizer)
-        scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts), dtype=bool)
-        scratchpads_acc = np.mean(scratchpad_matches)
-
-
-        ###################################################################
-        # Compute Accuracy p(y | x, z) only
-        ###################################################################
-        gen_values     = remove_padding(generated_tokens, is_scratchpad.logical_not())
-        values_texts   = get_values_texts(gen_values, batch["value"], tokenizer=lightning_module._tokenizer)
-        values_matches = np.fromiter((gen == ref for gen, ref in values_texts), dtype=bool)
-        values_acc     = np.mean(values_matches)
-
-        gen_outputs = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
-    else:
-        utils.check_equal("cuda", lightning_module._fixed_model.device.type)
-        ###################################################################
-        # Compute the scratchpad with the learnable model
-        ###################################################################
-        config_scratchpad                 = lightning_module._generation_kwargs[mode].copy()
-        config_scratchpad["eos_token_id"] = lightning_module._tokenizer.cls_token_id
-        gen_outputs = lightning_module._generate(
-            model             = lightning_module._model,
-            batch             = batch, 
-            generation_kwargs = config_scratchpad, 
-        )
-
-        ###################################################################
-        # Compute The accuracy of Scratchpads
-        ###################################################################
-        gen_scratchpads = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
-        scratchpad_texts = get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], tokenizer=lightning_module._tokenizer)
-        scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts), dtype=bool)
-        scratchpads_acc = np.mean(scratchpad_matches)
-
-        ###################################################################
-        # Compute the answer after the scratchpad
-        ###################################################################
-        config_answer  = lightning_module._generation_kwargs[mode].copy()
-        unpadded       = remove_padding(gen_outputs, gen_outputs != lightning_module._tokenizer.pad_token_id)
-        padded         = pad           (unpadded, pad_token_id=lightning_module._tokenizer.pad_token_id, direction="left")
-        attention_mask = generate_mask (unpadded, "left")
-
-        new_batch = dict(
-            generation_input_ids      = padded        .to(lightning_module._fixed_model.device),
-            generation_attention_mask = attention_mask.to(lightning_module._fixed_model.device),
-        )
-        gen_values = lightning_module._generate(
-            model             = lightning_module._fixed_answer_model,
-            generation_kwargs = config_answer, 
-            batch             = new_batch, 
-        )[:, new_batch["generation_input_ids"].shape[1]:]
-
-        ###################################################################
-        # Compute Accuracy p(y | x, z) only
-        ###################################################################
-        values_texts   = get_values_texts(gen_values, batch["value"], tokenizer=lightning_module._tokenizer)
-        values_matches = np.fromiter((gen == ref for gen, ref in values_texts), dtype=bool)
-        values_acc     = np.mean(values_matches)
-
-        gen_outputs = torch.cat([gen_scratchpads, gen_values], dim=1)
-
-    stats = build_match_stat_matrixes(
-        scratchpad_matches=scratchpad_matches, 
-        value_matches=values_matches,
-        
-    )
+    stats = build_match_stat_matrixes(scratchpad_matches=scratchpad_matches, value_matches=values_matches)
 
     if utils.is_rank_zero():
         stats_table = table.Table("Key", "Value")

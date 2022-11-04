@@ -47,6 +47,7 @@ def build_mlp(
 
 
 def save_models(actor, value, config, path):
+    rich.print("[bold red]Saving to ", path / "actor.pth")
     torch.save(actor.state_dict(), path / "actor.pth")
 
     if value:

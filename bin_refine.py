@@ -42,10 +42,11 @@ from tqdm import tqdm  # type: ignore[import]
 import transformers  # type: ignore[import]
 import wandb
 
-import console
-import constants
 import general_utils as utils
 
+import console
+import constants
+import fast_ckpt_reader
 import marginal
 import pretrain
 import train_utils
@@ -74,7 +75,7 @@ LIMIT_VAL_BATCHES = 10
 VAL_CHECK_INTERVAL = 1 / 3
 VAL_CHECK_INTERVAL_STEP_3 = 30
 
-DEFAULT_NUM_BEAMS = 20
+DEFAULT_NUM_BEAMS = 50
 MARGINAL_LIKELIHOOD_BS = (64 * 2) // DEFAULT_NUM_BEAMS
 
 DEFAULT_LM_MASKING_MODE = constants.LMMaskingMode.MASK_INPUT
@@ -86,7 +87,7 @@ WARMUP_EPOCHS = 1
 MAX_EPOCHS = 53
 
 DEFAULT_WANDB_ID: Optional[str] = "22luh7ae"  # 22luh7ae, 1 epoch
-DEFAULT_FIXED_ANSWER_MODEL_WANDB_RUN_ID: Optional[str] = "22luh7ae" # "14i2wrva"
+DEFAULT_FIXED_ANSWER_MODEL_WANDB_RUN_ID: Optional[str] = "14i2wrva"
 DEFAULT_DISTRIBUTE_STRATEGIES = "ddp"  # "ddp"
 
 DATA_MODE = constants.DataModes.HDF5_PRETOK
@@ -170,7 +171,9 @@ LIMIT_TRAIN_BATCHES = None
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Varia
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-PRECISION = "bf16"  # Also try mixed
+
+PRECISION = "bf16" if torch.cuda.is_bf16_supported() else 32 # "mixed"
+CONSOLE.print_zero_rank(f"\n[bold {'green' if PRECISION == 'bf16' else 'red'}]Precision:[/] {PRECISION}\n")
 
 SCHEDULER_FN = {
     constants.SchedulerTypes.CONSTANT:
@@ -259,46 +262,22 @@ def show_small_generation_table(
     CONSOLE.print_zero_rank(table_)
 
 
-
-@dataclasses.dataclass
-class LastCkptInfo:
-    path: Path
-    run_name: str
-    epoch: int
-    step: int
-
-
 def _get_last_checkpoint_path(
     checkpoints_folder, 
     run_name: Optional[str] = None, 
     wandb_run_id: Optional[str] = None
-) -> LastCkptInfo:
+) -> str:
 
     if wandb_run_id is None:
         return None
 
-    if run_name:
-        dir_ = checkpoints_folder / run_name / wandb_run_id 
-        checkpoints = list((dir_).glob("*.ckpt"))
-        
-    else:
-        checkpoints = []
-        for path in checkpoints_folder.glob("**/*.ckpt"):
-            if path.parent.name == wandb_run_id and path.name == "last.ckpt":
-                checkpoints.append(path)
+    dir_ = checkpoints_folder / run_name / wandb_run_id 
+    checkpoint_path = dir_ / "last.ckpt"
 
-    if not checkpoints:
-        return LastCkptInfo(None, run_name, None, None)
+    if not checkpoint_path.exists():
+        return None
 
-    assert len(checkpoints) == 1, checkpoints
-    checkpoint_path = checkpoints[0]
-    
-    if run_name is None:
-        # We recover the run name from the wandb run id
-        run_name = path.parent.parent.name
-        CONSOLE.print_zero_rank(f"\n[bold]Inferring `run_name` value of:[/] {run_name = !s}")
-
-    return LastCkptInfo(checkpoint_path, run_name, None, None)
+    return checkpoint_path
 
 
 def _json_default_paths(entry: Any):
@@ -821,13 +800,29 @@ def _setup_resuming_wandb_logger(
     return logger
 
 
+def _ensure_answer_model_is_more_trained(
+    path_fixed_answer_model,
+    path_fixed_scratchpad_model,
+):
+    assert path_fixed_answer_model != path_fixed_scratchpad_model, (
+            path_fixed_answer_model, path_fixed_scratchpad_model
+        )
+
+    fixed_scratchpad_model = fast_ckpt_reader.load(path_fixed_scratchpad_model)
+    fixed_answer_model = fast_ckpt_reader.load(path_fixed_answer_model)
+    
+    assert fixed_scratchpad_model["global_step"] < fixed_answer_model["global_step"], (
+        fixed_scratchpad_model["global_step"], fixed_answer_model["global_step"]
+    )
+
+
 def _init_in_rl_mode(
-    latest_checkpoint_path,
-    datasets,
+    *,
     base_model,
+    main_checkpoint_path,
+    answer_model_checkpoint_path,
+    datasets,
     tokenizer,
-    fixed_answer_model_wandb_run_id,
-    checkpoints_folder,
     meta_info,
     batch_sizes,
     logger,
@@ -835,44 +830,54 @@ def _init_in_rl_mode(
     #######################################################################
     # Initialize in RL mode.
     #######################################################################
-    CONSOLE.print_zero_rank(f"[bold red]Done Training")
-
-    scratchpad_model = pretrain.PreTrain.load_from_checkpoint(
-        latest_checkpoint_path,
+    scratchpad_pl_model = pretrain.PreTrain.load_from_checkpoint(
+        main_checkpoint_path,
         datasets=datasets,
         model=base_model,
-        tokenizer=tokenizer,
         scheduler_fn=SCHEDULER_FN,
+        tokenizer=tokenizer,
     )
 
-    fixed_model = train_utils.clone_hf_model(scratchpad_model._model)
+    scratchpad_model = train_utils.clone_hf_model(scratchpad_pl_model._model)
+    fixed_model = train_utils.clone_hf_model(scratchpad_pl_model._model)
     train_utils.fix_model_params_in_place(fixed_model)
     
     fixed_answer_model = None
-    if fixed_answer_model_wandb_run_id:
-        latest_checkpoint_fixed = _get_last_checkpoint_path(
-            checkpoints_folder, None, fixed_answer_model_wandb_run_id)
-        
+    if answer_model_checkpoint_path:
         fixed_answer_refine_lm = pretrain.PreTrain.load_from_checkpoint(
-            latest_checkpoint_fixed.path,
+            answer_model_checkpoint_path,
             datasets=datasets,
             model=base_model,
-            tokenizer=tokenizer,
             scheduler_fn=SCHEDULER_FN,
+            tokenizer=tokenizer,
         )
         
         fixed_answer_model = train_utils.clone_hf_model(fixed_answer_refine_lm._model)
         train_utils.fix_model_params_in_place(fixed_answer_model)
-    
+
+        _ensure_answer_model_is_more_trained(
+            path_fixed_scratchpad_model=main_checkpoint_path,
+            path_fixed_answer_model=answer_model_checkpoint_path, 
+        )        
+
     if fixed_answer_model is None:
         assert False, "This approach does not currently work"
         fixed_answer_model = fixed_model.clone()
         train_utils.fix_model_params_in_place(fixed_answer_model) # likely useless
 
+
+    assert scratchpad_model is not fixed_model
+    assert fixed_model is not fixed_answer_model
+    assert fixed_answer_model is not scratchpad_model
+
+    assert scratchpad_model is not base_model
+    assert fixed_model is not base_model
+    assert fixed_answer_model is not base_model
+
     return marginal.RLTraining(
+        model                   = scratchpad_model,
         fixed_scratchpad_model  = fixed_model,
         fixed_answer_model      = fixed_answer_model, 
-        model                   = base_model,
 
         loss_mode               = meta_info["step_3_loss_mode"],
         chainer                 = CHAINER,
@@ -916,7 +921,7 @@ def _init_in_mle_mode(batch_sizes, datasets, meta_info, base_model, tokenizer, l
         )
 
 
-def _should_init_rl_mode(meta_info, latest_checkpoint_path):
+def _should_init_rl_mode(meta_info, main_checkpoint_path):
     #######################################################################
     # Figure out if we need to resume in MLE or RL mode.
     #######################################################################
@@ -924,7 +929,7 @@ def _should_init_rl_mode(meta_info, latest_checkpoint_path):
     # We only support starting RL mode from it's start, we don't support
     # resuming from a checkpoint in RL mode. That's an important distinction.
     #######################################################################
-    ckpt = torch.load(latest_checkpoint_path, map_location="cpu")
+    ckpt = fast_ckpt_reader.load(main_checkpoint_path)
     epoch = ckpt["epoch"]
     global_step = ckpt["global_step"]
     CONSOLE.print_zero_rank(f"\n[bold]Epoch in checkpoint:[/] {epoch}, [bold]global step in checkpoint:[/] {global_step}")
@@ -995,8 +1000,8 @@ def main(
 
     dataset_path = Path(dataset_path)
     assert dataset_path.exists(), dataset_path
-    checkpoints_folder = Path(checkpoints_folder)
 
+    checkpoints_folder = Path(checkpoints_folder)
     assert checkpoints_folder.exists(), checkpoints_folder
     assert checkpoints_folder.is_dir(), checkpoints_folder
 
@@ -1005,20 +1010,11 @@ def main(
     )
 
     torch.use_deterministic_algorithms(mode=DETERMINISTIC)
-    run_name = dataset_path.name
-    last_ckpt_info = _get_last_checkpoint_path(
-        checkpoints_folder, None, wandb_run_id)
-    resuming = wandb_run_id is not None
-    
-    if resuming:
-        assert last_ckpt_info is not None, last_ckpt_info
 
-    if resuming:
-        latest_checkpoint_path = last_ckpt_info.path
-        CONSOLE.print_zero_rank(f"\n[bold]Will resume from:[/] \"{latest_checkpoint_path}\"")
-    else:
-        latest_checkpoint_path = None
-        CONSOLE.print_zero_rank(f"\n[bold]Not resuming: Will start from scratch.")
+    run_name = dataset_path.name
+    resuming = wandb_run_id is not None
+    main_checkpoint_path = _get_last_checkpoint_path(checkpoints_folder, run_name, wandb_run_id)
+    answer_model_checkpoint_path = _get_last_checkpoint_path(checkpoints_folder, run_name, fixed_answer_model_wandb_run_id)
 
     ddp_info = _setup_ddp(strategy)
     arg_meta_info = _build_meta_info(
@@ -1055,7 +1051,6 @@ def main(
     tokenizer = None
     datasets = None
     pl_object = None
-
         
     if batch_sizes is None:
         batch_sizes = _compute_batch_size_defaults(
@@ -1066,15 +1061,18 @@ def main(
         )
 
     if resuming:
-        CONSOLE.print_zero_rank("\n[bold]Resuming from checkpoint:[/]", latest_checkpoint_path)
-        
         #######################################################################
         # Deal with argument conf vs checkpoint conf
         #######################################################################
         # TODO: fix this logic wrt what actually gets loaded in the checkpoint.
-        # The thing is that, we used to do this by hand, but lighthing does a lot of it already.
+        # The thing is that, we used to do this by hand, 
+        # but lighthing does a lot of it already.
         # It's likely not necessary.
-        # meta_info = _set_resumed_state(checkpoints_folder, arg_meta_info, last_ckpt_info)
+        # meta_info = _set_resumed_state(
+        #   checkpoints_folder, 
+        #   arg_meta_info, 
+        #   last_ckpt_info,
+        # )
         meta_info = arg_meta_info
         del arg_meta_info
         
@@ -1092,11 +1090,10 @@ def main(
             all_arguments,
         )
 
-        
         tokenizer = _setup_tokenizer(
-                meta_info["transformers_model_name"], 
-                is_gpt2_model=meta_info["is_gpt2_model"],
-            )
+            meta_info["transformers_model_name"], 
+            is_gpt2_model=meta_info["is_gpt2_model"],
+        )
         
         datasets = _text_mode_build_dataset(dataset_path, tokenizer, 
             [constants.CVSets.TRAINING, constants.CVSets.VALIDATION]
@@ -1110,28 +1107,26 @@ def main(
             tokenizer=tokenizer,
         )
 
-        if _should_init_rl_mode(meta_info, latest_checkpoint_path):
+        if _should_init_rl_mode(meta_info, main_checkpoint_path):
             pl_object = _init_in_rl_mode(
-                latest_checkpoint_path,
-                datasets,
-                base_model,
-                tokenizer,
-                fixed_answer_model_wandb_run_id,
-                checkpoints_folder,
-                meta_info,
-                batch_sizes,
-                logger,
+                base_model=base_model,
+                datasets=datasets,
+                tokenizer=tokenizer,
+                answer_model_checkpoint_path=answer_model_checkpoint_path,
+                main_checkpoint_path=main_checkpoint_path,
+                meta_info=meta_info,
+                batch_sizes=batch_sizes,
+                logger=logger,
             )
         else:
             pl_object = _init_in_mle_mode(
-                batch_sizes, 
-                datasets, 
-                meta_info, 
-                base_model, 
-                tokenizer, 
-                logger,
+                batch_sizes=batch_sizes,
+                datasets=datasets,
+                meta_info=meta_info,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                logger=logger,
             )
-
     else:
         CONSOLE.print_zero_rank("\n[bold green]Not Resuming: Setting the initial state.")
         pl_object = None
@@ -1213,7 +1208,7 @@ def main(
     )
     
     if resuming and isinstance(pl_object, pretrain.PreTrain): 
-        trainer.fit(pl_object, ckpt_path=latest_checkpoint_path)
+        trainer.fit(pl_object, ckpt_path=main_checkpoint_path)
     else:
         trainer.fit(pl_object,)
 
@@ -1227,9 +1222,11 @@ def json(cls, name: str, path: Path) -> Dict[str, Any]:
     all_arguments = locals().copy()
     utils.check_and_print_args(all_arguments, cls.main, True)
 
-    entrypoint_names = {
-        k for k in cls.__dict__.keys() - {'json'} if not k.startswith("_")}
-    assert hasattr(cls, name), f"{cls.__name__}.{name} doesn't exist. Valid options are: {entrypoint_names}"
+    entrypoint_names = {k for k in cls.__dict__.keys() - {"json"} if not k.startswith("_")}
+    assert hasattr(cls, name), (
+        f"{cls.__name__}.{name} doesn't exist. "
+        f"Valid options are: {entrypoint_names}"
+    )
 
     with open(path, "r") as f:
         args = json.load(f)
@@ -1257,7 +1254,10 @@ def predict(
     
     mode = constants.CVSets.VALIDATION
     last_ckpt_info = _get_last_checkpoint_path(
-        checkpoints_root_dir, run_name, wandb_run_id)
+        checkpoints_root_dir, 
+        run_name, 
+        wandb_run_id,
+    )
     run_name = last_ckpt_info.run_name
     meta_info = utils.load_json(_make_config_path(
         checkpoints_root_dir=checkpoints_root_dir, 
@@ -1319,7 +1319,7 @@ def predict(
 
     trainer.validate(
         pl_object,
-        ckpt_path=str(last_ckpt_info.path),
+        ckpt_path=str(last_ckpt_info),
     )
 
 

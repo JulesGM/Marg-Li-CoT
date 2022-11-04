@@ -3,10 +3,12 @@ import enum
 from typing import *
 
 import numpy as np
+import scipy.signal
 import rich
 import torch
 
 import utils
+
 
 class ReplayBuffer:
     def __init__(
@@ -16,6 +18,7 @@ class ReplayBuffer:
         state_shape: Tuple[int, ...], 
         action_shape: Tuple[int, ...],
         qty_memory_samples: int,
+        store_logits: bool = False,
     ):
         self.output_device = output_device
         self.action_shape  = action_shape
@@ -23,11 +26,13 @@ class ReplayBuffer:
         self.size          = size
         self.qty_memory_samples = qty_memory_samples
 
-        self.observations      = np.zeros((size,  *state_shape), dtype=np.float32)
-        self.next_observations = np.zeros((size,  *state_shape), dtype=np.float32)
-        self.actions           = np.zeros((size,             1), dtype=np.float32)
-        self.rewards           = np.zeros((size,             1), dtype=np.float32)
-        self.dones             = np.zeros((size,             1), dtype=np.float32)
+        self.observations      = np.zeros((size,   *state_shape), dtype=np.float32)
+        self.next_observations = np.zeros((size,   *state_shape), dtype=np.float32)
+        self.actions           = np.zeros((size,              1), dtype=np.float32)
+        self.rewards           = np.zeros((size,              1), dtype=np.float32)
+        self.dones             = np.zeros((size,              1), dtype=np.float32)
+        if store_logits:
+            self.logits        = np.zeros((size,  *action_shape), dtype=np.float32)
 
         self.full = False
         self.ptr = 0
@@ -66,6 +71,149 @@ class ReplayBuffer:
 
         return output
 
+
+def discount_cumsum(x, discount):
+    """
+    magic from rllab for computing discounted cumulative sums of vectors.
+    input: 
+        vector x, 
+        [x0, x1, x2]
+    output:
+        [x0 + discount * x1 + discount^2 * x2,  
+        x1 + discount * x2,
+        x2]
+    """
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+
+class PPOBuffer:
+    """
+    From https://github.com/openai/spinningup/blob/master/spinup/algos/pytorch/ppo/ppo.py
+
+    A buffer for storing trajectories experienced by a PPO agent interacting
+    with the environment, and using Generalized Advantage Estimation (GAE-Lambda)
+    for calculating the advantages of state-action pairs.
+    """
+
+    def __init__(self, *, obs_dim, size, gamma, lam, dtype, device):
+
+        self._obs_buf:  Final[np.ndarray] = np.zeros((size, obs_dim,))
+        self._act_buf:  Final[np.ndarray] = np.zeros((size, ))
+        self._adv_buf:  Final[np.ndarray] = np.zeros((size,))
+        self._rew_buf:  Final[np.ndarray] = np.zeros((size,))
+        self._ret_buf:  Final[np.ndarray] = np.zeros((size,))
+        self._val_buf:  Final[np.ndarray] = np.zeros((size,))
+        self._logp_buf: Final[np.ndarray] = np.zeros((size,))
+        
+        self._lam:      Final[float] = lam
+        self._gamma:    Final[float] = gamma
+        self._max_size: Final[float] = size
+
+        self._dtype:    Final[float] = dtype
+        self._device:   Final[float] = device
+
+        # Things that can change
+        self._ptr: int = 0 
+        self._path_start_idx: int = 0
+        self._total_steps_seen: int = 0
+
+    def store(self, *, obs, act, rew, val, logp):
+        """
+        Append one timestep of agent-environment interaction to the buffer.
+        """
+        assert self._ptr < self._max_size     # buffer has to have room so you can store
+
+        self._obs_buf [self._ptr] = obs
+        self._act_buf [self._ptr] = act
+        self._rew_buf [self._ptr] = rew
+        self._val_buf [self._ptr] = val
+        self._logp_buf[self._ptr] = logp
+        
+        self._ptr += 1
+
+    def finish_path(self, last_val=0):
+        """
+        Call this at the end of a trajectory, or when one gets cut off
+        by an epoch ending. This looks back in the buffer to where the
+        trajectory started, and uses rewards and value estimates from
+        the whole trajectory to compute advantage estimates with GAE-Lambda,
+        as well as compute the rewards-to-go for each state, to use as
+        the targets for the value function.
+        
+        The "last_val" argument should be 0 if the trajectory ended
+        because the agent reached a terminal state (died), and otherwise
+        should be V(s_T), the value function estimated for the last state.
+
+        This allows us to bootstrap the reward-to-go calculation to account
+        for timesteps beyond the arbitrary episode horizon (or epoch cutoff).
+        """
+
+        path_slice = slice(self._path_start_idx, self._ptr)
+        rews = np.append(self._rew_buf[path_slice], last_val)
+        vals = np.append(self._val_buf[path_slice], last_val)
+        
+        # the next two lines implement GAE-Lambda advantage calculation
+        deltas = rews[:-1] + self._gamma * vals[1:] - vals[:-1]
+        self._adv_buf[path_slice] = discount_cumsum(deltas, self._gamma * self._lam)
+        
+        # the next line computes rewards-to-go, to be targets for the value function
+        self._ret_buf[path_slice] = discount_cumsum(rews, self._gamma)[:-1]
+        
+        self._path_start_idx = self._ptr
+        
+
+    def get(self):
+        """
+        Call this at the end of an epoch to get all of the data from
+        the buffer, with advantages appropriately normalized (shifted to have
+        mean zero and std one). Also, resets some pointers in the buffer.
+        """
+        # assert self._ptr == self._max_size    # buffer has to be full before you can get
+
+        
+        # the next two lines implement the advantage normalization trick
+        adv_mean = self.distr_mean(self._adv_buf)
+        adv_std = self.distr_std(self._adv_buf)
+
+        self._adv_buf = (self._adv_buf - adv_mean) / (adv_std + 1e-8)
+
+        data = dict(
+            obs =torch.tensor(self._obs_buf [:self._ptr], device=self._device, dtype=self._dtype), 
+            act =torch.tensor(self._act_buf [:self._ptr], device=self._device, dtype=self._dtype),
+            ret =torch.tensor(self._ret_buf [:self._ptr], device=self._device, dtype=self._dtype),
+            adv =torch.tensor(self._adv_buf [:self._ptr], device=self._device, dtype=self._dtype),
+            logp=torch.tensor(self._logp_buf[:self._ptr], device=self._device, dtype=self._dtype),
+        )
+
+        self._total_steps_seen += self._ptr
+        rich.print(f"\n[bold]ppo_buff | Steps seen: {self._total_steps_seen = }")
+        self._ptr = 0
+        self._path_start_idx = 0
+
+        return {k: torch.as_tensor(v, dtype=self._dtype, device=self._device) for k, v in data.items()}
+
+    def distr_sum(self, arr):
+        """
+        Sums an array across all MPI processes, and returns the sum.
+        """
+        return np.sum(arr)
+
+    def distr_mean(self, arr):
+        """
+        Averages an array across all MPI processes, and returns the average.
+        """
+        return np.mean(arr)
+
+    def distr_std(self, arr):
+        """
+        Computes the standard deviation of an array across all MPI processes, and returns the result.
+        """
+        return np.std(arr)
+
+    def reset(self,):
+        self._ptr: int = 0 
+        self._path_start_idx: int = 0
+    
 
 class AC_Mixin:
     def update(self, rollouts):
@@ -374,7 +522,6 @@ class AC(AC_Mixin):
         # action = torch.argmax(action_logits, dim=-1)
         return action.item(), action_logits
 
-
     def loss(self, rollout, values):
         rollout_value_loss = []
         rollout_policy_loss = []
@@ -415,61 +562,71 @@ class AC(AC_Mixin):
 
         return rollout_policy_loss, rollout_value_loss
 
-    def ppo_loss(self, rollout, values):
-        rollout_value_loss = []
-        rollout_policy_loss = []
-        advantages_reversed = []
-        lastgaelam = 0
 
-        for t, step in reversed(list(enumerate(rollout))):                
-            action = step["action"]
-            reward = step["reward"]
-            logits = step["logits"]
-            done   = step["done"]
+class PPO:
+    def __init__(self, *, 
+        policy, 
+        value, 
+        buffer_max_size, 
+        act_dim, 
+        obs_dim, 
+        dtype, 
+        device: str, 
+        lambda_: float, 
+        gamma: float,
+    ):
+        self.policy  = policy
+        self.value   = value
+        self.device  = device
+        self.lambda_ = lambda_
+        self.gamma   = gamma
 
-            action = torch.tensor(action, device=self.device, dtype=int        ).detach()
-            reward = torch.tensor(reward, device=self.device, dtype=torch.float).detach()
-            done   = torch.tensor(done,   device=self.device, dtype=torch.float).detach()
-
-            ###############################################################################
-            # Compute the Value Loss.
-            # This is the JUICE.
-            ###############################################################################
-            if not done:
-                next_value = values[t + 1]
-            else:
-                next_value = torch.tensor(0., device=self.device)
-
-            td_error   = reward   + self.lambda_ * next_value.detach() - values[t]
-            lastgaelam = td_error + self.lambda_ * self.gamma * lastgaelam
-            advantages_reversed.append(lastgaelam)
-
-        advantages = torch.stack(advantages_reversed[::-1]).detach()
-        returns = advantages + values
-
-
-        assert not torch.isnan(advantages).any(), "before - Advantages contain NaNs."
-        assert not torch.isinf(advantages).any(), "before - Advantages contain Infs."
-        advantages = (advantages - advantages.mean().detach()) / (advantages.std().detach() + 1e-8)
-        assert not torch.isnan(advantages).any(), "Advantages contain NaNs."
-        assert not torch.isinf(advantages).any(), "Advantages contain Infs."
-
-
-        all_logits = torch.stack([step["logits"][step["action"]] for step in rollout])
-
-        rollout_policy_loss.append(- torch.log_softmax(
-            all_logits, dim=-1)[action] * advantages.detach()
+        self._ppo_buff = PPOBuffer(
+            obs_dim=obs_dim, 
+            size=buffer_max_size, 
+            gamma=gamma, 
+            lam=lambda_, 
+            dtype=dtype, 
+            device=device,
         )
-        rollout_value_loss .append(advantages ** 2)
 
-        assert logits    .requires_grad
-        assert td_error  .requires_grad
-        assert values[t] .requires_grad
-        
-        rollout_policy_loss = torch.stack(rollout_policy_loss).sum()
-        rollout_value_loss = torch.stack(rollout_value_loss ).sum()
+    def __call__(self, observation):
+        observation = torch.tensor(observation, device=self.device).float()
+        action_logits = self.policy(observation)
+        action = torch.distributions.Categorical(logits=action_logits).sample()
+        # action = torch.argmax(action_logits, dim=-1)
+        return action.item(), action_logits
 
-        return rollout_policy_loss, rollout_value_loss
+    def add(self, *, observation, action, reward, done, logp):
+        # rich.print(f"[bold red]Adding.")
+        self._ppo_buff.store(obs=observation, act=action, rew=reward, val=done, logp=logp)
+
+    def buffer_finish_path(self):
+        self._ppo_buff.finish_path()
+
+    def get_minibatches(self, batch_size):
+        data = self._ppo_buff.get()
+        # Check that all sizes are the same
+        assert all(data["obs"].shape[0] == x.shape[0] for x in data.values()), {
+            k: data["obs"].shape[0] == v.shape[0] for k, v in data.items()}
+
+        for i in range(0, len(data["obs"]), batch_size):
+            yield {k: v[i:i + batch_size] for k, v in data.items()}
+
+    def loss(self, rollouts, new_logprobs, new_values):
+        clip_range = 0.2
+
+        assert new_values.requires_grad
+        assert new_logprobs.requires_grad
+
+        ratio = torch.exp(rollouts["logp"] - new_logprobs)        
+        policy_loss_1 = rollouts["adv"] * ratio
+        policy_loss_2 = rollouts["adv"] * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+        policy_loss = - torch.min(policy_loss_1, policy_loss_2).mean()
+
+        rollout_value_loss = ((new_values - rollouts["ret"]) ** 2).mean()
+
+        return policy_loss, rollout_value_loss
 
 
 

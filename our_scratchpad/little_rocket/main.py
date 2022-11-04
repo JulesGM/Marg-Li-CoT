@@ -26,8 +26,10 @@ import neural_net
 import rl
 import utils
 
+SCRIPT_DIR = Path(__file__).absolute().parent
 
-APPROACH_TYPE = constants.ApproachType.SARSA
+
+APPROACH_TYPE = constants.ApproachType.PPO
 SARSA_TYPE = rl.SARSA.SarsaTypes.EXPECTATION
 
 IS_DOUBLE_DQN = False
@@ -40,20 +42,19 @@ DOUBLE_DQN_SOFT_UPDATE_RATIO = 0.02
 CLIP_NORM: Optional[float] = None
 
 LR = 1E-5
-LAMBDA = 0.99
+LAMBDA = 0.97
 GAMMA = 0.99
 TAU = 0.001
 SEED = 42
 H = 64
 L = 3
 
-
-EPS_DECAY = 0.995
-EPS_MIN = 0.01
+EPS_DECAY = 0.9995
+EPS_MIN = 0.05
 EPS_MAX = 1
 
 STEP_SIZE = 1
-NUM_UNROLLINGS_BETWEEN_UPDATES = 8  # batch size
+
 
 QTY_MEMORY_SAMPLES = 64
 REPLAY_BUFFER_SIZE = 50000
@@ -118,7 +119,6 @@ def make_approach_inst_predict(approach_name, config, policy, value, device):
         )
     else:
         raise ValueError(f"Unknown approach: {approach_name}")
-    
 
 
 def main(
@@ -126,7 +126,6 @@ def main(
     sim_name=SIM_NAME,
 
     epochs=EPOCHS,    
-    steps_between_updates=NUM_UNROLLINGS_BETWEEN_UPDATES,
     qty_memory_samples=QTY_MEMORY_SAMPLES,
 
     step_size=STEP_SIZE,
@@ -146,7 +145,12 @@ def main(
 
     approach_name=APPROACH_TYPE,
 
+    ppo_batch_size=128,
+    steps_between_updates=32,
+    ppo_buffer_max_size=int(1e7),
+
     seed=SEED,
+    save_dir_root=SCRIPT_DIR / Path("saves")
 ):
     main_call_arguments = locals()
     rich.print(main_call_arguments)
@@ -216,6 +220,18 @@ def main(
             lambda_=lambda_,
             gamma=gamma,
         )
+    elif approach_name == constants.ApproachType.PPO:
+        method = rl.PPO(
+            policy=policy_model, 
+            value=value_model, 
+            buffer_max_size=ppo_buffer_max_size,
+            device=device,
+            dtype=torch.float32,
+            lambda_=lambda_,
+            gamma=gamma,
+            act_dim=env.action_space.n, 
+            obs_dim=env.observation_space.shape[0],
+        )
     elif approach_name == constants.ApproachType.SARSA:
         method = rl.SARSA(
             q=policy_model,
@@ -266,14 +282,16 @@ def main(
         observation, env = utils.reset_env_maybe_show(
             sim_name=sim_name,
             do_show=False,
-            env=env,
         )
         terminated = False
         truncated = False
 
         start_batch = time.perf_counter()
+        
         for rollout_idx in range(steps_between_updates):
+            # rich.print(f"[bold]Rollout[/] {rollout_idx} / {steps_between_updates}")
             assert not terminated and not truncated
+
             # ticker.update(1)
             current_rollout = []
             
@@ -287,35 +305,41 @@ def main(
                     action, logits = next_action, next_logits
 
                 accumulated_reward = 0.
-                for layer in method.q:
-                    if isinstance(layer, torch.nn.Linear):
-                        assert layer.weight.device.type == device, layer.weight.device.type
 
                 ################################################################################
                 # Execute the action `step_size` times.
                 ################################################################################
-                for _ in range(step_size):
-                    (next_observation, reward, terminated, truncated, _,) = env.step(action)
-                    is_done = terminated or truncated
-                    
-                    # Necessary for regular SARSA
-                    if not is_done:
-                        next_action, next_logits = method(next_observation)
+                assert step_size == 1, step_size
+                (next_observation, reward, is_done, info) = env.step(action)
+                
+                # Necessary for regular SARSA
+                if not is_done:
+                    next_action, next_logits = method(next_observation)
 
-                    accumulated_reward += reward
-                    current_rollout.append(dict(
+                accumulated_reward += reward
+
+                current_rollout.append(dict(
+                    observation=observation, 
+                    next_observation=next_observation,
+                    action=action, 
+                    reward=reward,
+                    done=is_done,
+                    logits=logits,
+                    next_action=next_action,
+                    next_logits=next_logits,
+                ))
+
+                assert isinstance(method, rl.PPO), type(method)
+
+                if isinstance(method, rl.PPO):
+                    method.add(
                         observation=observation, 
-                        next_observation=next_observation,
                         action=action, 
                         reward=reward,
-                        done=terminated or truncated,
-                        logits=logits,
-                        next_action=next_action,
-                        next_logits=next_logits,
-                    ))
-                    if terminated or truncated:
-                        break
-                
+                        done=is_done,
+                        logp=logits.log_softmax(dim=-1)[action],
+                    )
+
                 ################################################################################
                 # End of Step
                 ################################################################################
@@ -325,15 +349,16 @@ def main(
                     ################################################################################
                     next_action = None
                     next_logits = None
+
+                    if isinstance(method, rl.PPO):
+                        method.buffer_finish_path()
                     
                     rollouts.append(current_rollout)
-                    total_rewards += [
-                        sum(x["reward"] for x in current_rollout)]
+                    total_rewards += [sum(x["reward"] for x in current_rollout)]
                     do_show = demo_timer.step()
                     observation, env = utils.reset_env_maybe_show(
                         sim_name = sim_name,
                         do_show  = do_show,
-                        env      = env,
                     )
                     terminated = False
                     truncated = False
@@ -346,28 +371,50 @@ def main(
         # Optimization Stuff
         ################################################################################
         
-        # rich.print(f"[bold red]{len(rollouts) = }")
+        if isinstance(method, rl.PPO):
+            for i, minibatch in enumerate(method.get_minibatches(ppo_batch_size)):
+                logprobs = method.policy(minibatch["obs"]).log_softmax(dim=-1)
 
-        if approach_has_value_function:
-            policy_loss, value_loss = method.update(rollouts)
-            all_losses.append(value_loss.item())
-            (policy_loss + value_loss).backward()
+                per_action_new_log_softmax = logprobs.gather(
+                    index=minibatch["act"].long().unsqueeze(-1), 
+                    dim=-1,
+                )
+                
+                new_values = method.value(minibatch["obs"])
+                policy_loss, value_loss = method.loss(
+                    rollouts=minibatch,
+                    new_logprobs=per_action_new_log_softmax,
+                    new_values=new_values,
+                )
+                
+                all_losses.append(value_loss.item())
+                (policy_loss + value_loss).backward()
+
+                optimizer.step()
+                optimizer.zero_grad()
+            rich.print("Finished optimization")
         else:
-            loss = method.update(rollouts)
-            loss.backward()
-            all_losses.append(loss.item())
+            assert False
+            if approach_has_value_function:
+                policy_loss, value_loss = method.update(rollouts)
+                all_losses.append(value_loss.item())
+                (policy_loss + value_loss).backward()
+            else:
+                loss = method.update(rollouts)
+                loss.backward()
+                all_losses.append(loss.item())
 
-        if CLIP_NORM:
-            torch.nn.utils.clip_grad_norm_(parameters, CLIP_NORM)
+            if CLIP_NORM:
+                torch.nn.utils.clip_grad_norm_(parameters, CLIP_NORM)
 
-        optimizer.step()
-        optimizer.zero_grad()
-        
+            optimizer.step()
+            optimizer.zero_grad()
 
         ################################################################################
         # Stats and Plotting
         ################################################################################
         all_rewards.append(np.mean(total_rewards))
+
         if not do_plot:
             rich.print(f"[bold]Total rewards:[/] {np.mean(total_rewards)}")
             rich.print(f"[bold]Value Loss:[/]    {all_losses[-1]}")
@@ -381,7 +428,9 @@ def main(
             )
 
         if epoch % SAVE_EVERY_N_EPOCH == 0:
-            (Path("saves") / str(epoch)).mkdir()
+            dir_target = Path(save_dir_root) / str(epoch)
+            dir_target.mkdir()
+            
             neural_net.save_models(
                 policy_model, 
                 value_model if approach_has_value_function else None, 
@@ -398,7 +447,7 @@ def main(
                     has_value_function    = approach_has_value_function,
                     tau                   = tau,
                 ), 
-                Path("saves") / str(epoch),
+                dir_target,
             )
 
     env.close()
@@ -454,25 +503,23 @@ def predict(
 
     env = gym.make(config["sim_name"], render_mode="human")
     while True:
-        observation, info = env.reset()
-        done = False
+        observation = env.reset()
+        is_done = False
 
         total_reward = 0.
-        while not done:
+        while True:
             action, _ = method(observation)
 
             for i in range(config["step_size"]):
-                observation, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
+                observation, reward, is_done, info = env.step(action)
                 env.render()
                 total_reward += reward
-                if done:
+                if is_done:
                     rich.print(f"[bold]Total reward:[/] {total_reward}")
                     break
 
-            if done:
-                observation, info = env.reset()
-                break
+            if is_done:
+                observation = env.reset()
 
 
 ENTRYPOINTS = dict(

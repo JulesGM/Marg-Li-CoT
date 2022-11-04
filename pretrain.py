@@ -2,6 +2,7 @@ import dataclasses
 from pathlib import Path
 from typing import *
 
+import numpy as np
 import torch
 import pytorch_lightning as pl
 import transformers
@@ -116,6 +117,8 @@ class PreTrain(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
+        assert False
+        
         assert "labels" in batch, (
             "Labels must be in batch. We must mask the input section with -100"
         )
@@ -237,3 +240,46 @@ class PreTrain(pl.LightningModule):
 
     def on_save_checkpoint(self, ckpt):
         return 
+
+    def inference(self, batch: Dict[str, torch.LongTensor], mode):
+        gen_outputs = self._generate(
+            model             = self._model,
+            batch             = batch, 
+            generation_kwargs = self._generation_kwargs[mode], 
+        )
+        generated_tokens = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
+
+        ###################################################################
+        # Compute Scratchpad Accuracy
+        ###################################################################
+        pos_clss = (generated_tokens == self._tokenizer.cls_token_id).long() * torch.arange(
+            generated_tokens.shape[1]).unsqueeze(0).to(generated_tokens.device)
+        last_cls_pos = (pos_clss).max(dim=1).values.unsqueeze(-1)
+        del pos_clss
+
+        is_scratchpad = torch.arange(generated_tokens.shape[1]).repeat(
+            (generated_tokens.shape[0], 1)).to(generated_tokens.device) < last_cls_pos
+        gen_scratchpads = train_utils.remove_padding(generated_tokens, is_scratchpad)
+        scratchpad_texts = train_utils.get_scratchpad_texts(gen_scratchpads, batch["scratchpad"], self._tokenizer)
+        scratchpad_matches = np.fromiter((gen == ref for gen, ref in scratchpad_texts), dtype=bool)
+        scratchpads_acc = np.mean(scratchpad_matches)
+
+        ###################################################################
+        # Compute Accuracy p(y | x, z) only
+        ###################################################################
+        gen_values     = train_utils.remove_padding(
+            generated_tokens, is_scratchpad.logical_not())
+        values_texts   = train_utils.get_values_texts(
+            gen_values, batch["value"], tokenizer=self._tokenizer)
+        values_matches = np.fromiter((gen == ref for gen, ref in values_texts), dtype=bool)
+        values_acc     = np.mean(values_matches)
+
+        gen_outputs = gen_outputs[:, batch["generation_input_ids"].shape[1]:]
+
+        return dict(
+            scratchpad_matches = scratchpad_matches, 
+            scratchpads_acc    = scratchpads_acc, 
+            values_matches     = values_matches, 
+            gen_outputs        = gen_outputs,
+            values_acc         = values_acc, 
+        )
