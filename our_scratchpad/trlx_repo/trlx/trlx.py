@@ -17,6 +17,7 @@ def train(
     reward_fn: Optional[Callable] = None,
     dataset: Optional[Iterable[Tuple[str, float]]] = None,
     prompts: Optional[List[str]] = None,
+    labels: Optional[List[str]] = None,
     eval_prompts: Optional[List[str]] = None,
     metric_fn: Optional[Callable] = None,
     config: Optional[TRLConfig] = None,
@@ -69,7 +70,7 @@ def train(
         rich.print("[bold blue]`PromptPipeline`")
         #######################################################################
 
-        pipeline = PromptPipeline(prompts, model.tokenizer)
+        pipeline = PromptPipeline(prompts=prompts, tokenizer=model.tokenizer)
         
         #######################################################################
         rich.print("[bold blue]`get_orchestrator`")
@@ -84,7 +85,7 @@ def train(
         #######################################################################
 
         orch.make_experience(config.method.num_rollouts)
-        eval_pipeline = PromptPipeline(eval_prompts, model.tokenizer)
+        eval_pipeline = PromptPipeline(prompts=eval_prompts, tokenizer=model.tokenizer)
         model.add_eval_pipeline(eval_pipeline)
 
     elif dataset is not None:
@@ -109,7 +110,7 @@ def train(
         if eval_prompts is None:
             eval_prompts = [model.tokenizer.bos_token] * batch_size
 
-        eval_pipeline = PromptPipeline(eval_prompts, model.tokenizer)
+        eval_pipeline = PromptPipeline(prompts=eval_prompts, tokenizer=model.tokenizer)
 
         orch = OfflineOrchestrator(model, split_token=split_token)
         orch.make_experience(samples, rewards)

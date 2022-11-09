@@ -42,15 +42,16 @@ class PPOOrchestrator(Orchestrator):
         self.rl_model.reward_fn = reward_fn
         self.rl_model.metric_fn = metric_fn
 
-    def score(self, samples):
+    def score(self, samples, batch: PromptBatch):
         """
         Batched scoring function taking text and generating scalar
         """
-        return self.rl_model.reward_fn(samples)
+        return self.rl_model.reward_fn(samples, batch)
 
     def make_experience(self, num_rollouts: int = 1024, iter_count: int = 0):
         """
-        Takes `num_rollouts` prompts from `pipeline`, samples model, computes KL againts a reference model appends PPOElements to model's `store`
+        Takes `num_rollouts` prompts from `pipeline`, samples model, 
+        computes KL againts a reference model appends PPOElements to model's `store`
         """
         ppo_rl_elements = []
         stats = {}
@@ -70,7 +71,7 @@ class PPOOrchestrator(Orchestrator):
             texts = self.rl_model.tokenizer.batch_decode(
                 samples, skip_special_tokens=True
             )
-            scores = torch.as_tensor(self.score(texts))
+            scores = torch.as_tensor(self.score(texts, batch))
 
             # Precompute logprobs, values
             all_tokens = torch.cat(

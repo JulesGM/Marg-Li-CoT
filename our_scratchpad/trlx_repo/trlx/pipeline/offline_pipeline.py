@@ -3,7 +3,7 @@ from typing import Iterable
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
-from transformers import DataCollatorWithPadding
+import transformers
 
 from trlx.data.ilql_types import ILQLBatch, ILQLElement
 from trlx.pipeline import BasePipeline, BaseRolloutStore, register_datapipeline
@@ -15,23 +15,53 @@ class PromptPipeline(BasePipeline):
     Tokenizes texts, and then pads them into batches
     """
 
-    def __init__(self, prompts, tokenizer=None):
+    def __init__(self, *, prompts, tokenizer=None):
         super().__init__()
-        self.tokenizer = tokenizer
+        self._tokenizer = tokenizer
         self._prompts = prompts
 
     def __getitem__(self, ix: int):
-        return self.tokenizer(self._prompts[ix])
+        assert self._prompts[ix].keys() == {"inputs", "labels"}, (
+            self._prompts[ix].keys(), {"inputs", "labels"}
+        )
+
+        inputs = self._prompts[ix]["inputs"]
+        batch = self._tokenizer(inputs)
+        label_key = "labels"
+
+        assert label_key in self._prompts[ix], list(self._prompts[ix].keys())
+
+        if label_key in self._prompts[ix]:
+            
+            outputs              = self._prompts[ix][label_key]
+            output_labels        = self._tokenizer(outputs)
+            batch[label_key]     = output_labels["input_ids"]
+        
+        return batch
 
     def __len__(self) -> int:
         return len(self._prompts)
 
     def create_loader(self, batch_size: int, shuffle=False) -> DataLoader:
-        collate_fn = (
-            DataCollatorWithPadding(self.tokenizer) if self.tokenizer else torch.vstack
+        assert self._tokenizer
+        import rich
+
+        pre_collate_fn = (
+            transformers.DataCollatorForSeq2Seq(self._tokenizer, return_tensors="pt") 
+            if self._tokenizer else torch.vstack
         )
+
+        def collate_fn(*args, **kwargs):
+            rich.print("[bold green]Collate fn called")
+            output = pre_collate_fn(*args, **kwargs)
+            rich.print("[bold red]Collate fn finished")
+            return output
+
         return DataLoader(
-            self, batch_size=batch_size, collate_fn=collate_fn, shuffle=shuffle
+            self, 
+            batch_size=batch_size, 
+            collate_fn=collate_fn, 
+            shuffle=shuffle,
         )
 
 
