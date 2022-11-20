@@ -50,7 +50,8 @@ import fast_ckpt_reader
 import marginal
 import pretrain
 import train_utils
-
+import with_trlx.trlx_exp as trlx_exp
+    
 Sequence.register(torch.Tensor)
 
 CONSOLE = console.Console(force_terminal=True, force_interactive=True, width=200)
@@ -512,7 +513,8 @@ def _load_data(
 
 class DictDataset(torch.utils.data.Dataset):
     """
-    A dataset built from a dictionary with colums that fit the typing.Sequence protocol (eg, lists, tuples, np.ndarrays, torch.Tensors).
+    A dataset built from a dictionary with colums that fit the typing.Sequence 
+    protocol (eg, lists, tuples, np.ndarrays, torch.Tensors).
     The first dimension of the sequences needs to be of the same size.
     """
     def __init__(self, data: dict[str, Sequence[Any]]):
@@ -839,8 +841,8 @@ def _init_in_rl_mode(
     )
 
     scratchpad_model = train_utils.clone_hf_model(scratchpad_pl_model._model)
-    fixed_model = train_utils.clone_hf_model(scratchpad_pl_model._model)
-    train_utils.fix_model_params_in_place(fixed_model)
+    # fixed_model = train_utils.clone_hf_model(scratchpad_pl_model._model)
+    # train_utils.fix_model_params_in_place(fixed_model)
     
     fixed_answer_model = None
     if answer_model_checkpoint_path:
@@ -860,6 +862,8 @@ def _init_in_rl_mode(
             path_fixed_answer_model=answer_model_checkpoint_path, 
         )        
 
+    return scratchpad_model, fixed_answer_model
+
     if fixed_answer_model is None:
         assert False, "This approach does not currently work"
         fixed_answer_model = fixed_model.clone()
@@ -873,6 +877,7 @@ def _init_in_rl_mode(
     assert scratchpad_model is not base_model
     assert fixed_model is not base_model
     assert fixed_answer_model is not base_model
+    
 
     return marginal.RLTraining(
         model                   = scratchpad_model,
@@ -1108,6 +1113,29 @@ def main(
         )
 
         if _should_init_rl_mode(meta_info, main_checkpoint_path):
+            scratchpad_model, fixed_answer_model = _init_in_rl_mode(
+                base_model=base_model,
+                datasets=datasets,
+                tokenizer=tokenizer,
+                answer_model_checkpoint_path=answer_model_checkpoint_path,
+                main_checkpoint_path=main_checkpoint_path,
+                meta_info=meta_info,
+                batch_sizes=batch_sizes,
+                logger=logger,
+            )
+
+            trlx_exp.train(
+                model        = scratchpad_model,
+                reward_model = fixed_answer_model,
+                tokenizer    = tokenizer, 
+                ds_train     = datasets[constants.PipelineModes.MARGINAL_LIKELIHOOD_TRAINING], 
+                ds_eval      = datasets[constants.PipelineModes.VALIDATION], 
+                ensure_not_from_scratch = True,
+                trlx_config_path = "/home/mila/g/gagnonju/Marg-Li-CoT/our_scratchpad/configs/ppo_config.yml",
+            )
+
+            sys.exit(0)
+
             pl_object = _init_in_rl_mode(
                 base_model=base_model,
                 datasets=datasets,

@@ -1,0 +1,3 @@
+[submodule "text2digits"]
+	path = text2digits
+	url = https://github.com/JulesGM/text2digits
