@@ -1,5 +1,9 @@
 import datasets
+import rich
 import rl4lms.data_pools.text_generation_pool as rl4lms_pool
+import rl4lms.envs.text_generation.registry as rl4lms_registry
+
+datasets.logging.set_verbosity_error()
 
 
 def _clean_text(sample):
@@ -12,8 +16,8 @@ def _clean_text(sample):
 def _split_answer_scratchpad(sample):
     scratchpad, answer = sample["answer"].split("####")
     return {
-        "question": sample["question"].strip(), 
-        "answer": answer.strip(), 
+        "question":   sample["question"].strip(), 
+        "answer":     answer.strip(), 
         "scratchpad": scratchpad.strip()
     }
 
@@ -28,17 +32,18 @@ def _build_dataset(split):
 class ZeroShotGSM8KTextGenPool(rl4lms_pool.TextGenPool):
     @classmethod
     def prepare(cls, split: str):
+        if split == "val":
+            split = "test"
+            
         dataset = _build_dataset(split)
 
         samples = []
         for idx, item in enumerate(dataset):
             sample = rl4lms_pool.Sample(
-                id=f"{split}_{idx}",
-                prompt_or_input_text=item["question"],
-                references=[item["answer"]],
-                meta_data={
-                    "ref_scratchpad": item["scratchpad"],
-                }
+                id                   = f"{split}_{idx}",
+                meta_data            = {"ref_scratchpad": item["scratchpad"],},
+                references           = [item["answer"]],
+                prompt_or_input_text = item["question"],
             )
             samples.append(sample)
         pool_instance = cls(samples)
@@ -46,8 +51,12 @@ class ZeroShotGSM8KTextGenPool(rl4lms_pool.TextGenPool):
         return pool_instance
 
 
+rl4lms_registry.DataPoolRegistry.add(
+    "zero_shot_gsm8k_text_gen_pool",
+    ZeroShotGSM8KTextGenPool,
+)
+
+
 if __name__ == "__main__":
     pool = ZeroShotGSM8KTextGenPool.prepare("train")
-    print(pool)
-    print(pool[0])
-    print(pool[0].references)
+    rich.print(pool[3])

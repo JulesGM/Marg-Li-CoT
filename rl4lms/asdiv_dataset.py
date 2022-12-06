@@ -9,18 +9,24 @@ import random
 import re
 import xml
 
-import datasets
 import matplotlib.pyplot as plt
 import numpy as np
 import rich
 import rich.table
 import torch
-from tqdm import tqdm
 import wget
+
+import rl4lms.data_pools.text_generation_pool as rl4lms_pool
+import rl4lms.envs.text_generation.registry as rl4lms_registry
+
 
 
 class ASDivRaw(torch.utils.data.Dataset):
-    def __init__(self, cache_path, url="https://raw.githubusercontent.com/chaochun/nlu-asdiv-dataset/master/dataset/ASDiv.xml", quiet=False):
+    def __init__(
+        self, 
+        cache_path, 
+        url="https://raw.githubusercontent.com/chaochun/nlu-asdiv-dataset/master/dataset/ASDiv.xml", 
+        quiet=False):
         super().__init__()
 
         self._cache_path = Path(cache_path)
@@ -29,7 +35,7 @@ class ASDivRaw(torch.utils.data.Dataset):
         if not self._cache_path.exists():
             if not quiet:
                 print("Downloading dataset...")
-            wget.download(self._url, out=str(self._cache_path))
+            wget.download(self._url, out=str(self._cache_path), bar=None)
             if not quiet:
                 print("Download complete.")
         
@@ -38,7 +44,10 @@ class ASDivRaw(torch.utils.data.Dataset):
 
         with self._cache_path.open() as fp:
             root = xml.etree.ElementTree.parse(fp).getroot()[0]
-            self._data = [{element.tag: element.text for element in x} | dict(x.items()) for x in root]
+            self._data = [
+                {element.tag: element.text for element in x} | 
+                dict(x.items()) for x in root
+            ]
         
         if not quiet:
             print("Parsing complete.")
@@ -118,3 +127,40 @@ class ASDivInteger(torch.utils.data.Dataset):
     def _is_integer(cls, text):
         clean_text = re.sub(r"\s+", " ", text).replace(",", "").strip()
         return re.match(r"^\-?\d+(?: \([\w\s\-\./\\]+\))?$", clean_text) is not None
+
+
+def _build_dataset_integer(split):
+    return ASDivInteger(
+        cache_path=f"asdiv.xml",
+        quiet=True,
+    )
+
+
+class ZeroShotASDivTextGenPool(rl4lms_pool.TextGenPool):
+    @classmethod
+    def prepare(cls, split: str):
+        dataset = _build_dataset_integer(split)
+
+        samples = []
+        for idx, item in enumerate(dataset):
+            sample = rl4lms_pool.Sample(
+                id                   = f"{split}_{idx}",
+                meta_data            = {"ref_scratchpad": item["scratchpad"],},
+                references           = [item["answer"]],
+                prompt_or_input_text = item["question"],
+            )
+            samples.append(sample)
+        pool_instance = cls(samples)
+        
+        return pool_instance
+
+
+rl4lms_registry.DataPoolRegistry.add(
+    "zero_shot_asdiv_text_gen_pool",
+    ZeroShotASDivTextGenPool,
+)
+
+
+if __name__ == "__main__":
+    pool = ZeroShotASDivTextGenPool.prepare("train")
+    rich.print(pool[3])
