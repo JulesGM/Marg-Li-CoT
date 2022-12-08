@@ -50,6 +50,40 @@ def flan_t5_answer_removal(input_text):
     return scratchpad, answer
 
 
+def flan_t5_answer_joiner(scratchpad, answer, tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+    assert isinstance(scratchpad   , list), type(scratchpad   )
+    assert isinstance(scratchpad[0],  int), type(scratchpad[0])
+    assert isinstance(answer   ,     list), type(answer   )
+    assert isinstance(answer[0],      int), type(answer[0])
+    assert isinstance(
+        tokenizer, 
+        transformers.PreTrainedTokenizerBase
+    ), type(tokenizer)
+
+    joiner_tokens = tokenizer.encode(
+        f". Answer: ", 
+        add_special_tokens=False,
+    )
+
+    output = (
+        scratchpad    + 
+        joiner_tokens +
+        answer        +
+        [tokenizer.eos_token_id]
+    )
+
+    mask = (
+        [0] * len(scratchpad   ) +
+        [0] * len(joiner_tokens) +
+        [1] * len(answer       ) +
+        [1]
+    )
+
+    assert all([isinstance(x, int) for x in output]), output
+
+    return torch.tensor(output), torch.tensor(mask)
+
+
 class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):    
     @beartype
     def __init__(
@@ -57,7 +91,8 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
         *,
         reward_model:            transformers.PreTrainedModel,
         reward_tokenizer:        transformers.PreTrainedTokenizerBase,
-        answer_remover_fn:       abc.Callable[[str], str],
+        generation_splitter_fn:  abc.Callable[[str], str],
+        sp_answer_joiner_fn:     abc.Callable[[str, str], tuple[torch.Tensor, torch.Tensor]],
         reward_tokenizer_kwargs: dict[str, Any] = None,
     ) -> None:
 
@@ -71,7 +106,8 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
         self._metric_model            = reward_model.to(self._device)
         self._reward_tokenizer        = reward_tokenizer
         self._reward_tokenizer_kwargs = reward_tokenizer_kwargs
-        self._answer_remover_fn       = answer_remover_fn
+        self._split_generated         = generation_splitter_fn
+        self._join_sp_answer          = sp_answer_joiner_fn
 
     def __call__(
         self, 
@@ -88,7 +124,7 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                 ###############################################################
                 # Remove the generated answer from the generated text
                 ###############################################################
-                generated_scratchpad, generated_answer = self._answer_remover_fn(
+                generated_scratchpad, generated_answer = self._split_generated(
                     next_observation.context_text
                 )
 
@@ -108,24 +144,26 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                     add_special_tokens=False,
                     **self._reward_tokenizer_kwargs,
                 )["input_ids"]
+                assert isinstance(encoded_generated_scratchpad, list), type(encoded_generated_scratchpad)
+                assert isinstance(encoded_generated_scratchpad[0], int), type(encoded_generated_scratchpad[0])
 
+                assert len(next_observation.target_or_reference_texts) == 1
                 encoded_answ = self._reward_tokenizer(
-                    next_observation.target_or_reference_texts,
+                    next_observation.target_or_reference_texts[0],
                     add_special_tokens=False,
                     **self._reward_tokenizer_kwargs,
                 )["input_ids"]
 
-                assert len(encoded_answ) == 1, len(encoded_answ)
-                encoded_answ = encoded_answ[0]
                 assert isinstance(encoded_answ, list), type(encoded_answ)
-                
-                new_list = (
-                    encoded_generated_scratchpad +
-                    encoded_answ +
-                    [self._reward_tokenizer.eos_token_id]
+                assert isinstance(encoded_answ[0], int), type(encoded_answ[0])
+                                
+                new_list, rl_mask = self._join_sp_answer(
+                    scratchpad=encoded_generated_scratchpad,
+                    answer=encoded_answ,
+                    tokenizer=self._reward_tokenizer,
                 )
                 
-                decoder_input_ids = torch.tensor(new_list).to(self._device)
+                decoder_input_ids = new_list.to(self._device)
                 assert decoder_input_ids.ndim == 1, decoder_input_ids.shape
 
                 console.print("[bold red]#[/]" * 80)
@@ -133,17 +171,19 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                     f"[bold blue]target                [/]: "
                     f"\"{self._reward_tokenizer.decode(encoded_answ)}\""
                 )
+
                 assert len(next_observation.target_or_reference_texts) == 1, (
                     next_observation.target_or_reference_texts)
+
                 console.print(
                     f"[bold blue]reference text        [/]: "
                     f"[bold green]\"{next_observation.target_or_reference_texts[0]}\"[/]"
                 )
+
                 console.print(
-                    f"[bold  blue]generated ANSWER            [/]: "
+                    f"[bold  blue]generated ANSWER     [/]: "
                     f"[red   bold]\"{generated_answer    }\"[/]"
                 )
-
 
                 console.print(
                     f"[bold blue]encoder_input_ids text[/]: "
@@ -154,12 +194,12 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                     f"\"{self._reward_tokenizer.decode(decoder_input_ids)}\""
                 )
                 console.print(
-                    f"[bold  blue]generated SCRATCHPAD        [/]: "
+                    f"[bold  blue]generated SCRATCHPAD [/]: "
                     f"[green     ]\"{generated_scratchpad}\"[/]"
                 )
                 console.print(
                     f"[bold blue]raw generated text    [/]: "
-                    f"[red     ]\"{next_observation.context_text}\"[/]"
+                    f"[green     ]\"{next_observation.context_text}\"[/]"
                 )
                 
                 assert next_observation.context_encoded_pt.shape[0] == 1, (
@@ -199,13 +239,7 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                 assert full_predictions.shape[0] == logp.shape[0], (full_predictions.shape[0], logp.shape[0],)
                 assert logp.ndim        == 1, (logp.ndim    , 1,)
 
-                score_mask = torch.tensor(
-                    [0] * len(encoded_generated_scratchpad) + 
-                    [1] * len(encoded_answ) +
-                    [1]
-                ).to(self._device)
-
-                logp_answer = logp[score_mask == 1].sum(-1)
+                logp_answer = logp[rl_mask.to(self._device) == 1].sum(-1)
 
                 return logp_answer.item()
 

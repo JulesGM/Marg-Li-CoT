@@ -5,6 +5,8 @@ import re
 import types
 
 import datasets
+import json
+import logging
 import numpy as np
 import rich
 import rich.console
@@ -16,6 +18,9 @@ from tqdm import tqdm
 import transformers
 from typing import *
 import yaml
+import pickle
+from pathlib import Path
+import datetime
 
 datasets    .logging.set_verbosity_error()
 transformers.logging.set_verbosity_error()
@@ -25,20 +30,83 @@ import metric
 import reward
 import gsm8k_dataset
 import asdiv_dataset
+import general_utils as utils
+
 
 sys.path.append("/home/mila/g/gagnonju/RL4LMs")
 import rl4lms.envs.text_generation.training_utils as rl4lms_training_utils
 import rl4lms.envs.text_generation.logging_utils  as rl4lms_logging_utils
 import rl4lms.envs.text_generation.registry       as rl4lms_registry
-
-CONSOLE     = rich.console.Console(width=81)
+CONSOLE     = rich.console.Console(width=80)
 NUM_PAT     = re.compile(r"\d+(?:[\,\.]\d+)?")
 TEXT2DIGITS = text2digits.Text2Digits()
 
+
 REWARD_MODEL_DTYPE   = torch.float32
 REWARD_MODEL_HF_NAME = "google/flan-t5-small"
-POLICY_MODEL_HF_NAME = REWARD_MODEL_HF_NAME
+POLICY_TYPE          = "custom"
+DO_PROFILE           = True
+N_ENVS_TRAIN         = 1    
+EVAL_BATCH_SIZE      = 100
 POLICY_DTYPE         = REWARD_MODEL_DTYPE
+POLICY_MODEL_HF_NAME = REWARD_MODEL_HF_NAME
+LOG_LEVEL           = logging.WARNING
+
+
+###############################################################################
+###############################################################################
+
+
+SETTINGS = dict(
+    DO_PROFILE           = DO_PROFILE,
+    POLICY_TYPE          = POLICY_TYPE,
+    POLICY_DTYPE         = POLICY_DTYPE,
+    N_ENVS_TRAIN         = N_ENVS_TRAIN,
+    EVAL_BATCH_SIZE      = EVAL_BATCH_SIZE,
+    REWARD_MODEL_DTYPE   = REWARD_MODEL_DTYPE,
+    REWARD_MODEL_HF_NAME = REWARD_MODEL_HF_NAME,
+    POLICY_MODEL_HF_NAME = POLICY_MODEL_HF_NAME,
+)
+utils.print_dict(SETTINGS)
+
+
+_shared_pol_args = {
+    "prompt_truncation_side": "right",
+    "apply_model_parallel"  : True,
+    "model_name"            : POLICY_MODEL_HF_NAME,
+    "generation_kwargs"     : {
+        "max_new_tokens": 200,
+        "min_length"    : 15,
+        "do_sample"     : True,
+        "top_k"         : 50,
+    }
+}
+
+POL_BASIC = lambda _: {
+    "id": "seq2seq_lm_actor_critic_policy",
+    "args": _shared_pol_args,
+}
+
+POL_CUSTOM = lambda reward_model_inst: {
+    "id"  : "precision_control_seq2seq_lm_actor_critic_policy",
+    "args": {
+        "from_pretrained_kwargs": {"torch_dtype": POLICY_DTYPE},
+        "head_kwargs"           : {"dtype": POLICY_DTYPE},
+        "same_model_for_value"  : True,
+        "ref_model"             : reward_model_inst, 
+        } | _shared_pol_args
+}
+
+
+
+if POLICY_TYPE == "custom":
+    POLICY = POL_CUSTOM
+elif POLICY_TYPE == "naive":
+    POLICY = POL_BASIC
+else:
+    raise ValueError(f"Invalid policy type: {POLICY_TYPE}")
+
+
 
 torch.set_default_dtype(REWARD_MODEL_DTYPE)
 
@@ -126,10 +194,13 @@ def main():
     CONSOLE.print("[bold bright_yellow]#" * 80)
 
     reward_model_inst = transformers.AutoModelForSeq2SeqLM.from_pretrained(
-        REWARD_MODEL_HF_NAME, torch_dtype=REWARD_MODEL_DTYPE)
+        REWARD_MODEL_HF_NAME, torch_dtype=REWARD_MODEL_DTYPE).eval()
     reward_model_tok  = transformers.AutoTokenizer        .from_pretrained(
         REWARD_MODEL_HF_NAME)
     
+    for param in reward_model_inst.parameters():
+        param.requires_grad = False
+
     CONSOLE.print("[bold bright_yellow]#" * 80)
     CONSOLE.print("[bold bright_yellow]# <<< Done loading reward model")
     CONSOLE.print("[bold bright_yellow]#" * 80)
@@ -148,25 +219,7 @@ def main():
             "target_kl": 0.2,
             "coeff"    : 0.001, 
         },
-        "policy": {
-            # "id"  : "precision_control_seq2seq_lm_actor_critic_policy",
-            "id"  : "seq2seq_lm_actor_critic_policy",
-            
-            "args": {
-                # "from_pretrained_kwargs": {"torch_dtype": POLICY_DTYPE},
-                # "head_kwargs"           : {"dtype": POLICY_DTYPE},
-
-                "prompt_truncation_side": "right",
-                "apply_model_parallel"  : True,
-                "model_name"            : POLICY_MODEL_HF_NAME,
-                "generation_kwargs"     : {
-                    "max_new_tokens": 200,
-                    "min_length"    : 15,
-                    "do_sample"     : True,
-                    "top_k"         : 50,
-                }
-            }
-        }
+        "policy": POLICY(reward_model_inst)
     }
 
     datapool_config = {
@@ -175,12 +228,12 @@ def main():
     }
 
     env_config = {
-        "n_envs": 1,  # was 10
+        "n_envs": N_ENVS_TRAIN,  
         "args"  : {
             "prompt_truncation_side": "right",
             "context_start_token"   : 0,
-            "max_episode_length"    : 200,
-            "max_prompt_length"     : 512,
+            "max_episode_length"    : 100,
+            "max_prompt_length"     : 200,
             "terminate_on_eos"      : True,
         }
     }
@@ -189,7 +242,8 @@ def main():
         "id"  : "scratchpad_answer_reward",
         "args": {
             "reward_tokenizer_kwargs": {"padding": True},
-            "answer_remover_fn"      : reward.flan_t5_answer_removal,
+            "generation_splitter_fn" : reward.flan_t5_answer_removal,
+            "sp_answer_joiner_fn"    : reward.flan_t5_answer_joiner,
             "reward_tokenizer"       : reward_model_tok,
             "reward_model"           : reward_model_inst,
         },
@@ -203,16 +257,16 @@ def main():
     }
 
     train_evaluation_config = {
-        "eval_batch_size": 100,
+        "eval_batch_size": EVAL_BATCH_SIZE,
         "eval_every"     : 10,
         "save_every"     : 1,
-        "n_iters"        : 100,
+        "n_iters"        : 1,
         "metrics"        : [
             {
                 "id": "scratchpad_answer_accuracy",
                 "args": {
-                    "extract_answer_fn"      : split_fn,
-                    "make_answ_comparable_fn": metric.convert_to_int,
+                    "extract_answer_fn" : split_fn,
+                    "make_comparable_fn": metric.convert_to_int,
                 },
             }
         ],
@@ -234,7 +288,7 @@ def main():
         "env"             : env_config,
         "alg"             : alg_config,
     }
-
+    
     tracker = rl4lms_logging_utils.Tracker(
         base_path_to_store_results = "/home/mila/g/gagnonju/Marg-Li-CoT/rl4lms/results/",
         experiment_name            = "first_experiments",
@@ -242,6 +296,7 @@ def main():
         entity_name                = "julesgm",
         run_config                 = clean_config_for_wandb(config),
         wandb_log                  = True,
+        log_level                  = LOG_LEVEL,
     )
 
     trainer = rl4lms_training_utils.OnPolicyTrainer( 
@@ -255,20 +310,34 @@ def main():
     )
 
 
-    # with profile(
-    #     profile_memory = True, 
-    #     record_shapes  = True,
-    #     activities     = [ProfilerActivity.CUDA],
-    # ) as prof:
-    #     try:
-    #         transformers.logging.set_verbosity_error()
-    #         datasets    .logging.set_verbosity_error()
+    if DO_PROFILE:
+        prof = profile(
+            profile_memory = True, 
+            record_shapes  = True,
+            activities     = [ProfilerActivity.CUDA],
+        ).__enter__()
+
+    transformers.logging.set_verbosity_error()
+    datasets    .logging.set_verbosity_error()
     trainer.train_and_eval()
 
+    if DO_PROFILE:
+        CONSOLE.print("[blue bold]Our code: [white bold]prof.__exit__")
+        prof.__exit__(None, None, None)
+        CONSOLE.print("[blue bold]Our code: [white bold]Done with prof.__exit__")
+        CONSOLE.print("[blue bold]Our code: [white bold]preparing prof output")
+        prof_obj = prof.key_averages()
 
-    # rich.print("[green bold]Preparing profile results...")
-    # output = prof.key_averages().table(sort_by="self_gpu_memory_usage", row_limit=10)
-    # rich.print(output)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        path = f"/home/mila/g/gagnonju/Marg-Li-CoT/rl4lms/profiling/profiling_{timestamp}_{POLICY_TYPE}"
+        with Path(path + ".pkl").open("wb") as f:
+            pickle.dump(prof_obj, f)
+        with Path(path + ".json").open("w") as f:
+            json.dump(SETTINGS, f, indent=4, default=str)
+
+        output = prof_obj.table(sort_by="self_cuda_memory_usage", row_limit=100)
+        "[blue bold]Our code: [white bold]Done preparing prof output"
+        CONSOLE.print(output)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,59 @@
+model:
+  model_path: null  # Name of hf model to load
+  tokenizer_path: null  # Name of hf tokenizer to load
+  model_type: "AcceleratePPOModel"  # Name of accelerate model type to load
+  num_layers_unfrozen: 2  # Number of bottom layers to freeze during training
+  tokenizer_kwargs:
+    padding_side: "left"
+
+train:
+  seq_length: 100  # Size of LM context
+  epochs: 1000  # Train for max(epochs, total_steps)
+
+  total_steps: 10000000000000000000  # Train for max(epochs, total_steps)
+  batch_size: 128  # batch size
+
+  lr_ramp_steps: 100  # learning rate warm up
+  lr_decay_steps: 79000  # learning rate decay
+  weight_decay: 1.0e-6  # weight decay param
+  learning_rate_init: 1.412e-4  # init learning rate
+  learning_rate_target: 1.412e-4  # target final learning rate
+  opt_betas: [0.9, 0.95] # adam betas
+
+  checkpoint_interval: 10000  # checkpoint interval
+  eval_interval: 200  # eval interval #JULES CHANGED ITT, DEFAULT 16
+
+  pipeline: "PPOPipeline"  # prompt pipeline to load
+  orchestrator: "PPOOrchestrator"  # orchestrator to load
+
+method:
+  ###################
+  # Things I changed:
+  ###################
+  init_kl_coef: 0.2 # init kl coefficient
+  target: 6 # target kl coefficient, set None for fixed kl coef
+  horizon: 1000  # PPO horizon
+
+  ###################
+  # Rest:
+  ###################
+  name: 'ppoconfig'  # Name of RL method config
+  num_rollouts: 128  # Number of rollouts to collect per epoch (Jules: Batch size, essentially)
+  chunk_size: 128  # Number of rollouts to collect in one loop of orchestrator
+  ppo_epochs: 4  # Number of ppo epochs
+  
+  gamma: 1  # PPO discount
+  lam: 0.95  # PPO lambda
+  cliprange: 0.2  # clip range
+  cliprange_value: 0.2  # clip range
+  vf_coef: 2.3  # value term weight
+  gen_kwargs:
+    max_new_tokens: 100
+    min_length: 0  # LM min sample gen length
+    top_k: 0.0  # top k
+    top_p: 1.0  # top p
+
+    ##########
+    # Things I changed in gen_kwargs:
+    ##########
+    do_sample: False  # True # sample
