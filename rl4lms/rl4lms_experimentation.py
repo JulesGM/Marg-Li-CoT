@@ -1,29 +1,32 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import re
-import types
-
-import datasets
+import datetime
+import os
 import json
 import logging
+from pathlib import Path
+import pickle
+import re
+import sys
+import types
+from typing import *
+import yaml
+
+import datasets
 import numpy as np
 import rich
 import rich.console
-import sys
 from text2digits import text2digits
 import torch
 from   torch.profiler import profile, record_function, ProfilerActivity
 from tqdm import tqdm
 import transformers
-from typing import *
-import yaml
-import pickle
-from pathlib import Path
-import datetime
+
 
 datasets    .logging.set_verbosity_error()
 transformers.logging.set_verbosity_error()
+
 
 import policy
 import metric
@@ -37,17 +40,21 @@ sys.path.append("/home/mila/g/gagnonju/RL4LMs")
 import rl4lms.envs.text_generation.training_utils as rl4lms_training_utils
 import rl4lms.envs.text_generation.logging_utils  as rl4lms_logging_utils
 import rl4lms.envs.text_generation.registry       as rl4lms_registry
-CONSOLE     = rich.console.Console(width=80)
-NUM_PAT     = re.compile(r"\d+(?:[\,\.]\d+)?")
+CONSOLE = rich.console.Console(width=80)
+LOGGER = logging.getLogger(__name__)
+NUM_PAT = re.compile(r"\d+(?:[\,\.]\d+)?")
 TEXT2DIGITS = text2digits.Text2Digits()
 
 
-REWARD_MODEL_DTYPE   = torch.float32
-REWARD_MODEL_HF_NAME = "google/flan-t5-small"
+torch.backends.cuda.matmul.allow_tf32 = True
+
+
+REWARD_MODEL_DTYPE   = torch.bfloat16
+REWARD_MODEL_HF_NAME = "google/flan-t5-xxl"
 POLICY_TYPE          = "custom"
 DO_PROFILE           = True
 N_ENVS_TRAIN         = 1    
-EVAL_BATCH_SIZE      = 100
+EVAL_BATCH_SIZE      = 1
 POLICY_DTYPE         = REWARD_MODEL_DTYPE
 POLICY_MODEL_HF_NAME = REWARD_MODEL_HF_NAME
 LOG_LEVEL           = logging.WARNING
@@ -118,14 +125,14 @@ def deal_with_words(text: str) -> Optional[float]:
     if not output:
         return None
 
-    CONSOLE.print("[bold blue]" + "#" * 80)
-    CONSOLE.print(
+    LOGGER.info("[bold blue]" + "#" * 80)
+    LOGGER.info(
         f"[bold blue]# text2digits[/]:\n"
         f" \t -> [green]source:[/]    {text}\n"
         f" \t -> [green]converted:[/] {converted}\n"
         f" \t -> [green]final:[/]     {output}"
     )
-    CONSOLE.print("[bold blue]" + "#" * 80)
+    LOGGER.info("[bold blue]" + "#" * 80)
 
     return output 
 
@@ -147,7 +154,7 @@ def split_fn(generated_text: str) -> Optional[str]:
         if output is not None:
             output = output[-1]
         else:
-            CONSOLE.print(
+            LOGGER.info(
                 f"[red]split_fn: no numbers found. \n"
                 f"\t-> Received:[/] `{generated_text}`"
             )
@@ -180,18 +187,44 @@ def clean_config_for_wandb(config_node: Any) -> Any:
     else:
         if isinstance(config_node, types.FunctionType):
             transformed_node = f"Function called `{config_node.__name__}`"
-            CONSOLE.print(f"[red]{transformed_node}")
+            LOGGER.info(f"[red]{transformed_node}")
         else:
-            transformed_node = f"Instance of type `{type(config_node).__name__}`"
-            CONSOLE.print(f"[red]{transformed_node}")
+            transformed_node = (
+                f"Instance of type "
+                f"`{type(config_node).__name__}`"
+            )
+            LOGGER.info(f"[red]{transformed_node}")
     return transformed_node
 
 
+def log_rank_0(level, message):
+    if os.getenv("LOCAL_RANK", "0") == "0":
+        LOGGER.log(level, message)
+
+
+def info_rank_0(message):
+    log_rank_0(logging.INFO, message)
+
+
+def debug_rank_0(message):
+    log_rank_0(logging.DEBUG, message)
+
 
 def main():
-    CONSOLE.print("[bold bright_yellow]#" * 80)
-    CONSOLE.print("[bold bright_yellow]# >>> Loading REWARD model")
-    CONSOLE.print("[bold bright_yellow]#" * 80)
+    
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+
+    logging.basicConfig(
+        level=logging.INFO, 
+        format=f"[{local_rank + 1} / {world_size}]:\t%(message)s", 
+        datefmt="[%X]", 
+        handlers=[rich.logging.RichHandler(markup=True, rich_tracebacks=True)]
+    )
+
+    LOGGER.info("[bold bright_yellow]#" * 80)
+    LOGGER.info("[bold bright_yellow]# >>> Loading REWARD model")
+    LOGGER.info("[bold bright_yellow]#" * 80)
 
     reward_model_inst = transformers.AutoModelForSeq2SeqLM.from_pretrained(
         REWARD_MODEL_HF_NAME, torch_dtype=REWARD_MODEL_DTYPE).eval()
@@ -201,9 +234,9 @@ def main():
     for param in reward_model_inst.parameters():
         param.requires_grad = False
 
-    CONSOLE.print("[bold bright_yellow]#" * 80)
-    CONSOLE.print("[bold bright_yellow]# <<< Done loading reward model")
-    CONSOLE.print("[bold bright_yellow]#" * 80)
+    LOGGER.info("[bold bright_yellow]#" * 80)
+    LOGGER.info("[bold bright_yellow]# <<< Done loading reward model")
+    LOGGER.info("[bold bright_yellow]#" * 80)
 
     alg_config = {
         "id": "ppo",
@@ -322,14 +355,15 @@ def main():
     trainer.train_and_eval()
 
     if DO_PROFILE:
-        CONSOLE.print("[blue bold]Our code: [white bold]prof.__exit__")
+        LOGGER.info("[blue bold]Our code: [white bold]prof.__exit__")
         prof.__exit__(None, None, None)
-        CONSOLE.print("[blue bold]Our code: [white bold]Done with prof.__exit__")
-        CONSOLE.print("[blue bold]Our code: [white bold]preparing prof output")
+        LOGGER.info("[blue bold]Our code: [white bold]Done with prof.__exit__")
+        LOGGER.info("[blue bold]Our code: [white bold]preparing prof output")
+        
         prof_obj = prof.key_averages()
-
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         path = f"/home/mila/g/gagnonju/Marg-Li-CoT/rl4lms/profiling/profiling_{timestamp}_{POLICY_TYPE}"
+
         with Path(path + ".pkl").open("wb") as f:
             pickle.dump(prof_obj, f)
         with Path(path + ".json").open("w") as f:
@@ -337,7 +371,7 @@ def main():
 
         output = prof_obj.table(sort_by="self_cuda_memory_usage", row_limit=100)
         "[blue bold]Our code: [white bold]Done preparing prof output"
-        CONSOLE.print(output)
+        LOGGER.info(output)
 
 
 if __name__ == "__main__":

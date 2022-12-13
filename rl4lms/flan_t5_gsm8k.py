@@ -55,18 +55,44 @@ import transformers
 import wget
 
 import general_utils as utils
-
 import asdiv_dataset
 
-# importlib.reload(text2digits)
+
+MODEL_NAME = "google/flan-t5-xxl"
 
 
+model_precision = torch.float16
+do_autocast = False
+use_dp = True
 
-dataset_train = datasets.load_dataset("gsm8k", "main", split="train")
-dataset_test  = datasets.load_dataset("gsm8k", "main", split="test")
+verbose = True
+shuffle = True
+n_shots = 1
+num_beams = 8
+batch_size = 8
+max_new_tokens = 200
+with_scratchpads = True
+use_majority_vote = True
+use_group_beam_search = False
+few_shot_context_rng_seed = 42  # Makes sure the context is the same if we want it to stay the same
+generation_extra_kwargs = dict(repetition_penalty=50.)
+
+
+###############################################################################
+###############################################################################
+
+def model_unwrap(model):
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module
+    return model
+
 
 def clean_text(sample):
-    return {k: v.replace("<<", "(").replace(">>", ")").strip() for k, v in sample.items()}
+    return {
+        k: v.replace("<<", "(").replace(">>", ")").strip()
+        for k, v in sample.items()
+    }
+
 
 def split_answer_scratchpad(sample):
     scratchpad, answer = sample["answer"].split("####")
@@ -77,49 +103,20 @@ def split_answer_scratchpad(sample):
     }
 
 
-dataset_train = dataset_train.map(clean_text).map(split_answer_scratchpad)
-dataset_test  = dataset_test .map(clean_text).map(split_answer_scratchpad)
-
-print(dataset_train[0].keys())
-print(dataset_test[0].keys())
-
-
-# dataset_train = asdiv_dataset.ASDivInteger(cache_path="ASDiv.xml", quiet=False)
-# dataset_test  = dataset_train
-
-
-###############################################################################
-# Load the model
-###############################################################################
-model_name = "google/flan-t5-xxl"
-tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
-
-with utils.ctx_timeit(f"Loading model `{model_name}`"):
-    model = transformers.AutoModelForSeq2SeqLM.from_pretrained(model_name)
-
-with utils.ctx_timeit("Converting model's type"):
-    # model_cpu
-    pass
-
-with utils.ctx_timeit(f"Moving model to GPU"):
-    model = model.cuda()
-
-rich.print(f"[bold blue]Model dtype:[/]  {model.dtype}")
-devices = collections.Counter(x.device.type for x in model.parameters())
-rich.print(f"\n[bold blue]Model device:[/] {devices}")
-
-assert len(devices) == 1 and "cuda" in devices, devices
-
-
-
-
 text2digits_ = text2digits.Text2Digits()
 num_pat = re.compile(r"\d+(?:[\,\.]\d+)?")
 
 
 def deal_with_words(text):
     converted = text2digits_.convert(text)
-    output = num_pat.findall(converted)[-1]
+
+
+    all_found = num_pat.findall(converted)
+    
+    if not all_found:
+        raise ValueError(f"Could not find any numbers in `{converted}`. Original text: `{text}`.")
+
+    output = all_found[-1]
     rich.print(
         f"[bold blue]text2digits[/]:\n"
         f" \t - [green]source:[/]    {text}\n"
@@ -263,9 +260,11 @@ def compare(pred, answ):
 
 def run(
     *,
+    use_dp,
+    do_autocast,
+    model_precision,
     shuffle,
     verbose,
-    context,
     num_beams,
     batch_size,
     max_new_tokens,
@@ -275,7 +274,55 @@ def run(
     generation_extra_kwargs
 ):
     args = locals().copy()
-    
+        
+
+    dataset_train = datasets.load_dataset("gsm8k", "main", split="train")
+    dataset_test  = datasets.load_dataset("gsm8k", "main", split="test")
+
+    dataset_train = dataset_train.map(clean_text).map(split_answer_scratchpad)
+    dataset_test  = dataset_test .map(clean_text).map(split_answer_scratchpad)
+
+    print(dataset_train[0].keys())
+    print(dataset_test[0].keys())
+
+
+    # dataset_train = asdiv_dataset.ASDivInteger(cache_path="ASDiv.xml", quiet=False)
+    # dataset_test  = dataset_train
+
+    context = ContextGeneration.compose_fewshot_context(
+            dataset_train, 
+            n_shots, 
+            with_scratchpads, 
+            few_shot_context_rng_seed,
+        )
+
+
+    rich.print(
+        f"[bold blue]Context[/]:\n" +
+        context
+    )
+
+    ###############################################################################
+    # Load the model
+    ###############################################################################
+    tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    rich.print(f"[bold blue]Loading the model [bold white]{MODEL_NAME}")
+    with utils.ctx_timeit(f"Loading model `{MODEL_NAME}`"):
+        model = transformers.AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, torch_dtype=model_precision)
+
+    with utils.ctx_timeit("Converting model's type"):
+        # model_cpu
+        pass
+
+    if use_dp:
+        model.parallelize()
+    else:
+        with utils.ctx_timeit(f"Moving model to GPU"):
+            model = model.cuda()
+
+    rich.print(f"[bold blue]Model dtype:[/]  {model}")
+
     with torch.inference_mode():
         dataloader = torch.utils.data.DataLoader(
             dataset_test,
@@ -294,6 +341,14 @@ def run(
             extra_kwargs["num_beam_groups"] = num_beams
 
         for batch in tqdm_obj:
+            if do_autocast:
+                ctx_obj = torch.amp.autocast(device_type="cuda", dtype=model_precision)
+                ctx_obj.__enter__()
+
+            utils.check_equal(batch["input_ids"].shape[0], batch_size)
+            utils.check_equal(batch["input_ids"].shape[0], batch["attention_mask"].shape[0])
+            utils.check_equal(batch["input_ids"].shape[1], batch["attention_mask"].shape[1])
+
             output = model.generate(
                 input_ids            = batch["input_ids"],
                 attention_mask       = batch["attention_mask"],
@@ -302,6 +357,9 @@ def run(
                 max_new_tokens       = max_new_tokens,
                 **extra_kwargs
             ).reshape(batch_size, num_beams if use_majority_vote else 1, -1)
+
+            if do_autocast:
+                ctx_obj.__exit__(None, None, None)
 
             predictions = list(majority_vote_batch(output, tokenizer, split_fn, verbose))
             raw_decoded = [
@@ -348,40 +406,12 @@ def run(
         rich.print(f"[bold green]Accuracy, {model.dtype}: {accuracy:.1%}")
 
 
-verbose = True
-shuffle = True
-n_shots = 16
-num_beams = 8
-batch_size = 1
-max_new_tokens = 200
-with_scratchpads = True
-use_majority_vote = True
-use_group_beam_search = False
-few_shot_context_rng_seed = 42  # Makes sure the context is the same if we want it to stay the same
-
-generation_extra_kwargs = dict(
-    repetition_penalty=50.,
-)
-
-
-context = ContextGeneration.compose_fewshot_context(
-        dataset_train, 
-        n_shots, 
-        with_scratchpads, 
-        few_shot_context_rng_seed,
-    )
-
-
-rich.print(
-    f"[bold blue]Context[/]:\n" +
-    context
-)
-
-
 run(
+    use_dp=use_dp,
+    model_precision=model_precision,
+    do_autocast=do_autocast,
     shuffle=shuffle,
     verbose=verbose,
-    context=context,
     num_beams=num_beams, 
     batch_size=batch_size, 
     max_new_tokens=max_new_tokens, 

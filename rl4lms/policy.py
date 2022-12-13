@@ -10,6 +10,9 @@ sys.path.append("/home/mila/g/gagnonju/RL4LMs")
 import rl4lms.envs.text_generation.registry as rl4lms_registry
 import rl4lms.envs.text_generation.policy.seq2seq_policy as rl4lms_seq2seq_policy
 from rl4lms.envs.text_generation import hf_generation_utils 
+import transformers
+import transformers.deepspeed
+import deepspeed
 
 CONSOLE = rich.console.Console(
     width=80,
@@ -29,7 +32,7 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
     rl4lms_seq2seq_policy.Seq2SeqLMActorCriticPolicy):
     def __init__(
         self,
-        *args,
+        *,
         from_pretrained_kwargs,
         head_kwargs,
         same_model_for_value,
@@ -46,31 +49,8 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         self._same_model_for_value   = same_model_for_value
         self._from_pretrained_kwargs = from_pretrained_kwargs
 
-        super().__init__(*args, **kwargs)
+        super().__init__(**kwargs)
         
-        #######################################################################
-        # Check the devices of each module in this module.
-        # It is strange because the original code doesn't have to do this.
-        #######################################################################
-
-        # self.to("cuda")
-        # assert self.device == "cuda", f"Got `{self.device}`"
-        # for k, v in vars(self).items():
-        #     if k == "features_extractor_class":
-        #         continue
-            
-        #     if hasattr(v, "device"):
-        #         assert v.device == self.device, f"{k}:{v.device} != {self.device}"
-        #         print("{k} is ok - device")
-
-        #     if hasattr(v, "parameters"):
-        #         try:
-        #             for p in v.parameters():
-        #                 assert p.device == self.device, f"{k}: {p.device} != {self.device}"
-        #         except TypeError:
-        #             print(f"{k}")
-        #             raise
-        #         print("{k} is ok - parameters")
 
     def _build_model_heads(self, model_name: str):
         """
@@ -155,6 +135,50 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         else:
             assert False    
         
+
+
+class DeepSpeedExperimentationPolicy(rl4lms_seq2seq_policy.Seq2SeqLMActorCriticPolicy):
+    def __init__(self, *args, ds_config, **kwargs):
+        super().__init__(*args, **kwargs)
+                
+        self._dschf = transformers.deepspeed.HfDeepSpeedConfig(ds_config)  
+        
+        models = {
+            "_policy_model": self._policy_model, 
+            "_value_model": self._value_model, 
+            "_ref_model": self._ref_model, 
+            "_value_head": self._value_head,
+        }
+        # engines = []
+        # for idx, (attr_name, model) in enumerate(models.items()):
+        #     engine = deepspeed.initialize(
+        #         model=model, 
+        #         optimizer=self.optimizer,
+        #         dist_init_required=idx == 0,
+        #         config_params=ds_config,
+        #     )[0]
+        #     engines.append(engine)
+        #     setattr(self, attr_name, engine)
+
+        # self.optimizer = OptimizerMerger(engines)
+
+        
+
+
+
+    def _build_model_heads(self, model_name: str):
+        self._policy_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+            model_name)
+        self._policy_model.__class__ = hf_generation_utils.override_generation_routines(
+            type(self._policy_model))
+
+        self._value_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+            model_name)
+        self._ref_model = copy.deepcopy(self._policy_model).eval()
+
+        self._value_head = torch.nn.Linear(
+            self._value_model.config.hidden_size, 1, bias=False)
+
 
 rl4lms_registry.PolicyRegistry.add(
     "precision_control_seq2seq_lm_actor_critic_policy",
