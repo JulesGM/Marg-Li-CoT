@@ -1,6 +1,8 @@
 import copy
-from typing import *
+import logging
+import os
 import sys
+from typing import *
 
 import rich
 import torch
@@ -14,6 +16,13 @@ import transformers
 import transformers.deepspeed
 import deepspeed
 
+from our_scratchpad.bin_deepspeed_experim import OptimizerMerger
+
+import general_utils as utils
+
+LOGGER = logging.getLogger(__name__)
+
+
 CONSOLE = rich.console.Console(
     width=80,
     force_terminal=True,
@@ -23,9 +32,10 @@ def msg(text, color, inner_color=None):
     if inner_color is None:
         inner_color = color
 
-    CONSOLE.print(f"[{color} bold]#" * 80)
-    CONSOLE.print(f"[{color} bold]# [bold {inner_color}]{text}")
-    CONSOLE.print(f"[{color} bold]#" * 80)
+    utils.info_rank_0(LOGGER, f"[{color} bold]#" * 80)
+    utils.info_rank_0(LOGGER, f"[{color} bold]#" * 80)
+    utils.info_rank_0(LOGGER, f"[{color} bold]# [bold {inner_color}]{text}")
+    utils.info_rank_0(LOGGER, f"[{color} bold]#" * 80)
 
 
 class PrecisionControlSeq2SeqLMActorCriticPolicy(
@@ -40,9 +50,9 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         **kwargs,
     ):
         
-        CONSOLE.print("[bright_magenta bold]#" * 80)
-        CONSOLE.print("[bright_magenta bold]# [bright_cyan]POLICY PrecisionControlSeq2SeqLMActorCriticPolicy.__call__")
-        CONSOLE.print("[bright_magenta bold]#" * 80)
+        utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
+        utils.info_rank_0(LOGGER, "[bright_magenta bold]# [bright_cyan]POLICY PrecisionControlSeq2SeqLMActorCriticPolicy.__call__")
+        utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
 
         self._reward_model_container = [ref_model] if ref_model else None
         self._head_kwargs            = head_kwargs
@@ -138,32 +148,41 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
 
 
 class DeepSpeedExperimentationPolicy(rl4lms_seq2seq_policy.Seq2SeqLMActorCriticPolicy):
-    def __init__(self, *args, ds_config, **kwargs):
+    def __init__(self, *args, ds_configs, **kwargs):
+    
+        kwargs["apply_model_parallel"] is False, kwargs["apply_model_parallel"]
         super().__init__(*args, **kwargs)
+        assert self._apply_model_parallel is False, self._apply_model_parallel
                 
-        self._dschf = transformers.deepspeed.HfDeepSpeedConfig(ds_config)  
+        self._ds_train_config, self._ds_inference_config = ds_configs
+        self._dschf = transformers.deepspeed.HfDeepSpeedConfig(self._ds_train_config)
+
+        deepspeed.init_distributed()
+        self._policy_model = deepspeed.initialize(
+            model=self._policy_model, 
+            dist_init_required=False,
+            config_params=self._ds_train_config,
+        )[0]
+        self._value_model = deepspeed.initialize(
+            model=self._value_model, 
+            dist_init_required=False,
+            config_params=self._ds_train_config,
+        )[0]
+        self._value_head = deepspeed.initialize(
+            model=self._value_head,
+            dist_init_required=False,
+            config_params=self._ds_train_config,
+        )[0]
+
+        self._ref_model = deepspeed.init_inference(
+            model=self._ref_model,
+            mp_size=os.environ["WORLD_SIZE"],
+            config=self._ds_inference_config,
+        )
         
-        models = {
-            "_policy_model": self._policy_model, 
-            "_value_model": self._value_model, 
-            "_ref_model": self._ref_model, 
-            "_value_head": self._value_head,
-        }
-        # engines = []
-        # for idx, (attr_name, model) in enumerate(models.items()):
-        #     engine = deepspeed.initialize(
-        #         model=model, 
-        #         optimizer=self.optimizer,
-        #         dist_init_required=idx == 0,
-        #         config_params=ds_config,
-        #     )[0]
-        #     engines.append(engine)
-        #     setattr(self, attr_name, engine)
-
-        # self.optimizer = OptimizerMerger(engines)
-
-        
-
+        self.optimizer = OptimizerMerger(
+            [self._policy_model, self._value_model, self._value_head]
+        )
 
 
     def _build_model_heads(self, model_name: str):
@@ -178,6 +197,11 @@ class DeepSpeedExperimentationPolicy(rl4lms_seq2seq_policy.Seq2SeqLMActorCriticP
 
         self._value_head = torch.nn.Linear(
             self._value_model.config.hidden_size, 1, bias=False)
+
+rl4lms_registry.PolicyRegistry.add(
+    "deepspeed_experimentation_policy",
+    DeepSpeedExperimentationPolicy,
+)
 
 
 rl4lms_registry.PolicyRegistry.add(

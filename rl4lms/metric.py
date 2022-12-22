@@ -1,3 +1,4 @@
+import logging
 import re
 from typing import *
 
@@ -17,7 +18,7 @@ import rl4lms.envs.text_generation.registry as rl4lms_registry
 import general_utils as utils
 
 TO_INT_PAT = re.compile(r"((?:- ?)?\d+)(\.0*)?")
-
+LOGGER = logging.getLogger(__name__)
 
 @beartype
 def convert_to_int(num_str: str) -> Optional[int]:
@@ -74,9 +75,11 @@ class ScratchpadAnswerAccuracy(rl4lms_metric.BaseMetric):
                 parsed.append((None, ref))
                 em_value.append(0.)
 
-        return dict(
+        output = dict(
             em_accuracy=(em_value, np.mean(em_value),),
         )
+        LOGGER.info(f"[bold green]EM Result: [bold white]{np.mean(em_value):0.1%}")
+        return output
 
 
 rl4lms_registry.MetricRegistry.add(

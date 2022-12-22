@@ -22,20 +22,30 @@ def _split_answer_scratchpad(sample):
     }
 
 
-def _build_dataset(split):
+def _build_dataset(split, tokenizer, max_sum_squares):
+    """
+    Max sum squares is the maximum of the square of the number of tokens in the
+    question and the square of the number of tokens in the answer.
+    This is to control the memory usage of the transformer model.
+    """
     assert split in ("train", "test"), split
     dataset = datasets.load_dataset("gsm8k", "main", split=split)
     dataset = dataset.map(_clean_text).map(_split_answer_scratchpad)
+    dataset.filter(
+        lambda x: 
+            len(tokenizer(x["question"])["input_ids"]) ** 2 + 
+            len(tokenizer(x["answer"  ])["input_ids"]) ** 2 < max_sum_squares
+    )
     return dataset
 
 
 class ZeroShotGSM8KTextGenPool(rl4lms_pool.TextGenPool):
     @classmethod
-    def prepare(cls, split: str):
+    def prepare(cls, split: str, tokenizer, max_sum_squares):
         if split == "val":
             split = "test"
             
-        dataset = _build_dataset(split)
+        dataset = _build_dataset(split, tokenizer, max_sum_squares)
 
         samples = []
         for idx, item in enumerate(dataset):

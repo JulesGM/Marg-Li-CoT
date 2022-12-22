@@ -3,6 +3,11 @@
 
 
 """
+This is basic code to do inference with Flan-T5-* on zero or few-shot chain of thought problems.
+The goal is to use this as as benchmark, to see what to expect of each model sizes, for each dataset,
+with and without scratchpads, with and without majority vote, with and without group beam search,
+for different number of shots, etc.
+
 A few decisions.
 
 ###########################################################
@@ -28,15 +33,23 @@ We currently round to the closest integer.
 More than 85% of the questions in the ASDiv dataset have a single, integer answer.
 We only consider those questions, as they make the task of parsing the answer easier.
 
+
+###########################################################
+# 
+###########################################################
+
 """
 
 
 import collections
+import enum
 
 import importlib
 import itertools
+import logging
 import math
 import more_itertools
+import os
 from pathlib import Path
 import random
 import re
@@ -44,6 +57,7 @@ import time
 import xml
 
 import datasets
+import deepspeed
 import matplotlib.pyplot as plt
 import numpy as np
 import rich
@@ -53,59 +67,45 @@ import torch
 from tqdm import tqdm
 import transformers
 import wget
+import rl4lms.data_pools.text_generation_pool as rl4lms_pool
 
 import general_utils as utils
-import asdiv_dataset
+import dataset_asdiv
+import dataset_gsm8k
+from our_scratchpad import bin_deepspeed_experim
 
 
-MODEL_NAME = "google/flan-t5-xxl"
+LOGGER = logging.getLogger(__name__)
+MODEL_NAME = "google/flan-t5-xl"
 
+dataset_to_use = "asdiv"
+parallelism = "deepspeed"
 
-model_precision = torch.float16
+model_precision = torch.bfloat16
 do_autocast = False
 use_dp = True
 
 verbose = True
 shuffle = True
-n_shots = 1
-num_beams = 8
+n_shots = 0
+num_beams = 1
 batch_size = 8
-max_new_tokens = 200
+max_new_tokens = 197
 with_scratchpads = True
-use_majority_vote = True
+use_majority_vote = False
 use_group_beam_search = False
 few_shot_context_rng_seed = 42  # Makes sure the context is the same if we want it to stay the same
-generation_extra_kwargs = dict(repetition_penalty=50.)
+generation_extra_kwargs = dict(repetition_penalty=0.5)
+
+if use_group_beam_search:
+    generation_extra_kwargs["diversity_penalty"] = 1.
 
 
 ###############################################################################
 ###############################################################################
-
-def model_unwrap(model):
-    if isinstance(model, torch.nn.DataParallel):
-        return model.module
-    return model
-
-
-def clean_text(sample):
-    return {
-        k: v.replace("<<", "(").replace(">>", ")").strip()
-        for k, v in sample.items()
-    }
-
-
-def split_answer_scratchpad(sample):
-    scratchpad, answer = sample["answer"].split("####")
-    return {
-        "question": sample["question"].strip(), 
-        "answer": answer.strip(), 
-        "scratchpad": scratchpad.strip()
-    }
-
 
 text2digits_ = text2digits.Text2Digits()
 num_pat = re.compile(r"\d+(?:[\,\.]\d+)?")
-
 
 def deal_with_words(text):
     converted = text2digits_.convert(text)
@@ -157,13 +157,16 @@ class ContextGeneration:
     question_intro         = "Question:"
 
     @classmethod
-    def compose_fewshot_context(cls, dataset, n, with_scratchpad, seed):
+    def compose_fewshot_context(cls, dataset, n: int, with_scratchpad: bool, seed: int):
         """ 
         Creates a random few-shot context. Works fine with n = 0.
         """
-        rng = random.Random(seed)
+        if n == 0:
+            return ""
 
+        rng = random.Random(seed)
         indices = rng.sample(range(len(dataset)), n)
+
         output = []
         for i in indices:
             scratchpad = dataset[i]["scratchpad"]
@@ -188,17 +191,21 @@ class ContextGeneration:
         first_context_addition = few_shot_context + f" {cls.question_intro} "
         final_context_addition = f" {cls.chain_of_thought_intro} " if with_scratchpad else f" {cls.answer_intro} "
 
-        inputs = utils.dict_unzip(inputs)
+        reformatted_samples = dict(question=[], answer=[], scratchpad=[])
+        for entry in inputs:
+            assert isinstance(entry, tuple), type(entry)
+            assert len(entry) == 2, len(entry)
+            sample = entry[0]
+            assert isinstance(sample, rl4lms_pool.Sample), type(sample)
+            assert len(sample.references) == 1, len(sample.references)
+            reformatted_samples["question"  ].append(sample.prompt_or_input_text)
+            reformatted_samples["scratchpad"].append(sample.meta_data["ref_scratchpad"])
+            reformatted_samples["answer"    ].append(sample.references[0])
 
         question_text = [
             first_context_addition + question + final_context_addition 
-            for question in inputs["question"]
+            for question in reformatted_samples["question"]
         ]
-
-        # rich.print(
-        #     f"[bold blue]Question example:[/]\n" +
-        #     random.choice(question_text) 
-        # )
 
         output = tokenizer(
             question_text,
@@ -206,11 +213,11 @@ class ContextGeneration:
             return_tensors="pt"
         ) 
 
-        output["answer"] = inputs["answer"]
-        output["scratchpad"] = inputs["scratchpad"]
+        output["answer"] = reformatted_samples["answer"]
+        output["scratchpad"] = reformatted_samples["scratchpad"]
         
         return {
-            k: v.to("cuda") if isinstance(v, torch.Tensor) else v 
+            k: v.to(int(os.getenv("LOCAL_RANK", "0"))) if isinstance(v, torch.Tensor) else v 
             for k, v in output.items()
     }
 
@@ -254,13 +261,24 @@ def majority_vote_batch(generated, tokenizer, answer_extraction_fn, verbose):
     for entry in generated:
         yield majority_vote(entry, tokenizer, answer_extraction_fn, verbose)
 
+
 def compare(pred, answ):
     return format_output(pred.strip()) == format_output(answ.strip())
 
 
+class DatasetChoices(str, enum.Enum):
+    gsm8k = "gsm8k"
+    asdiv = "asdiv"
+
+class ParallelismChoices(str, enum.Enum):
+    naive_mp = "naive_mp"
+    deepspeed = "deepspeed"
+    no_parallelism = "none"
+
+
 def run(
     *,
-    use_dp,
+    parallelism,
     do_autocast,
     model_precision,
     shuffle,
@@ -271,23 +289,36 @@ def run(
     with_scratchpads,
     use_majority_vote,
     use_group_beam_search,
-    generation_extra_kwargs
+    generation_extra_kwargs,
+    which_dataset_to_use: DatasetChoices,
+    max_sum_squares=None, # 41957
 ):
     args = locals().copy()
-        
+    global_rank = int(os.getenv("RANK", "0"))
+    world_size = int(os.getenv("WORLD_SIZE", "0"))
 
-    dataset_train = datasets.load_dataset("gsm8k", "main", split="train")
-    dataset_test  = datasets.load_dataset("gsm8k", "main", split="test")
+    logging.basicConfig(
+        level=logging.INFO, 
+        format=f"[{global_rank + 1} / {world_size}]:\t%(message)s", 
+        datefmt="[%X]", 
+        handlers=[rich.logging.RichHandler(markup=True, rich_tracebacks=True)]
+    )
 
-    dataset_train = dataset_train.map(clean_text).map(split_answer_scratchpad)
-    dataset_test  = dataset_test .map(clean_text).map(split_answer_scratchpad)
+    # The tokenizer is required to do length filtering of the datasets.
+    tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    print(dataset_train[0].keys())
-    print(dataset_test[0].keys())
+    if which_dataset_to_use == DatasetChoices.asdiv:    
+        dataset_train = dataset_asdiv.ZeroShotASDivTextGenPool.prepare("train")
+        dataset_test  = dataset_asdiv.ZeroShotASDivTextGenPool.prepare("test")
 
+    elif which_dataset_to_use == DatasetChoices.gsm8k:
+        dataset_train = dataset_gsm8k.ZeroShotGSM8KTextGenPool.prepare("train", tokenizer, max_sum_squares=max_sum_squares)
+        dataset_test  = dataset_gsm8k.ZeroShotGSM8KTextGenPool.prepare("test", tokenizer, max_sum_squares=max_sum_squares)
 
-    # dataset_train = asdiv_dataset.ASDivInteger(cache_path="ASDiv.xml", quiet=False)
-    # dataset_test  = dataset_train
+        print(dataset_train[0].keys())
+        print(dataset_test [0].keys())
+    else:
+        raise ValueError(f"Unknown dataset: {which_dataset_to_use}, should be one of {list(DatasetChoices)}")
 
     context = ContextGeneration.compose_fewshot_context(
             dataset_train, 
@@ -295,7 +326,6 @@ def run(
             with_scratchpads, 
             few_shot_context_rng_seed,
         )
-
 
     rich.print(
         f"[bold blue]Context[/]:\n" +
@@ -305,21 +335,24 @@ def run(
     ###############################################################################
     # Load the model
     ###############################################################################
-    tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
 
     rich.print(f"[bold blue]Loading the model [bold white]{MODEL_NAME}")
     with utils.ctx_timeit(f"Loading model `{MODEL_NAME}`"):
         model = transformers.AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, torch_dtype=model_precision)
 
-    with utils.ctx_timeit("Converting model's type"):
-        # model_cpu
-        pass
-
-    if use_dp:
+    if parallelism == ParallelismChoices.naive_mp:
+        LOGGER.info("[bold red]Initializing with parallelize")
         model.parallelize()
-    else:
+    elif parallelism == ParallelismChoices.deepspeed:
+        LOGGER.info("[bold red]Initializing deepspeed")
+        world_size = int(os.getenv("WORLD_SIZE", "1"))
+        _, config_inference = bin_deepspeed_experim.make_deepspeed_config(batch_size=batch_size, wandb_config=None)
+        model = deepspeed.init_inference(model=model, config=config_inference)
+    elif parallelism == ParallelismChoices.no_parallelism:
         with utils.ctx_timeit(f"Moving model to GPU"):
             model = model.cuda()
+    else:
+        raise ValueError(f"Unknown parallelism: {parallelism}, should be one of {list(ParallelismChoices)}")
 
     rich.print(f"[bold blue]Model dtype:[/]  {model}")
 
@@ -345,7 +378,7 @@ def run(
                 ctx_obj = torch.amp.autocast(device_type="cuda", dtype=model_precision)
                 ctx_obj.__enter__()
 
-            utils.check_equal(batch["input_ids"].shape[0], batch_size)
+            # utils.check_equal(batch["input_ids"].shape[0], batch_size)
             utils.check_equal(batch["input_ids"].shape[0], batch["attention_mask"].shape[0])
             utils.check_equal(batch["input_ids"].shape[1], batch["attention_mask"].shape[1])
 
@@ -403,22 +436,24 @@ def run(
         accuracy = np.mean(outputs)
 
         rich.print(args)
-        rich.print(f"[bold green]Accuracy, {model.dtype}: {accuracy:.1%}")
+        rich.print(f"[bold green]Accuracy: {accuracy:.1%}")
 
 
-run(
-    use_dp=use_dp,
-    model_precision=model_precision,
-    do_autocast=do_autocast,
-    shuffle=shuffle,
-    verbose=verbose,
-    num_beams=num_beams, 
-    batch_size=batch_size, 
-    max_new_tokens=max_new_tokens, 
-    with_scratchpads=with_scratchpads, 
-    use_majority_vote=use_majority_vote, 
-    use_group_beam_search=use_group_beam_search,
-    generation_extra_kwargs=generation_extra_kwargs
+if __name__ == "__main__":
+    run(
+        parallelism=parallelism,
+        model_precision=model_precision,
+        do_autocast=do_autocast,
+        shuffle=shuffle,
+        verbose=verbose,
+        num_beams=num_beams, 
+        batch_size=batch_size, 
+        max_new_tokens=max_new_tokens, 
+        with_scratchpads=with_scratchpads, 
+        use_majority_vote=use_majority_vote, 
+        use_group_beam_search=use_group_beam_search,
+        generation_extra_kwargs=generation_extra_kwargs,
+        which_dataset_to_use=dataset_to_use,
 )
 
 
