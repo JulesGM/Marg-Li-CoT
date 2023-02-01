@@ -1,8 +1,0 @@
-- What do I need to do ? get the small model to work is reasonable. 
-Soo ASDiv has kind of ok results with flan-t5-xxl. With GSM8K has bad results even with flan-t5-xxl.
-
-
-
-- 
-
-

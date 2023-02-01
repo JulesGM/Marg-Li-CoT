@@ -4,25 +4,25 @@ import os
 import random
 import re
 import textwrap
+from collections import abc
 from typing import *
 
-from beartype import beartype
-from collections import abc
 import datasets
+import general_utils as utils
 import more_itertools
 import numpy as np
 import pandas as pd
-import text2digits
-import tqdm
 import rich
 import rich.console
-import transformers
+import text2digits
 import torch
+import tqdm
+import transformers
+from beartype import beartype
 
 import rl4lms.envs.text_generation.observation as rl4lms_observation
-import rl4lms.envs.text_generation.reward as rl4lms_reward
 import rl4lms.envs.text_generation.registry as rl4lms_registry
-import general_utils as utils
+import rl4lms.envs.text_generation.reward as rl4lms_reward
 
 
 class ParallelizeMode(str, enum.Enum):
@@ -44,7 +44,7 @@ LOGGER = logging.getLogger(__name__)
 #     if match_object is not None:
 #         matches = [x.strip() for x in match_object.groups()]
 #         # rich.print(f"[bold blue]flan_t5_answer_removal[/]: \"{matches}\"")
-#         assert len(matches) == 2, matches    
+#         assert len(matches) == 2, matches
 
 #     else:
 #         matches = ["", input_text]
@@ -60,65 +60,55 @@ class AnswerExtractionModes(str, enum.Enum):
 def flan_t5_answer_removal(input_text, mode=AnswerExtractionModes.last_number):
     if mode == AnswerExtractionModes.last_sentence:
         input_text = input_text.strip().removesuffix(".")
-        splits     = input_text.split(".")
+        splits = input_text.split(".")
         if len(splits) > 1:
-            answer     = splits[-1].strip()
+            answer = splits[-1].strip()
             scratchpad = ".".join(splits[:-1])
         else:
-            answer     = input_text
+            answer = input_text
             scratchpad = ""
     elif mode == AnswerExtractionModes.last_number:
         match_obj = more_itertools.last(NUM_PAT.finditer(input_text), default=None)
         if match_obj is not None:
             answer = match_obj.group()
-            scratchpad = input_text[:match_obj.start()]
+            scratchpad = input_text[: match_obj.start()]
         else:
             scratchpad = ""
             answer = input_text
     else:
-        raise ValueError(f"Unknown mode: {mode}, should be one of {list(AnswerExtractionModes)}")
+        raise ValueError(
+            f"Unknown mode: {mode}, should be one of {list(AnswerExtractionModes)}"
+        )
 
     return scratchpad, answer
 
 
-def flan_t5_answer_joiner(scratchpad, answer, tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+def flan_t5_answer_joiner(
+    scratchpad, answer, tokenizer
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert isinstance(scratchpad, list), type(scratchpad)
     if scratchpad:
         assert isinstance(scratchpad[0], int), type(scratchpad[0])
     assert isinstance(answer, list), type(answer)
-    
+
     if answer:
         assert isinstance(answer[0], int), type(answer[0])
 
-    assert isinstance(
-        tokenizer, 
-        transformers.PreTrainedTokenizerBase
-    ), type(tokenizer)
+    assert isinstance(tokenizer, transformers.PreTrainedTokenizerBase), type(tokenizer)
 
-    joiner_tokens = tokenizer.encode(
-        f". Answer: ", 
-        add_special_tokens=False,
-    )
+    joiner_tokens = tokenizer.encode(f". Answer: ", add_special_tokens=False,)
 
-    output = (
-        scratchpad +
-        joiner_tokens +
-        answer +
-        [tokenizer.eos_token_id]
-    )
+    output = scratchpad + joiner_tokens + answer + [tokenizer.eos_token_id]
 
     mask = (
-        [False] * len(scratchpad) +
-        [False] * len(joiner_tokens) +
-        [True] * len(answer) +
-        [True]
+        [False] * len(scratchpad)
+        + [False] * len(joiner_tokens)
+        + [True] * len(answer)
+        + [True]
     )
 
     assert all([isinstance(x, int) for x in output]), output
     return torch.tensor(output, dtype=torch.long), torch.tensor(mask, dtype=bool)
-
-
-
 
 
 def deal_with_words(text: str) -> Optional[float]:
@@ -128,83 +118,59 @@ def deal_with_words(text: str) -> Optional[float]:
     if not output:
         return None
 
-    utils.debug_rank_0(LOGGER, 
-        "[bold blue]" + "#" * 80
-    )
-    utils.debug_rank_0(LOGGER, 
+    utils.debug_rank_0(LOGGER, "[bold blue]" + "#" * 80)
+    utils.debug_rank_0(
+        LOGGER,
         f"[bold blue]# text2digits[/]:\n"
         f" \t -> [green]source:[/]    {text}\n"
         f" \t -> [green]converted:[/] {converted}\n"
-        f" \t -> [green]final:[/]     {output}"
+        f" \t -> [green]final:[/]     {output}",
     )
-    utils.debug_rank_0(
-        LOGGER, 
-        "[bold blue]" + "#" * 80
-    )
+    utils.debug_rank_0(LOGGER, "[bold blue]" + "#" * 80)
 
     return output
-
 
 
 NUM_PAT = re.compile(r"\d+(?:[\,\.]\d+)?")
 
-def split_fn(generated_text: str) -> Optional[str]:
 
-    results = NUM_PAT.findall(generated_text)
-    
-    if results:
-        # Numbers found
-        output = results[-1]
-    else:
-        # No numbers found
-        try:
-            output = deal_with_words(generated_text)
-        except ValueError:
-            output = None
-
-        if output is not None:
-            output = output[-1]
-        else:
-            utils.debug_rank_0(LOGGER, 
-                f"[red]split_fn: no numbers found. \n"
-                f"\t-> Received:[/] `{generated_text}`"
-            )
-            output = None
-
-    return output
-
-
-class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):    
+class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
     @beartype
     def __init__(
-        self, *,
-        reward_model:            transformers.PreTrainedModel,
-        reward_tokenizer:        transformers.PreTrainedTokenizerBase,
-        generation_splitter_fn:  abc.Callable[[str], str],
-        sp_answer_joiner_fn:     abc.Callable[[str, str], tuple[torch.Tensor, torch.Tensor]],
+        self,
+        *,
+        reward_model: transformers.PreTrainedModel,
+        reward_tokenizer: transformers.PreTrainedTokenizerBase,
+        generation_splitter_fn: abc.Callable[[str], str],
+        sp_answer_joiner_fn: abc.Callable[
+            [str, str], tuple[torch.Tensor, torch.Tensor]
+        ],
         reward_tokenizer_kwargs: dict[str, Any] = None,
-        parallelize_mode:        ParallelizeMode,
+        parallelize_mode: ParallelizeMode,
     ) -> None:
 
         utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
-        utils.info_rank_0(LOGGER, "[bright_magenta bold]# [bright_yellow]REWARD ScratchpadAnswerReward")
+        utils.info_rank_0(
+            LOGGER,
+            "[bright_magenta bold]# [bright_yellow]REWARD ScratchpadAnswerReward",
+        )
         utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
-        
+
         super().__init__()
         assert torch.cuda.is_available(), "Reward model must be on GPU"
-        self._device                  = int(os.environ.get("LOCAL_RANK", "0"))
-        self._metric_model            = reward_model
-        self._reward_tokenizer        = reward_tokenizer
+        self._device = int(os.environ.get("LOCAL_RANK", "0"))
+        self._metric_model = reward_model
+        self._reward_tokenizer = reward_tokenizer
         self._reward_tokenizer_kwargs = reward_tokenizer_kwargs
-        self._split_generated         = generation_splitter_fn
-        self._join_sp_answer          = sp_answer_joiner_fn
+        self._split_generated = generation_splitter_fn
+        self._join_sp_answer = sp_answer_joiner_fn
 
         if parallelize_mode == ParallelizeMode.data_parallel:
             self._metric_model = torch.nn.DataParallel(self._metric_model)
         elif parallelize_mode == ParallelizeMode.parallelize:
-            self._metric_model = self._metric_model.parallelize()
+            self._metric_model.parallelize()
         elif parallelize_mode == ParallelizeMode.nothing:
-            pass
+            assert self._metric_model
         elif parallelize_mode == ParallelizeMode.single_gpu:
             self._metric_model = self._metric_model.to(self._device)
         else:
@@ -224,7 +190,7 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
         LOGGER.warning(f"[bold blue]{title}:     \n[green]{cls._wrap(text)}")
 
     def __call__(
-        self, 
+        self,
         current_observation: rl4lms_observation.Observation,
         action: int,
         next_observation: rl4lms_observation.Observation,
@@ -252,14 +218,14 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                 # -------------------------------------------------------------
                 # Tokenize the prompt
                 # -------------------------------------------------------------
-                # Needs special tokens and tensors because it's going to 
+                # Needs special tokens and tensors because it's going to
                 # the encoder directly
                 encoder_inputs = self._reward_tokenizer(
                     current_observation.prompt_or_input_text,
                     return_tensors="pt",
                     **self._reward_tokenizer_kwargs,
                 ).to(self._device)
-                
+
                 # -------------------------------------------------------------
                 # Tokenize the scratchpad
                 # -------------------------------------------------------------
@@ -273,12 +239,12 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                 LOGGER.warning(f"[bold bright_black]" + "#" * 80)
                 if encoded_generated_scratchpad:
                     assert isinstance(encoded_generated_scratchpad[0], int), (
-                        type(encoded_generated_scratchpad[0]), 
+                        type(encoded_generated_scratchpad[0]),
                     )
                 else:
                     self._log(
-                        "[red bold]Generated scratchpad is empty.", 
-                        f"[red]{generated_scratchpad}"
+                        "[red bold]Generated scratchpad is empty.",
+                        f"[red]{generated_scratchpad}",
                     )
 
                 # -------------------------------------------------------------
@@ -306,11 +272,12 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                 decoder_input_ids = decoder_input_ids.to(self._device)
                 assert decoder_input_ids.ndim == 1, decoder_input_ids.shape
                 LOGGER.info("[bold red]" + "#" * 80)
-                assert len(next_observation.target_or_reference_texts) == 1, (
-                    next_observation.target_or_reference_texts)
-                assert next_observation.context_encoded_pt.shape[0] == 1, (
-                    next_observation.context_encoded_pt.shape
-                )
+                assert (
+                    len(next_observation.target_or_reference_texts) == 1
+                ), next_observation.target_or_reference_texts
+                assert (
+                    next_observation.context_encoded_pt.shape[0] == 1
+                ), next_observation.context_encoded_pt.shape
 
                 ###############################################################
                 # Compute the reward:
@@ -321,8 +288,11 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                     decoder_input_ids=decoder_input_ids.unsqueeze(0).to(self._device),
                     **{k: v.to(self._device) for k, v in encoder_inputs.items()},
                 ).logits.log_softmax(dim=-1)
-                assert full_predictions.ndim == 3, (full_predictions.ndim, 3,)
-                
+                assert full_predictions.ndim == 3, (
+                    full_predictions.ndim,
+                    3,
+                )
+
                 ###############################################################
                 # Extract the likelihood of the answer
                 # -------------------------------------------------------------
@@ -332,68 +302,85 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
                 assert full_predictions.shape[0] == 1, full_predictions.shape
                 full_predictions = full_predictions.squeeze(0)
                 logp = full_predictions.gather(
-                    index=decoder_input_ids.unsqueeze(0),
-                    dim=-1,
+                    index=decoder_input_ids.unsqueeze(0), dim=-1,
                 ).squeeze(0)
                 assert full_predictions.shape[0] == logp.shape[0], (
-                    full_predictions.shape[0], logp.shape[0],)
-                assert logp.ndim == 1, (logp.ndim, 1,)
+                    full_predictions.shape[0],
+                    logp.shape[0],
+                )
+                assert logp.ndim == 1, (
+                    logp.ndim,
+                    1,
+                )
                 logp_answer = logp[answer_mask].sum(-1)
-                
+
                 ###############################################################
                 # Logging
                 ###############################################################
-                self._log("Prompt",                  current_observation.prompt_or_input_text)
-                self._log("Generated text",          next_observation.context_text)
-                self._log("Generated scratchpad",    generated_scratchpad)
-                self._log("Generated answer",        generated_answ)
-                self._log("Target",                  self._reward_tokenizer.decode(encoded_ref_answ))
-                self._log("Reference text",          next_observation.target_or_reference_texts[0])
-                self._log("decoder_input_ids text",  self._reward_tokenizer.decode(decoder_input_ids))
-                self._log("positively masked",       self._reward_tokenizer.decode(decoder_input_ids[answer_mask]))
-                
+                self._log("Prompt", current_observation.prompt_or_input_text)
+                self._log("Generated text", next_observation.context_text)
+                self._log("Generated scratchpad", generated_scratchpad)
+                self._log("Generated answer", generated_answ)
+                self._log("Target", self._reward_tokenizer.decode(encoded_ref_answ))
+                self._log(
+                    "Reference text", next_observation.target_or_reference_texts[0]
+                )
+                self._log(
+                    "decoder_input_ids text",
+                    self._reward_tokenizer.decode(decoder_input_ids),
+                )
+                self._log(
+                    "positively masked",
+                    self._reward_tokenizer.decode(decoder_input_ids[answer_mask]),
+                )
+
                 return logp_answer.item()
 
-        return 0.
+        return 0.0
 
 
-class BatchedScratchpadAnswerReward(rl4lms_reward.BatchedRewardFunction):    
+class BatchedScratchpadAnswerReward(rl4lms_reward.BatchedRewardFunction):
     @beartype
     def __init__(
-        self, 
+        self,
         *,
-        reward_model:              transformers.PreTrainedModel,
-        reward_tokenizer:          transformers.PreTrainedTokenizerBase,
-        sp_answer_joiner_fn:       abc.Callable[[list[int], list[int]], tuple[list[int], list[bool]]],
+        reward_model: transformers.PreTrainedModel,
+        reward_tokenizer: transformers.PreTrainedTokenizerBase,
+        sp_answer_joiner_fn: abc.Callable[
+            [list[int], list[int]], tuple[list[int], list[bool]]
+        ],
         answer_split_generated_fn: abc.Callable[[str], str] = flan_t5_answer_removal,
-        parallelize_mode:          ParallelizeMode,
+        parallelize_mode: ParallelizeMode,
     ) -> None:
-        
+
         utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
-        utils.info_rank_0(LOGGER, "[bright_magenta bold]# [bright_yellow]REWARD ScratchpadAnswerReward")
+        utils.info_rank_0(
+            LOGGER,
+            "[bright_magenta bold]# [bright_yellow]REWARD ScratchpadAnswerReward",
+        )
         utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
 
         super().__init__()
-        self._device                  = int(os.environ.get("LOCAL_RANK", "0"))
-        self._reward_model            = reward_model.to(self._device)
-        self._reward_tokenizer        = reward_tokenizer
-        self._split_generated         = answer_split_generated_fn
-        self._sp_answer_joiner        = sp_answer_joiner_fn
+        self._device = int(os.environ.get("LOCAL_RANK", "0"))
+        self._reward_model = reward_model.to(self._device)
+        self._reward_tokenizer = reward_tokenizer
+        self._split_generated = answer_split_generated_fn
+        self._sp_answer_joiner = sp_answer_joiner_fn
 
         if parallelize_mode == ParallelizeMode.data_parallel:
-            self._metric_model = torch.nn.DataParallel(self._metric_model)
+            self._reward_model = torch.nn.DataParallel(self._reward_model)
         elif parallelize_mode == ParallelizeMode.parallelize:
-            self._metric_model = self._metric_model.parallelize()
+            self._reward_model.parallelize()
         elif parallelize_mode == ParallelizeMode.nothing:
             pass
         elif parallelize_mode == ParallelizeMode.single_gpu:
-            self._metric_model = self._metric_model.to(self._device)
+            self._reward_model = self._reward_model.to(self._device)
         else:
             raise ValueError(
                 f"Invalid parallelize_mode: {parallelize_mode}, "
                 f"must be one of {list(ParallelizeMode)}"
             )
-    
+
     @classmethod
     def _wrap(cls, text, width=80):
         preprocessed_text = text.replace("\n", " ").strip()
@@ -403,7 +390,7 @@ class BatchedScratchpadAnswerReward(rl4lms_reward.BatchedRewardFunction):
     @classmethod
     def _log(cls, title, text):
         LOGGER.warning(f"[bold blue]{title}:     \n[green]{cls._wrap(text)}")
-    
+
     def __call__(
         self,
         prompt_texts: List[str],
@@ -415,26 +402,23 @@ class BatchedScratchpadAnswerReward(rl4lms_reward.BatchedRewardFunction):
 
         # Can't do anything if they're not all done
         if not all(dones):
-            return 0.
+            return 0.0
 
         with torch.inference_mode():
             # -------------------------------------------------------------
             # Tokenize the prompt
             # -------------------------------------------------------------
-            # Needs special tokens and tensors because it's going to 
+            # Needs special tokens and tensors because it's going to
             # the encoder directly
             done_prompts_encoded_ids = self._reward_tokenizer(
-                prompt_texts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, 
+                prompt_texts, return_tensors="pt", padding=True, truncation=True,
             ).input_ids.to(self._device)
-            
+
             # Split the generated texts
-            generated_scratchpads, generated_answ = zip(*[
-                self._answer_remover_fn(gen_text) for gen_text in gen_texts
-            ])
-            
+            generated_scratchpads, generated_answ = zip(
+                *[self._answer_remover_fn(gen_text) for gen_text in gen_texts]
+            )
+
             # -------------------------------------------------------------
             # Tokenize the scratchpad and ref answers
             # -------------------------------------------------------------
@@ -442,64 +426,100 @@ class BatchedScratchpadAnswerReward(rl4lms_reward.BatchedRewardFunction):
             gen_scratchpads_ids = self._reward_tokenizer(
                 generated_scratchpads, add_special_tokens=False,
             )
-            ref_ids = self._reward_tokenizer(
-                ref_texts, add_special_tokens=False,
-            )
-            
+            ref_ids = self._reward_tokenizer(ref_texts, add_special_tokens=False,)
+
             # -------------------------------------------------------------
             # Join the scratchpads and reference answers
             # -------------------------------------------------------------
-            decoder_input_ids, reward_mask = zip(*[
-                self._sp_answer_joiner(
-                    scratchpad=sp, answer=answ, tokenizer=self._reward_tokenizer,
-                ) for sp, answ in zip(gen_scratchpads_ids, ref_ids)
-            ])
+            decoder_input_ids, reward_mask = zip(
+                *[
+                    self._sp_answer_joiner(
+                        scratchpad=sp, answer=answ, tokenizer=self._reward_tokenizer,
+                    )
+                    for sp, answ in zip(gen_scratchpads_ids, ref_ids)
+                ]
+            )
             output_reward_mask = torch.nn.utils.rnn.pad_sequence(
                 reward_mask, batch_first=True, padding_value=False,
             )
             decoder_input_ids = self._reward_tokenizer.pad(
-                dict(input_ids=decoder_input_ids), 
-                return_tensors="pt",
-                padding=True,
+                dict(input_ids=decoder_input_ids), return_tensors="pt", padding=True,
             )
-            
+
             ###############################################################
             # Compute the reward:
             ###############################################################
+            # TODO: Non Tested!
             full_predictions = self._metric_model(
                 decoder_input_ids=decoder_input_ids["input_ids"].to(self._device),
-                decoder_attention_mask=decoder_input_ids["attention_mask"].to(self._device),
+                decoder_attention_mask=decoder_input_ids["attention_mask"].to(
+                    self._device
+                ),
                 **{k: v.to(self._device) for k, v in done_prompts_encoded_ids.items()},
             ).logits.log_softmax(dim=-1)
-            assert full_predictions.ndim == 3, (full_predictions.ndim, 3,)
+            assert full_predictions.ndim == 3, (
+                full_predictions.ndim,
+                3,
+            )
 
             ###############################################################
             # Extract the likelihood of the answer
             ###############################################################
-            logp = full_predictions.gather(
-                dim=-1, 
-                index=decoder_input_ids["input_ids"]
-            )
-            logp[output_reward_mask] = 0
-            logp_answer = logp.sum(-1)
+            # TODO: Non Tested!
+            logp = full_predictions.gather(dim=-1, index=decoder_input_ids["input_ids"])
+            logp_answer = (logp * output_reward_mask.to(logp.dtype)).sum(-1)
+            print(f"{(logp * output_reward_mask.to(logp.dtype)).shape = }")
 
             ###############################################################
             # Logging
             ###############################################################
             idx = random.randint(0, len(gen_texts) - 1)
-            self._log("Prompt",                  prompt_texts[idx])
-            self._log("Generated text",          gen_texts[idx])
-            self._log("Generated scratchpad",    generated_scratchpads[idx])
-            self._log("Generated answer",        generated_answ[idx])
-            self._log("Target",                  self._reward_tokenizer.decode(ref_ids[idx]))
-            self._log("Reference text",          ref_texts[idx])
-            self._log("decoder_input_ids text",  self._reward_tokenizer.decode(decoder_input_ids))
-            self._log("positively masked",       self._reward_tokenizer.decode(decoder_input_ids[answer_mask]))
-                
+            self._log("Prompt", prompt_texts[idx])
+            self._log("Generated text", gen_texts[idx])
+            self._log("Generated scratchpad", generated_scratchpads[idx])
+            self._log("Generated answer", generated_answ[idx])
+            self._log("Target", self._reward_tokenizer.decode(ref_ids[idx]))
+            self._log("Reference text", ref_texts[idx])
+            self._log(
+                "decoder_input_ids text",
+                self._reward_tokenizer.decode(decoder_input_ids[idx]),
+            )
+            self._log(
+                "positively masked",
+                self._reward_tokenizer.decode(decoder_input_ids[idx][reward_mask[idx]]),
+            )
+
             return logp_answer.item()
 
 
+class FlanT5ScratchpadAnswerReward(rl4lms_reward.RewardFunction):
+    @beartype
+    def __init__(self, **kwargs,) -> None:
+        super().__init__(
+            sp_answer_joiner_fn=flan_t5_answer_joiner,
+            generation_splitter_fn=flan_t5_answer_removal,
+            **kwargs,
+        )
+
+
+class FlanT5BatchedScratchpadAnswerReward(rl4lms_reward.BatchedRewardFunction):
+    def __init__(self, **kwargs,) -> None:
+        super().__init__(
+            sp_answer_joiner_fn=flan_t5_answer_joiner,
+            generation_splitter_fn=flan_t5_answer_removal,
+            **kwargs,
+        )
+
+
 rl4lms_registry.RewardFunctionRegistry.add(
-    "scratchpad_answer_reward",
-    ScratchpadAnswerReward,
+    "scratchpad_answer_reward", ScratchpadAnswerReward,
+)
+rl4lms_registry.RewardFunctionRegistry.add(
+    "batch_scratchpad_answer_reward", BatchedScratchpadAnswerReward,
+)
+rl4lms_registry.RewardFunctionRegistry.add(
+    "flan_t5_scratchpad_answer_reward", ScratchpadAnswerReward,
+)
+rl4lms_registry.RewardFunctionRegistry.add(
+    "flan_t5_batch_scratchpad_answer_reward", BatchedScratchpadAnswerReward,
 )

@@ -9,24 +9,21 @@ import torch
 import transformers
 
 sys.path.append("/home/mila/g/gagnonju/RL4LMs")
-import rl4lms.envs.text_generation.registry as rl4lms_registry
-import rl4lms.envs.text_generation.policy.seq2seq_policy as rl4lms_seq2seq_policy
-from rl4lms.envs.text_generation import hf_generation_utils 
+import deepspeed
+import general_utils as utils
 import transformers
 import transformers.deepspeed
-import deepspeed
 
-from our_scratchpad.bin_deepspeed_experim import OptimizerMerger
-
-import general_utils as utils
+import rl4lms.envs.text_generation.policy.seq2seq_policy as rl4lms_seq2seq_policy
+import rl4lms.envs.text_generation.registry as rl4lms_registry
+from bin_deepspeed_experim import OptimizerMerger
+from rl4lms.envs.text_generation import hf_generation_utils
 
 LOGGER = logging.getLogger(__name__)
 
 
-CONSOLE = rich.console.Console(
-    width=80,
-    force_terminal=True,
-)
+CONSOLE = rich.console.Console(width=80, force_terminal=True,)
+
 
 def msg(text, color, inner_color=None):
     if inner_color is None:
@@ -39,7 +36,8 @@ def msg(text, color, inner_color=None):
 
 
 class PrecisionControlSeq2SeqLMActorCriticPolicy(
-    rl4lms_seq2seq_policy.Seq2SeqLMActorCriticPolicy):
+    rl4lms_seq2seq_policy.Seq2SeqLMActorCriticPolicy
+):
     def __init__(
         self,
         *,
@@ -49,18 +47,20 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         ref_model=None,
         **kwargs,
     ):
-        
+
         utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
-        utils.info_rank_0(LOGGER, "[bright_magenta bold]# [bright_cyan]POLICY PrecisionControlSeq2SeqLMActorCriticPolicy.__call__")
+        utils.info_rank_0(
+            LOGGER,
+            "[bright_magenta bold]# [bright_cyan]POLICY PrecisionControlSeq2SeqLMActorCriticPolicy.__call__",
+        )
         utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
 
         self._reward_model_container = [ref_model] if ref_model else None
-        self._head_kwargs            = head_kwargs
-        self._same_model_for_value   = same_model_for_value
+        self._head_kwargs = head_kwargs
+        self._same_model_for_value = same_model_for_value
         self._from_pretrained_kwargs = from_pretrained_kwargs
 
         super().__init__(**kwargs)
-        
 
     def _build_model_heads(self, model_name: str):
         """
@@ -73,8 +73,9 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         #######################################################################
         msg("Loading Policy Model", "bright_cyan")
         self._policy_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
-            model_name, **self._from_pretrained_kwargs)
-        
+            model_name, **self._from_pretrained_kwargs
+        )
+
         self._policy_model.__class__ = hf_generation_utils.override_generation_routines(
             type(self._policy_model)
         )
@@ -82,7 +83,7 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         #######################################################################
         # Create Value Model
         #######################################################################
-        if self._same_model_for_value:            
+        if self._same_model_for_value:
             msg("Reusing the policy model as the value model", "bright_cyan")
             self._value_model = self._policy_model
         else:
@@ -90,7 +91,7 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
             self._value_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
                 model_name, **self._from_pretrained_kwargs
             )
-        
+
         #######################################################################
         # Reference Model
         #######################################################################
@@ -113,10 +114,7 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         # Create value head
         #######################################################################
         self._value_head = torch.nn.Linear(
-            self._value_model.config.hidden_size, 
-            1,
-            bias=False, 
-            **self._head_kwargs,
+            self._value_model.config.hidden_size, 1, bias=False, **self._head_kwargs,
         )
         rich.print("[red bold]Done Loading Value Model[/]")
 
@@ -126,7 +124,7 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         assert torch.cuda.is_available(), "requires CUDA"
         if torch.cuda.is_available():
             if self._apply_model_parallel and self._policy_model.is_parallelizable:
-    
+
                 self._policy_model.parallelize()
                 self._ref_model.parallelize()
 
@@ -137,34 +135,39 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
 
             else:  # else defaults to data parallel
                 assert False
-                self._policy_model = torch.nn.DataParallel(self._policy_model.to(self.device))
-                self._ref_model    = torch.nn.DataParallel(self._ref_model   .to(self.device))
-                self._value_model  = torch.nn.DataParallel(self._value_model .to(self.device))
-                self._value_head   = torch.nn.DataParallel(self._value_head  .to(self.device))
+                self._policy_model = torch.nn.DataParallel(
+                    self._policy_model.to(self.device)
+                )
+                self._ref_model = torch.nn.DataParallel(self._ref_model.to(self.device))
+                self._value_model = torch.nn.DataParallel(
+                    self._value_model.to(self.device)
+                )
+                self._value_head = torch.nn.DataParallel(
+                    self._value_head.to(self.device)
+                )
 
         else:
-            assert False    
-        
+            assert False
 
 
 class DeepSpeedExperimentationPolicy(rl4lms_seq2seq_policy.Seq2SeqLMActorCriticPolicy):
     def __init__(self, *args, ds_configs, **kwargs):
-    
+
         kwargs["apply_model_parallel"] is False, kwargs["apply_model_parallel"]
         super().__init__(*args, **kwargs)
         assert self._apply_model_parallel is False, self._apply_model_parallel
-                
+
         self._ds_train_config, self._ds_inference_config = ds_configs
         self._dschf = transformers.deepspeed.HfDeepSpeedConfig(self._ds_train_config)
 
         deepspeed.init_distributed()
         self._policy_model = deepspeed.initialize(
-            model=self._policy_model, 
+            model=self._policy_model,
             dist_init_required=False,
             config_params=self._ds_train_config,
         )[0]
         self._value_model = deepspeed.initialize(
-            model=self._value_model, 
+            model=self._value_model,
             dist_init_required=False,
             config_params=self._ds_train_config,
         )[0]
@@ -179,28 +182,31 @@ class DeepSpeedExperimentationPolicy(rl4lms_seq2seq_policy.Seq2SeqLMActorCriticP
             mp_size=os.environ["WORLD_SIZE"],
             config=self._ds_inference_config,
         )
-        
+
         self.optimizer = OptimizerMerger(
             [self._policy_model, self._value_model, self._value_head]
         )
 
-
     def _build_model_heads(self, model_name: str):
         self._policy_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
-            model_name)
+            model_name
+        )
         self._policy_model.__class__ = hf_generation_utils.override_generation_routines(
-            type(self._policy_model))
+            type(self._policy_model)
+        )
 
         self._value_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
-            model_name)
+            model_name
+        )
         self._ref_model = copy.deepcopy(self._policy_model).eval()
 
         self._value_head = torch.nn.Linear(
-            self._value_model.config.hidden_size, 1, bias=False)
+            self._value_model.config.hidden_size, 1, bias=False
+        )
+
 
 rl4lms_registry.PolicyRegistry.add(
-    "deepspeed_experimentation_policy",
-    DeepSpeedExperimentationPolicy,
+    "deepspeed_experimentation_policy", DeepSpeedExperimentationPolicy,
 )
 
 
