@@ -12,9 +12,17 @@ By default, we support the GPT2 model.
 
 """
 
+
+TOKENIZER_MODEL = "google/flan-t5-small"
+DATASET_TO_USE  = "gsm8k"
+REWARD_MODEL    = "google/flan-t5-small"
+MAIN_MODEL      = "google/flan-t5-small"
+
+
 import collections
 import contextlib
 import enum
+import logging
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -22,38 +30,37 @@ import itertools
 import random
 import re
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import *
 
+import accelerate
 import datasets
 import fire
+import general_utils
 import numpy as np
 import rich
+import rich.logging
 import torch
 import transformers
+import trlx
+from trlx.data.configs import TRLConfig
 import yaml
 from tqdm import tqdm
 
-sys.path.append("/home/mila/g/gagnonju/Marg-Li-CoT/with_trlx/trlx_repo")
-import general_utils
-from tqdm import tqdm
-
-from trlx_repo import trlx
-from trlx_repo.trlx.data.configs import TRLConfig
-
 import lib_data
+import reward
+from general_utils import parallel_guard
+
 
 print("Done with imports")
 
-PPO_CONFIG_PATH = (
-    "/home/mila/g/gagnonju/Marg-Li-CoT/our_scratchpad/configs/ppo_config.yml"
-)
-MAIN_MODEL = "google/flan-t5-small"
-REWARD_MODEL = "google/flan-t5-small"
-TOKENIZER_MODEL = "google/flan-t5-small"
-DATASET_TO_USE = "asdiv"
+
+LOGGER = logging.getLogger(__name__)
+
+PPO_CONFIG_PATH = str(Path(__file__).parent / "ppo_config.yml")
+assert Path(PPO_CONFIG_PATH).exists(), f"{PPO_CONFIG_PATH = }"
+print(f"{PPO_CONFIG_PATH = }")
 
 
 def check_tokenizer(tokenizer):
@@ -78,8 +85,6 @@ def check_tokenizer(tokenizer):
     ), f"{tokenizer.eos_token_id = }, {tokenizer.cls_token_id = }"
 
 
-
-
 @contextlib.contextmanager
 def setup(
     *,
@@ -90,81 +95,29 @@ def setup(
     reward_model_hf_name_or_path: Optional[Union[str, Path]],
     tokenizer_hf_name_or_path: Optional[Union[str, Path]],
     model_class: Optional[Type[transformers.PreTrainedModel]],
-    do_load_from_hf_name_or_path,
 ):
 
-    if do_load_from_hf_name_or_path:
+    assert reward_model is None, f"{reward_model = }"
+    assert model is None, f"{type(model    ) = }"
+    assert tokenizer is None, f"{type(tokenizer) = }"
 
-        assert reward_model is None, f"{reward_model = }"
-        assert model is None, f"{type(model    ) = }"
-        assert tokenizer is None, f"{type(tokenizer) = }"
+    LOGGER.info("[bold red]Loading from HF name or path")
+    LOGGER.info(f"[bold red]{main_model_hf_name_or_path   = }")
+    LOGGER.info(f"[bold red]{reward_model_hf_name_or_path = }")
+    LOGGER.info(f"[bold red]{tokenizer_hf_name_or_path    = }")
 
-        rich.print("[bold red]Loading from HF name or path")
-        rich.print(f"[bold red]{main_model_hf_name_or_path = }")
-        rich.print(f"[bold red]{reward_model_hf_name_or_path = }")
-        rich.print(f"[bold red]{tokenizer_hf_name_or_path = }")
+    reward_model = model_class.from_pretrained(reward_model_hf_name_or_path)
+    assert reward_model.config.model_type == "t5"
+    reward_tokenizer = transformers.AutoTokenizer.from_pretrained(
+        tokenizer_hf_name_or_path
+    )
 
-        hf_path = main_model_hf_name_or_path
-
-        # We do some modifications to the tokenizer, so even if we load from a HF name or path, we still need to save it
-        # and have the trained reload it intenally
-        reward_model = model_class.from_pretrained(reward_model_hf_name_or_path).cuda()
-
-        if reward_model.config.model_type == "gpt2":
-            assert False
-            reward_tokenizer = transformers.AutoTokenizer.from_pretrained(
-                tokenizer_hf_name_or_path, padding_side="left"
-            )
-            reward_tokenizer.pad_token = reward_tokenizer.eos_token
-            reward_tokenizer.cls_token = reward_tokenizer.eos_token
-
-        elif reward_model.config.model_type == "t5":
-            reward_tokenizer = transformers.AutoTokenizer.from_pretrained(
-                tokenizer_hf_name_or_path, padding_side="right"
-            )
-        else:
-            raise ValueError(f"{reward_model.config.model_type = }")
-
-        print("done loading first model")
-        tmp_dir = tempfile.TemporaryDirectory()
-        tok_path = tmp_dir.name
-        reward_tokenizer.save_pretrained(tok_path)
-
-    else:
-        ###########################################################################
-        # Save the model and the tokenizer to a temporary directory
-        # so the trlx code can load it
-        ###########################################################################
-        rich.print("[bold red]Not Loading From HF Name or Path.")
-
-        assert (
-            reward_model is not None
-        ), f"`reward_model` should not be None. {reward_model = }"
-        assert model is not None, f"`model` should not be None.{type(model    ) = }"
-        assert tokenizer is not None, f"`tokenizer` should not be None. {tokenizer = }"
-
-        tmp_dir = tempfile.TemporaryDirectory()
-        model.save_pretrained(tmp_dir.name)
-        tokenizer.save_pretrained(tmp_dir.name)
-        hf_path = tmp_dir.name
-        tok_path = tmp_dir.name
-        reward_model.cuda()
-
-        for param in reward_model.parameters():
-            param.requires_grad = False
-
-        reward_tokenizer = transformers.AutoTokenizer.from_pretrained(
-            hf_path, padding_side="left"
-        )
-        check_tokenizer(reward_tokenizer)
-
-    with tmp_dir:
-        yield (
-            hf_path,
-            tok_path,
-            reward_model,
-            reward_tokenizer,
-        )
+    return (
+        reward_model_hf_name_or_path,
+        tokenizer_hf_name_or_path,
+        reward_model,
+        reward_tokenizer,
+    )
 
 
 def stats_for_key(
@@ -211,11 +164,11 @@ def stats_for_key(
     max_ = np.max(keys)
     min_ = np.min(keys)
 
-    rich.print(f"\n[bold blue]{field}:")
-    rich.print(f"input max  = {int(max_)}")
-    rich.print(f"input min  = {int(min_)}")
-    rich.print(f"input mean = {mean:0.3}")
-    rich.print(f"input std  = {std :0.3}")
+    LOGGER.info(f"\n[bold blue]{field}:")
+    LOGGER.info(f"input max  = {int(max_)}")
+    LOGGER.info(f"input min  = {int(min_)}")
+    LOGGER.info(f"input mean = {mean:0.3}")
+    LOGGER.info(f"input std  = {std :0.3}")
 
     # plt.title(field)
     # plt.hist(keys, bins=10, weights=values)
@@ -252,14 +205,6 @@ def sanity_check_model_type(model_class_name: str, hf_name_or_path: str):
 
 
 def train(
-    do_load_from_hf_name_or_path: bool = True,
-    # If we want the method to receive models directly:
-    # (This is if do_load_from_hf_name_or_path is False)
-    main_model: Optional[transformers.PreTrainedModel] = None,
-    reward_model: Optional[transformers.PreTrainedModel] = None,
-    tokenizer: Optional[transformers.PreTrainedTokenizer] = None,
-    # If we want instead the model to use hf_names_or_paths:
-    # (This is if do_load_from_hf_name_or_path is True)
     main_model_hf_name_or_path: Optional[str] = MAIN_MODEL,
     reward_model_hf_name_or_path: Optional[str] = REWARD_MODEL,
     tokenizer_hf_name_or_path: Optional[str] = TOKENIZER_MODEL,
@@ -268,12 +213,25 @@ def train(
     # ds_train: Optional[torch.data.Dataset] = None,
     trlx_config_path: Union[Path, str] = PPO_CONFIG_PATH,
     dataset_to_use: str = DATASET_TO_USE,
+    log_level: str = "INFO",
 ):
 
     args = locals().copy()
-    rich.print("[bold blue]Arguments:")
-    general_utils.print_dict(args)
-    print("")
+    rank = int(os.getenv("RANK", "0"))
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+
+    logging.basicConfig(
+        level=log_level,
+        format=f"[{rank}/{world_size}] %(name)s - %(message)s ",
+        handlers=[
+            rich.logging.RichHandler(markup=True),
+        ],
+    )
+
+    if rank == 0:
+        LOGGER.info("[bold blue]Arguments:")
+        general_utils.print_dict(args, logger=LOGGER, log_level="INFO")
+        print("")
 
     assert dataset_to_use in list(
         lib_data.DatasetChoices
@@ -281,237 +239,74 @@ def train(
 
     sanity_check_model_type(model_class_name, main_model_hf_name_or_path)
     sanity_check_model_type(model_class_name, reward_model_hf_name_or_path)
-    model_base_class = MODEL_CLASS_CHOICES[model_class_name]
 
     # The setup makes use of a tempfile.TemporaryDirectory to go around the peculiarities of TRLX.
     # This is why setup is a context manager.
-    with setup(
-        model=main_model,
-        reward_model=reward_model,
-        tokenizer=tokenizer,
-        main_model_hf_name_or_path=main_model_hf_name_or_path,
-        reward_model_hf_name_or_path=reward_model_hf_name_or_path,
-        tokenizer_hf_name_or_path=tokenizer_hf_name_or_path,
-        model_class=model_base_class,
-        do_load_from_hf_name_or_path=do_load_from_hf_name_or_path,
-    ) as (hf_path, tok_path, reward_model, reward_tokenizer):
+    hf_path = main_model_hf_name_or_path
+    reward_tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_hf_name_or_path)
+    config_dict = yaml.safe_load(Path(trlx_config_path).read_text())
 
-        ds_train_obj = lib_data.GSM8KLMDataset(
-            datasets.load_dataset("gsm8k", "main", split="train"),
-            tokenizer=reward_tokenizer,
-        )
-        ds_eval_obj = lib_data.GSM8KLMDataset(
-            datasets.load_dataset("gsm8k", "main", split="train"),
-            tokenizer=reward_tokenizer,
-        )
+    max_input_length = (
+        config_dict["train"]["seq_length"] - 
+        config_dict["method"]["gen_kwargs"]["max_new_tokens"]
+    )
+    ds_train_obj = lib_data.GSM8KLMDataset(
+        datasets.load_dataset("gsm8k", "main", split="train"),
+        tokenizer=reward_tokenizer,
+        max_length=max_input_length,
+    )
+    ds_eval_obj = lib_data.GSM8KLMDataset(
+        datasets.load_dataset("gsm8k", "main", split="train"),
+        tokenizer=reward_tokenizer,
+        max_length=max_input_length,
+    )
 
-        config_dict = yaml.safe_load(Path(trlx_config_path).read_text())
 
-        config_dict["model"]["model_path"] = hf_path
-        config_dict["model"]["tokenizer_path"] = tok_path
-        config_dict["method"]["gen_kwargs"][
-            "eos_token_id"
-        ] = reward_tokenizer.cls_token_id
+    assert "model_path" not in config_dict["model"]
+    config_dict["model"]["model_path"] = hf_path
+    assert "tokenizer_path" not in config_dict["tokenizer"]
+    config_dict["tokenizer"]["tokenizer_path"] = tokenizer_hf_name_or_path
 
+    config_dict["method"]["gen_kwargs"][
+        "eos_token_id"
+    ] = reward_tokenizer.cls_token_id
+
+    if rank == 0:
+        LOGGER.info("[bold blue]Config:")
         rich.print(config_dict)
-        config = TRLConfig.from_dict(config_dict)
 
-        # stats_for_key(ds_train_obj, "input", reward_tokenizer)
-        # stats_for_key(ds_train_obj, "value", reward_tokenizer)
-        # stats_for_key(ds_eval_obj , "input", reward_tokenizer)
-        # stats_for_key(ds_eval_obj , "value", reward_tokenizer)
+    config = TRLConfig.from_dict(config_dict)
 
-        scratchpad_reward_fn = ScratchpadRewardFn(
-            reward_model=reward_model,
-            reward_tokenizer=reward_tokenizer,
-            ds_train_obj=ds_train_obj,
-        )
+    # stats_for_key(ds_train_obj, "input", reward_tokenizer)
+    # stats_for_key(ds_train_obj, "value", reward_tokenizer)
+    # stats_for_key(ds_eval_obj , "input", reward_tokenizer)
+    # stats_for_key(ds_eval_obj , "value", reward_tokenizer)
 
-        model = trlx.train(
-            model_path=hf_path,
-            config=config,
-            prompts=ds_train_obj,
-            eval_prompts=ds_eval_obj,
-            reward_fn=scratchpad_reward_fn,
-            model_base_class=model_base_class,
-        )
+    scratchpad_reward_fn = reward.ScratchpadRewardFn(
+        reward_model_hf_name_or_path=reward_model_hf_name_or_path,
+        reward_tokenizer=reward_tokenizer,
+        ds_train_obj=ds_train_obj,
+        batch_size=config_dict["train"]["batch_size"],
+    )
 
-
-def remove_special_token_ids(
-    input_ids: list[int], tokenizer: transformers.PreTrainedTokenizer
-):
-    """
-    Remove special tokens from the input_ids
-    """
-    all_special_ids = set(tokenizer.all_special_ids)
-    filtered_input_ids = [x for x in input_ids if x not in all_special_ids]
-    return filtered_input_ids
-
-
-class ScratchpadRewardFn:
-    def __init__(
-        self, *, reward_model, reward_tokenizer, ds_train_obj,
-    ):
-
-        if reward_model.config.is_encoder_decoder:
-            assert (
-                reward_tokenizer.padding_side == "right"
-            ), f"{reward_tokenizer.padding_side = }"
-        else:
-            assert (
-                reward_tokenizer.padding_side == "left"
-            ), f"{reward_tokenizer.padding_side = }"
-
-        self._reward_model = reward_model
-        self._reward_tokenizer = reward_tokenizer
-        self._ds_train_obj = ds_train_obj
-
-    def __call__(self, batch, question_ids, scratchpad_ids, meta_info):
-        # The idea is to:
-        # 1. Extract the associated answers & tokenize the answers
-        # 2. Create a mask for the answers
-        # 3. Tokenize the samples
-        # 4. Concate the samples & answers
-        # 5. Run the reward model on the concatenated samples & answers
-        # 6. Extract the logp for the answers
-        # 7. Return the logp for the answers
-
-        rand_id = random.randint(0, len(question_ids) - 1)
-        question = self._reward_tokenizer.decode(question_ids[rand_id])
-        scratchpad = self._reward_tokenizer.decode(scratchpad_ids[rand_id])
-        question_filtered = question.replace(self._reward_tokenizer.pad_token, "")
-        scratchpad_filtered = scratchpad.replace(
-            self._reward_tokenizer.eos_token, ""
-        ).replace(self._reward_tokenizer.pad_token, "")
-
-        rich.print(f'[bold blue]meta_info:[/]  "{meta_info}"\n')
-        rich.print(f'[bold blue]question:[/]   "{question}"\n')
-        rich.print(f'[bold blue]scratchpad:[/] "{scratchpad}"\n')
-        rich.print(f'[bold blue]question_filtered:[/]   "{question_filtered}"\n')
-        rich.print(f'[bold blue]scratchpad_filtered:[/] "{scratchpad_filtered}"\n')
-
-        zipped_batch = general_utils.dict_zip(batch)
-        # check_tokenizer(self._reward_tokenizer)
-
-        ids_outputs = []
-        training_mask_ids_outputs = []
-        if self._reward_model.config.is_encoder_decoder:
-            ids_inputs = []
-            training_mask_ids_inputs = []
-
-        for input_, question_ids_indiv, scratchpad_ids_indiv in zip(
-            zipped_batch, question_ids, scratchpad_ids
-        ):
-
-            # 1.a Extract the associated answers
-            question_ids_indiv = remove_special_token_ids(
-                question_ids_indiv.tolist(), self._reward_tokenizer
-            )
-            scratchpad_ids_indiv = remove_special_token_ids(
-                scratchpad_ids_indiv.tolist(), self._reward_tokenizer
-            )
-
-            labels = [x.item() for x in input_["labels"] if x >= 0]
-            answer = self._reward_tokenizer.decode(labels, skip_special_tokens=True)
-
-            for k, v in self._reward_tokenizer.special_tokens_map.items():
-                if k != "additional_special_tokens":
-                    answer = answer.replace(v, "")
-
-            answer_tokens = self._reward_tokenizer(answer, add_special_tokens=False)[
-                "input_ids"
-            ]
-
-            if self._reward_model.config.is_encoder_decoder:
-                tokens = (
-                    scratchpad_ids_indiv
-                    + answer_tokens
-                    + [self._reward_tokenizer.eos_token_id]
-                )
-                ids_inputs.append(question_ids_indiv)
-                ids_outputs.append(tokens)
-                label_pad = 0
-                training_mask_ids_inputs.append([label_pad] * len(question_ids_indiv))
-                training_mask_ids_outputs.append(
-                    [label_pad] * len(scratchpad_ids_indiv)
-                    + [1] * len(answer_tokens)
-                    + [1]
-                )
-            else:
-                tokens = (
-                    question_ids_indiv
-                    + scratchpad_ids_indiv
-                    + answer_tokens
-                    + [self._reward_tokenizer.eos_token_id]
-                )
-                ids_outputs.append(tokens)
-
-                label_pad = 0
-                training_mask_ids_outputs.append(
-                    [label_pad] * len(question_ids_indiv)
-                    + [label_pad] * len(scratchpad_ids_indiv)
-                    + [1] * len(answer_tokens)
-                    + [1]
-                )
-                assert len(tokens) == len(training_mask_ids_outputs[-1]), (
-                    "{len(tokens) = }",
-                    "{len(training_mask_ids_outputs[-1]) = }",
-                )
-
-        ###########################################################################
-        # 1.b Tokenize the answers
-        ###########################################################################
-        full_seq = self._reward_tokenizer.pad(
-            dict(input_ids=ids_outputs), return_tensors="pt", padding=True
-        )
-        full_seq = {k: v.cuda() for k, v in full_seq.items()}
-        if self._reward_model.config.is_encoder_decoder:
-            full_seq_inputs = self._reward_tokenizer.pad(
-                dict(input_ids=ids_inputs), return_tensors="pt", padding=True
-            )
-            full_seq_inputs = {k: v.cuda() for k, v in full_seq_inputs.items()}
-
-        ###########################################################################
-        # 2. Compute the logp for the answers
-        ###########################################################################
-        # THE PROBLEM IS THAT THERE ARE IDS THAT ARE NOT IN THE VOCAB
-        # THEY SHOULD BE IN THE CHECKPOINT HOWEVER.
-        # THIS IS WHAT I WILL DO TOMORROW - INTEGRATION OF THIS SOLUTION WITH THE
-        # OTHER CHECKPOINT SHIT
-        if not self._reward_model.config.is_encoder_decoder:
-            logits = self._reward_model(
-                full_seq["input_ids"], attention_mask=full_seq["attention_mask"]
-            ).logits
-        else:
-            logits = self._reward_model(
-                input_ids=full_seq_inputs["input_ids"],
-                attention_mask=full_seq_inputs["attention_mask"],
-                decoder_input_ids=full_seq["input_ids"],
-                decoder_attention_mask=full_seq["attention_mask"],
-            ).logits
-
-        reward_model_outputs = logits.softmax(-1)
-
-        ###########################################################################
-        # 3. Only keep the logp for the actual values used
-        ###########################################################################
-        logp = reward_model_outputs.gather(
-            dim=-1, index=full_seq["input_ids"].unsqueeze(-1)
-        ).squeeze(-1)
-
-        ###########################################################################
-        # 4. Mask the logits of everything that is not the answer
-        ###########################################################################
-        full_seq_input_masks = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(x) for x in training_mask_ids_outputs],
-            batch_first=True,
-            padding_value=-100,
-        ).to(logp.device)
-        logp[full_seq_input_masks] = 1
-        logp_per_seq = logp.prod(-1)
-        average_logp = logp_per_seq.mean()
-        return average_logp
+    model = trlx.train(
+        model_path=hf_path,
+        config=config,
+        prompts=list(ds_train_obj),
+        eval_prompts=list(ds_eval_obj),
+        reward_fn=scratchpad_reward_fn,
+    )
 
 
 if __name__ == "__main__":
+    
+    if int(os.getenv("RANK", "0")) == 0:
+        for k, v in os.environ.items():
+            if "deepspeed" in k.lower():
+                print(f"{k} = {v}")
+
+        for k, v in os.environ.items():
+            if "accelerate" in k.lower() and "deepspeed" not in k.lower():
+                print(f"{k} = {v}")
+
     fire.Fire(train)

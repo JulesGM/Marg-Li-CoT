@@ -24,21 +24,26 @@ import torch
 import transformers
 import yaml
 from text2digits import text2digits
-from torch.profiler import ProfilerActivity, profile, record_function
 from tqdm import tqdm
 
-import algorithm_deepspeed_ppo
 import dataset_asdiv
 import dataset_gsm8k
 import metric
 import policy
 import reward
-from bin_deepspeed_experim import make_deepspeed_config
-
-sys.path.append("/home/mila/g/gagnonju/RL4LMs")
 import rl4lms.envs.text_generation.logging_utils as rl4lms_logging_utils
 import rl4lms.envs.text_generation.registry as rl4lms_registry
 import rl4lms.envs.text_generation.training_utils as rl4lms_training_utils
+from bin_deepspeed_experim import make_deepspeed_config
+
+RL4LMS_ROOT = "/home/mila/g/gagnonju/AccelerateRL4LMS"
+
+# for _module in [rl4lms_logging_utils, rl4lms_registry, rl4lms_training_utils]:
+#     assert _module.__file__.startswith(RL4LMS_ROOT), (
+#         _module.__file__, RL4LMS_ROOT)
+
+
+
 
 pretty_traceback.install()
 datasets.logging.set_verbosity_error()
@@ -61,9 +66,9 @@ class PolicyTypes(str, enum.Enum):
 
 
 MODEL_PARALLEL = True
-REWARD_MODEL_HF_NAME = "google/flan-t5-small"
+REWARD_MODEL_HF_NAME = "google/flan-t5-xl"
 POLICY_TYPE = PolicyTypes.naive
-N_ENVS_TRAIN = 128
+N_ENVS_TRAIN = 2
 POLICY_MODEL_HF_NAME = REWARD_MODEL_HF_NAME
 LOG_LEVEL = logging.WARNING
 
@@ -83,7 +88,7 @@ LOG_LEVEL = logging.INFO
 # Doesn't change
 ###############################################################################
 DATASET_CHOICE = DatasetChoices.asdiv
-REWARD_MODEL_DTYPE = torch.bfloat16
+REWARD_MODEL_DTYPE = torch.float32
 POLICY_DTYPE = REWARD_MODEL_DTYPE
 MAX_PROMPT_LENGTH = 107
 MAX_EPISODE_LENGTH = N_STEPS
@@ -227,14 +232,14 @@ def main():
         datefmt="[%X]",
         handlers=[rich.logging.RichHandler(markup=True, rich_tracebacks=True)],
     )
-    reward.LOGGER.setLevel(logging.WARNING)
-    logging.getLogger("rl4lms.envs.text_generation.policy.base_policy").setLevel(
+    reward.LOGGER.setLevel(
         logging.WARNING
     )
+    # logging.getLogger("rl4lms.envs.text_generation.policy.base_policy").setLevel(
+    #     logging.WARNING
+    # )
 
-    utils.info_rank_0(LOGGER, "[bold bright_yellow]#" * 80)
     utils.info_rank_0(LOGGER, "[bold bright_yellow]# >>> Loading REWARD model")
-    utils.info_rank_0(LOGGER, "[bold bright_yellow]#" * 80)
 
     reward_model_inst = transformers.AutoModelForSeq2SeqLM.from_pretrained(
         REWARD_MODEL_HF_NAME, torch_dtype=REWARD_MODEL_DTYPE
@@ -244,9 +249,7 @@ def main():
     for param in reward_model_inst.parameters():
         param.requires_grad = False
 
-    utils.info_rank_0(LOGGER, "[bold bright_yellow]#" * 80)
     utils.info_rank_0(LOGGER, "[bold bright_yellow]# <<< Done loading reward model")
-    utils.info_rank_0(LOGGER, "[bold bright_yellow]#" * 80)
 
     alg_config = {
         "id": "deepspeed_ppo" if POLICY_TYPE == PolicyTypes.deepspeed else "ppo",
@@ -297,17 +300,14 @@ def main():
         # "id"  : "flan_t5_scratchpad_answer_reward",
         # "args": {
         #     "reward_tokenizer_kwargs": {"padding": True},
-        #     "generation_splitter_fn" : reward.flan_t5_answer_removal,
-        #     "sp_answer_joiner_fn"    : reward.flan_t5_answer_joiner,
         #     "reward_tokenizer"       : reward_model_tok,
         #     "reward_model"           : reward_model_inst,
-        #     "parallelize_mode"      : reward_parallelism_mode,
         # },
+
         "id": "flan_t5_batch_scratchpad_answer_reward",
         "args": {
             "reward_model": reward_model_inst,
             "reward_tokenizer": reward_model_tok,
-            "parallelize_mode": reward_parallelism_mode,
         },
     }
 
@@ -342,6 +342,8 @@ def main():
         "alg": alg_config,
     }
 
+
+
     tracker = rl4lms_logging_utils.Tracker(
         base_path_to_store_results=os.path.join(
             os.environ["SLURM_TMPDIR"], "results"),
@@ -353,7 +355,9 @@ def main():
         log_level=LOG_LEVEL,
     )
 
+
     if "supervised" in config["alg"]["id"]:
+        assert False
         trainer = rl4lms_training_utils.SupervisedTrainer(
             train_eval_config=config["train_evaluation"],
             tokenizer_config=config["tokenizer"],
@@ -373,39 +377,10 @@ def main():
             tracker=tracker,
         )
 
-    if DO_PROFILE:
-        prof = profile(
-            profile_memory=True, record_shapes=True, activities=[ProfilerActivity.CUDA],
-        ).__enter__()
 
     transformers.logging.set_verbosity_error()
     datasets.logging.set_verbosity_error()
     trainer.train_and_eval()
-
-    if DO_PROFILE:
-        utils.info_rank_0(
-            LOGGER, "[blue bold]Our code: [/blue bold][bold]prof.__exit__"
-        )
-        prof.__exit__(None, None, None)
-        utils.info_rank_0(
-            LOGGER, "[blue bold]Our code: [/blue bold][bold]Done with prof.__exit__"
-        )
-        utils.info_rank_0(
-            LOGGER, "[blue bold]Our code: [/blue bold][bold]preparing prof output"
-        )
-
-        prof_obj = prof.key_averages()
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        path = f"/home/mila/g/gagnonju/Marg-Li-CoT/rl4lms/profiling/profiling_{timestamp}_{POLICY_TYPE}"
-
-        with Path(path + ".pkl").open("wb") as f:
-            pickle.dump(prof_obj, f)
-        with Path(path + ".json").open("w") as f:
-            json.dump(SETTINGS, f, indent=4, default=str)
-
-        output = prof_obj.table(sort_by="self_cuda_memory_usage", row_limit=100)
-        "[blue bold]Our code: [/blue bold][bold]Done preparing prof output"
-        utils.info_rank_0(LOGGER, output)
 
 
 if __name__ == "__main__":

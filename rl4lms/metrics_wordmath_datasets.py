@@ -5,7 +5,7 @@ import typing
 import general_utils as utils
 from text2digits import text2digits
 
-import metric
+import with_trlx.metric as metric
 import rl4lms.envs.text_generation.registry as rl4lms_registry
 
 LOGGER = logging.getLogger(__name__)

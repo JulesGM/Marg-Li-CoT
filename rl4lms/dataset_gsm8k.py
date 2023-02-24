@@ -1,16 +1,16 @@
 import collections
 import logging
+import re
 import typing
 
-from beartype import beartype
 import datasets
-import pretty_traceback
 import general_utils as utils
 import jsonlines as jsonl
-import re
+import pretty_traceback
 import rich
-from text2digits import text2digits
 import transformers
+from beartype import beartype
+from text2digits import text2digits
 
 import metric
 import metrics_wordmath_datasets

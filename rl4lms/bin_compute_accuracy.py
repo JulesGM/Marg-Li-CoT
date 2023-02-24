@@ -13,17 +13,17 @@
 
 import collections
 import enum
-import fire
 import logging
-from pathlib import Path
 import os
 import random
 import re
 import time
 import typing
+from pathlib import Path
 
 import accelerate
 import datasets
+import fire
 import general_utils as utils
 import matplotlib.pyplot as plt
 import more_itertools
@@ -38,7 +38,6 @@ import dataset_asdiv
 import dataset_gsm8k
 import rl4lms.data_pools.text_generation_pool as rl4lms_pool
 from metrics_wordmath_datasets import split_fn
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -84,6 +83,7 @@ USE_MAJORITY_VOTE = NUM_RETURN_SEQUENCES > 1
 ###############################################################################
 
 import contextlib
+
 
 @contextlib.contextmanager
 def one_by_one(accelerator):

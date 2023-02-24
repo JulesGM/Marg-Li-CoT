@@ -47,7 +47,9 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         ref_model=None,
         **kwargs,
     ):
-
+        assert False
+        super().__init__(**kwargs)
+        
         utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
         utils.info_rank_0(
             LOGGER,
@@ -55,12 +57,11 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         )
         utils.info_rank_0(LOGGER, "[bright_magenta bold]#" * 80)
 
-        self._reward_model_container = [ref_model] if ref_model else None
         self._head_kwargs = head_kwargs
+        self._reward_model_container = [ref_model] if ref_model else None
         self._same_model_for_value = same_model_for_value
         self._from_pretrained_kwargs = from_pretrained_kwargs
 
-        super().__init__(**kwargs)
 
     def _build_model_heads(self, model_name: str):
         """
@@ -122,32 +123,33 @@ class PrecisionControlSeq2SeqLMActorCriticPolicy(
         # Parallelization
         #######################################################################
         assert torch.cuda.is_available(), "requires CUDA"
-        if torch.cuda.is_available():
-            if self._apply_model_parallel and self._policy_model.is_parallelizable:
 
-                self._policy_model.parallelize()
-                self._ref_model.parallelize()
+        # if torch.cuda.is_available():
+        #     if self._apply_model_parallel and self._policy_model.is_parallelizable:
 
-                if not self._value_model is self._policy_model:
-                    self._value_model.parallelize()
+        #         self._policy_model.parallelize()
+        #         self._ref_model.parallelize()
 
-                self._value_head = self._value_head.to(self.device)
+        #         if not self._value_model is self._policy_model:
+        #             self._value_model.parallelize()
 
-            else:  # else defaults to data parallel
-                assert False
-                self._policy_model = torch.nn.DataParallel(
-                    self._policy_model.to(self.device)
-                )
-                self._ref_model = torch.nn.DataParallel(self._ref_model.to(self.device))
-                self._value_model = torch.nn.DataParallel(
-                    self._value_model.to(self.device)
-                )
-                self._value_head = torch.nn.DataParallel(
-                    self._value_head.to(self.device)
-                )
+        #         self._value_head = self._value_head.to(self.device)
 
-        else:
-            assert False
+        #     else:  # else defaults to data parallel
+        #         assert False
+        #         self._policy_model = torch.nn.DataParallel(
+        #             self._policy_model.to(self.device)
+        #         )
+        #         self._ref_model = torch.nn.DataParallel(self._ref_model.to(self.device))
+        #         self._value_model = torch.nn.DataParallel(
+        #             self._value_model.to(self.device)
+        #         )
+        #         self._value_head = torch.nn.DataParallel(
+        #             self._value_head.to(self.device)
+        #         )
+
+        # else:
+        #     assert False
 
 
 class DeepSpeedExperimentationPolicy(rl4lms_seq2seq_policy.Seq2SeqLMActorCriticPolicy):

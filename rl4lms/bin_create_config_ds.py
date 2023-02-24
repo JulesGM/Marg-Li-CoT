@@ -1,8 +1,11 @@
-import bin_deepspeed_experim
-import fire
 import json
-import rich
 import typing
+
+import fire
+import rich
+
+import bin_deepspeed_experim
+
 
 def main(
     output_path: str="./config_ds_json/config_ds_new_json.json",
