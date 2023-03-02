@@ -21,6 +21,8 @@ def info(message):
 LOGGER = logging.getLogger(__name__)
 
 
+
+
 def make_dataloader(*, tokenizer, batch_size, num_workers):
     all_data = datasets.load_dataset("gsm8k", "main", split="train")["question"]
     return torch.utils.data.DataLoader(
@@ -29,7 +31,7 @@ def make_dataloader(*, tokenizer, batch_size, num_workers):
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-    )
+    ), all_data
 
 def main(
         hf_model_name = "google/flan-t5-small",
@@ -53,21 +55,30 @@ def main(
     model_1 = transformers.AutoModelForSeq2SeqLM.from_pretrained(hf_model_name)
     model_2 = transformers.AutoModelForSeq2SeqLM.from_pretrained(hf_model_name)
     tok = transformers.AutoTokenizer.from_pretrained(hf_model_name)
-    dataloader = make_dataloader(tokenizer=tok, batch_size=batch_size, num_workers=num_workers)
 
     single_accel = accelerate.Accelerator()
 
-    lol = torch.ones(3) * rank
-    lol = lol.to(single_accel.device)
-    all_lols = [
-        torch.empty(3, dtype=lol.dtype).to(single_accel.device) 
-        for _ in range(world_size)
-    ]
-    torch.distributed.all_gather(all_lols, lol)
-    # info(str(all_lols))
-    output = single_accel.gather(lol)
-    info(str(output))
+    if single_accel.is_main_process:
+        _, all_data = make_dataloader(
+            tokenizer=tok, 
+            batch_size=batch_size, 
+            num_workers=num_workers,
+        )
+        size = len(all_data) // world_size
+        assert isinstance(all_data   , list), f"{type(all_data   ).mro() = }"
+        assert isinstance(all_data[0], str ), f"{type(all_data[0]).mro() = }"
+        all_data = [all_data[i * size:(i + 1) * size] for i in range(world_size)]
+    else:
+        all_data = [None] * world_size
+    
+    output_list = [None]
+    torch.distributed.scatter_object_list(
+        scatter_object_output_list=output_list,
+        scatter_object_input_list=all_data,
+        src=0,
+    )
 
+    LOGGER.info(f"{[(len(x) if x is not None else x) for x in all_data]}")
     exit()
 
     two_models = [model_1, model_2]

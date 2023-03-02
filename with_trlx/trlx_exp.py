@@ -25,7 +25,6 @@ import enum
 import logging
 import os
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import itertools
 import random
 import re
@@ -49,6 +48,7 @@ import yaml
 from tqdm import tqdm
 
 import lib_data
+import metric
 import reward
 from general_utils import parallel_guard
 
@@ -227,6 +227,8 @@ def train(
             rich.logging.RichHandler(markup=True),
         ],
     )
+    logging.getLogger("reward").setLevel(logging.DEBUG)
+
 
     if rank == 0:
         LOGGER.info("[bold blue]Arguments:")
@@ -256,10 +258,21 @@ def train(
         max_length=max_input_length,
     )
     ds_eval_obj = lib_data.GSM8KLMDataset(
-        datasets.load_dataset("gsm8k", "main", split="train"),
+        datasets.load_dataset("gsm8k", "main", split="test"),
         tokenizer=reward_tokenizer,
         max_length=max_input_length,
     )
+
+    # It needs to be enabled before this point to 
+    # tokenize the whole dataset, but it's not needed after that.
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    def merged_get_extra_info(input_str):
+        output = ds_train_obj.get_extra_info(input_str)
+        if output is None:
+            output = ds_eval_obj.get_extra_info(input_str)
+        assert output is not None, input_str
+        return output
 
 
     assert "model_path" not in config_dict["model"]
@@ -282,11 +295,19 @@ def train(
     # stats_for_key(ds_eval_obj , "input", reward_tokenizer)
     # stats_for_key(ds_eval_obj , "value", reward_tokenizer)
 
+    # Afaik the eval should not need the extra info engine.
     scratchpad_reward_fn = reward.ScratchpadRewardFn(
         reward_model_hf_name_or_path=reward_model_hf_name_or_path,
         reward_tokenizer=reward_tokenizer,
         ds_train_obj=ds_train_obj,
         batch_size=config_dict["train"]["batch_size"],
+    )
+
+    # The metric does however need access to eval extra info. 
+    # This feels safe because the metric can't have an effect 
+    # on the training.
+    metric_accuracy = metric.ScratchpadAnswerAccuracy(
+        extra_info_engine=merged_get_extra_info,
     )
 
     model = trlx.train(
@@ -295,6 +316,7 @@ def train(
         prompts=list(ds_train_obj),
         eval_prompts=list(ds_eval_obj),
         reward_fn=scratchpad_reward_fn,
+        metric_fn=metric_accuracy,
     )
 
 

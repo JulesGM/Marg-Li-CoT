@@ -1,4 +1,5 @@
 import abc
+import bisect
 import collections
 import enum
 import logging
@@ -11,6 +12,7 @@ from pathlib import Path
 # import datasketch
 import editdistance
 import general_utils
+import itertools
 import more_itertools
 import numpy as np
 import rich
@@ -20,6 +22,7 @@ import wget
 from text2digits import text2digits
 
 LOGGER = logging.getLogger(__name__)
+
 
 class MovingAverage:
     def __init__(self, window_size: int):
@@ -49,11 +52,11 @@ class MovingAverage:
 
 class ConvToNum:
     def __init__(self, failure_rate_moving_average_window_size: int = 10000):
-        self._failure_rate = MovingAverage(failure_rate_moving_average_window_size)
-        self._change_rate = MovingAverage(failure_rate_moving_average_window_size)
+        self._failure_rate   = MovingAverage(failure_rate_moving_average_window_size)
+        self._change_rate    = MovingAverage(failure_rate_moving_average_window_size)
         self._no_answer_rate = MovingAverage(failure_rate_moving_average_window_size)
         self._converter_inst = text2digits.Text2Digits(convert_ordinals=False)
-        self._answer_pat = re.compile(r"(\d+(,\d+)*)(\.\d+)?")
+        self._answer_pat     = re.compile(r"(\d+(,\d+)*)(\.\d+)?")
 
     @classmethod
     def _log_diffs(cls, *, level, initial, text, converted, final, change_stats):
@@ -168,6 +171,17 @@ class ConvToNum:
             )
             text = text_
 
+        # E)
+        # Add space between the last number and a percentage sign.
+        text_ = re.sub(r"(\d)%", r"\1 %", text)
+        if text_ != text:
+            LOGGER.debug(
+                "[bold blue]E) Added a space before the percentage sign:\n"
+                f"[white]{text}\n"
+                f"[green]{text_}\n"
+            )
+            text = text_
+
         #######################################################################
         # Now we attempt to convert the words to numbers.
         #######################################################################
@@ -176,7 +190,7 @@ class ConvToNum:
         except (ValueError, ArithmeticError):
             self._failure_rate.update(1)
             ratio, (sum_, size) = self._failure_rate.get()
-            LOGGER.info(
+            LOGGER.debug(
                 f"\n[red bold] Failed to convert words to numbers. "
                 f"(Failure rate: {ratio:0.2%}, {int(sum_)}/{size}):\n[white]"
                 f"{text}"
@@ -250,15 +264,16 @@ class ConvToNum:
             return initial
 
     def extract_answer(self, text: str) -> re.Match:
+        
         output = more_itertools.last(
             re.finditer(self._answer_pat, text),
             default=None,
         )
-        if output:
-            assert output.group(0).strip() != ",", (
-                f"{str(output) = }\n"
-                f"{str(text)   = }\n"
-            )
+
+        if output is None:
+            # LOGGER.debug(f"[dark_orange bold on white]EXTRACT ANSWER FAILED: `{text}`")
+            pass
+
         return output
 
     def __call__(self, text: str) -> str:
@@ -267,93 +282,70 @@ class ConvToNum:
 
 # class ApproxMatcher:
 #     def __init__(self, ds):
-#         self._matcher = datasketch.MinHashLSH(threshold=0.5, num_perm=128)
 #         self._ds = ds
 
-#         for i, sample in enumerate(ds):
-#             self._matcher.insert(str(i), self._get_minhash(sample))
-    
-#     def _get_minhash(self, sample):
-#         min_hash = datasketch.MinHash(num_perm=128)
-#         min_hash.update(sample.encode("utf8"))
-#         for word in sample.split():
-#             min_hash.update(word.encode("utf8"))
-
-#         return min_hash
-
 #     def query(self, sample):
-#         output = self._matcher.query(self._get_minhash(sample))
-#         print(output)
-#         distance = editdistance.distance(sample, output[0]) < 2
-#         assert distance, f"{sample = } {output = } {distance = }"
-#         return output[0]
+#         start = time.perf_counter()
+#         min_distance_match, distance = min(
+#             ((k, editdistance.distance(sample, k)) 
+#             for k in self._ds)
+#             , key=lambda x: x[1]
+#         )
+#         delta = time.perf_counter() - start
+#         rich.print(
+#             f"{sample             = }\n" +
+#             f"{min_distance_match = }\n" + 
+#             f"{distance = } {delta = :0.3}\n" + 
+#             f"-" * 80 + "\n"
+#         )
+        
+#         if distance < 10: 
+#             rich.print(
+
+#             f"\n"
+#             f"[bold white on red]LARGE DISTANCE:[green on black]\n"
+#             f"{sample             = }\n"
+#             f"{min_distance_match = }\n"
+#             f"{distance           = }\n"
+#         )
+        
+#         return self._ds.get_extra_info(min_distance_match)
 
 
 class ApproxMatcher:
     def __init__(self, ds):
-        self._ds = ds
+        self._ds = sorted(ds)
 
     def query(self, sample):
         start = time.perf_counter()
-        min_distance_match, distance = min(
-            ((k, editdistance.distance(sample, k)) 
-            for k in self._ds)
-            , key=lambda x: x[1]
-        )
+        idx = bisect.bisect(self._ds, sample)        
+        value_right = self._ds[idx]
+        value_left  = self._ds[max(idx - 1, 0)]
         delta = time.perf_counter() - start
+
+        info = (
+            "\n" +
+            f"delta: {delta = :0.3}\n" +
+            f"\t- {sample = }\n" +
+            f"\t- {value_right = }\n" +
+            f"\t- {value_left = }\n" +
+            f"\t- {value_right[:len(sample)] = }\n" +
+            f"\t- {value_left[:len(sample)] = }\n"
+        )
+        assert value_left[:len(sample)] == sample, info
+
         rich.print(
-            f"{sample             = }\n" +
-            f"{min_distance_match = }\n" + 
-            f"{distance = } {delta = :0.3}\n" + 
-            f"-" * 80 + "\n"
+            f"[red bold on white]PREFIX MATCHED:\n" +
+            info
         )
         
-        if distance < 10: 
-            rich.print(
-
-            f"\n"
-            f"[bold white on red]LARGE DISTANCE:[green on black]\n"
-            f"{sample             = }\n"
-            f"{min_distance_match = }\n"
-            f"{distance           = }\n"
-        )
-        
-        return self._ds.get_sample_extra_info(min_distance_match)
-
-
-def deal_with_words(text: str) -> typing.Optional[float]:
-    try:
-        converted = text2digits.Text2Digits().convert(text)
-    except (ValueError, ArithmeticError):
-        converted = text
-
-    output = _NUM_PAT.findall(converted)
-
-    if not output:
-        return None
-
-    output = output[-1]
-
-    LOGGER.debug("[bold blue]" + "#" * 80)
-    LOGGER.debug(
-        f"[bold blue]# text2digits[/]:\n"
-        f" \t -> [green]source:[/]    {text}\n"
-        f" \t -> [green]converted:[/] {converted}\n"
-        f" \t -> [green]final:[/]     {output}",
-    )
-    LOGGER.debug("[bold blue]" + "#" * 80)
-
-    return output
-
-
-
 
 class BaseTRLXExtraInfoDataset(torch.utils.data.Dataset, abc.ABC):
     def __init__(self):
         self._matcher = ApproxMatcher(self)
 
     @abc.abstractmethod
-    def get_sample_extra_info(self, sample_str: str) -> dict[str, typing.Any]:
+    def get_extra_info(self, sample_str: str) -> dict[str, typing.Any]:
         raise NotImplementedError
 
 
@@ -422,7 +414,7 @@ class ASDiv(BaseTRLXExtraInfoDataset):
             tokenized["input_ids"], skip_special_tokens=True,
         ).strip()
 
-    def get_sample_extra_info(self, sample_str: str) -> dict[str, typing.Any]:
+    def get_extra_info(self, sample_str: str) -> dict[str, typing.Any]:
         return self._extra_info[sample_str]
 
     def __len__(self) -> int:
@@ -463,24 +455,66 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
         tokenizer: transformers.PreTrainedTokenizerBase, 
         max_length: int
     ):
-        self._ds = ds
         self._inputs_key = "question"
         self._outputs_key = "answer"
         self._tokenizer = tokenizer
         self._extra_info = {}
         self._max_length = max_length
+        self._populate_ds(ds)
+
         super().__init__()
 
-    def get_sample_extra_info(self, sample_str: str
+    def _populate_ds(self, ds):
+        samples = []
+        outputs = []
+
+        for idx in range(len(ds)):
+            sample = self.preprocess_question(ds[idx][self._inputs_key])
+            output = ds[idx][self._outputs_key].rsplit("####", 1)[1].strip()
+
+            samples.append(sample)
+            outputs.append(output.replace(",", ""))
+
+        LOGGER.info("> Tokenizing.")
+        tokenized_samples = self._tokenizer(samples)["input_ids"]
+        tokenized_outputs = self._tokenizer(outputs)["input_ids"]
+        LOGGER.info("< Done Tokenizing.")
+
+
+        self._samples = []
+        self._outputs = []
+        
+        for t_s, t_o in zip(tokenized_samples, tokenized_outputs):
+            if len(t_s) > self._max_length:
+                continue
+
+            self._samples.append(
+                self._tokenizer.decode(
+                    t_s, skip_special_tokens=True
+                )
+            )
+            self._outputs.append(
+                self._tokenizer.decode(
+                    t_o, skip_special_tokens=True
+                )
+            )
+
+        LOGGER.info(
+            f"[red bold]With len {self._max_length} - "
+            f"Kept {len(self._samples) / len(samples):0.1%} samples, "
+            f"{len(self._samples)} / {len(samples)}"
+        )
+
+    def get_extra_info(self, sample_str: str
     ) -> dict[str, typing.Any]:
 
         if isinstance(sample_str, list):
             return general_utils.dict_unzip([
-                self.get_sample_extra_info(sample) for sample in sample_str
+                self.get_extra_info(sample) 
+                for sample in sample_str
             ])
         else:
             assert isinstance(sample_str, str), f"{type(sample_str).mro() = }"
-            # sample_str = self.preprocess_question(sample_str)
             
             if sample_str not in self._extra_info:
                 match = self._matcher.query(sample_str)
@@ -496,38 +530,33 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
     def preprocess_question(self, question: str) -> str:
         tokenized = self._tokenizer(
             question,
-            truncation=True,
-            max_length=self._max_length,
             add_special_tokens=False,
         )
-        assert isinstance(tokenized["input_ids"], list), (
-            f"{type(tokenized['input_ids']).mro() = }"
-        )
-        assert isinstance(tokenized["input_ids"][0], int), (
-            f"{type(tokenized['input_ids'][0]).mro() = }"
-        )
-
         return self._tokenizer.decode(
             tokenized["input_ids"], 
             skip_special_tokens=True,
             
         ).strip()
 
-    def _get_indiv_item(self, idx) -> str:
+    def _get_indiv_item(self, idx, dont_add_to_extra_info=False) -> str:
         assert isinstance(idx, int), f"{type(idx) = }"
         assert idx >= 0, f"{idx = }"
+        sample = self._samples[idx]
+        output = self._outputs[idx]
 
-        sample = self.preprocess_question(self._ds[idx][self._inputs_key])
-        output = self._ds[idx][self._outputs_key].rsplit("####", 1)[1].strip()
-        self._extra_info[sample] = dict(answer=output)
+        if not dont_add_to_extra_info:
+            self._extra_info[sample] = dict(answer=output)
 
         assert isinstance(sample, str)
         return sample
 
     def __len__(self):
-        return len(self._ds)
+        return len(self._samples)
 
-    def __getitem__(self, idx_or_slice: typing.Union[int, slice]) -> typing.Union[str, list[str]]:
+    def __getitem__(
+            self, idx_or_slice: typing.Union[int, slice]
+        ) -> typing.Union[str, list[str]]:
+
         if isinstance(idx_or_slice, int):
             return self._get_indiv_item(idx_or_slice)
 

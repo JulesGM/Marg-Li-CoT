@@ -4,6 +4,7 @@ from typing import *
 
 import datasets
 import general_utils as utils
+import math
 import numpy as np
 import pandas as pd
 import rich
@@ -12,36 +13,42 @@ import tqdm
 import transformers
 from beartype import beartype
 
+import metric
+import lib_data
 
-
-TO_INT_PAT = re.compile(r"((?:- ?)?\d+)(\.0*)?")
 LOGGER = logging.getLogger(__name__)
 
-
-@beartype
-def convert_to_int(num_str: Optional[str]) -> Optional[int]:
-    if num_str is None:
-        return None
-        
-    num_str = num_str.replace(",", "")
-    output = TO_INT_PAT.fullmatch(num_str)
-    if output is None:
-        return None
-
-    return int(output.group(1).replace(" ", ""))
 
 
 class ScratchpadAnswerAccuracy:
     def __init__(
         self, *, 
-        make_comparable_fn: Callable, 
-        extract_answer_fn: Callable[[str], str],
-        extra_info_engine
+        extra_info_engine,
     ):
         super().__init__()
-        self._make_comparable = make_comparable_fn
-        self._extract_answer = extract_answer_fn
-        self._extra_info_engine = extra_info_engine
+        self._extra_info_fn = extra_info_engine
+        self._make_comparable   = self._make_comparable
+        self._num_conv_instance = lib_data.ConvToNum()
+        self._extract_answer    = self._num_conv_instance.extract_answer
+
+    def _make_comparable(self, match: re.Match, original_text: str = None) -> Optional[int]:
+        if match is None:
+            return None
+        
+        assert isinstance(match, re.Match), type(match).mro()
+        try:
+            converted = float(match.group(0))
+        except ValueError:
+            try:
+                converted = float(match.group(0).replace(",", ""))
+            except ValueError:
+                LOGGER.info(
+                    f"[red bold]ValueError: [white]"
+                    f"`{match.group(0).replace(',', '') = }` `{original_text = }`"
+                )
+                return None
+        
+        return converted
 
     def __call__(
         self,
@@ -49,28 +56,39 @@ class ScratchpadAnswerAccuracy:
         samples: List[str],
         outputs: List[str],
     ):
-        extra_info = self._extra_info_engine.get_sample_extra_info(prompts)
+        extra_info = self._extra_info_fn(prompts)
         generated_texts = outputs
+        reference_texts = extra_info["answer"]
+        assert len(reference_texts) == len(generated_texts), (
+            len(reference_texts),
+            len(generated_texts),
+        )
 
         assert len(generated_texts) == len(reference_texts), (
             len(generated_texts),
             len(reference_texts),
         )
 
-        parsed = []
+        parsed = [] # Only used for debugging. Convert to a dataframe as needed.
         em_value = []
-        qty_skipped_bc_ref = 0
+        num_none_parsed = 0
 
         for raw_gen, raw_ref in zip(generated_texts, reference_texts):
+            if isinstance(raw_ref, str):
+                raw_ref = [raw_ref]
+
             assert isinstance(raw_ref, list), type(raw_ref)
             assert len(raw_ref) == 1, len(raw_ref)
             assert isinstance(raw_ref[0], str), type(raw_ref[0])
 
             extracted_ref = self._extract_answer(raw_ref[0])
-            ref = self._make_comparable(extracted_ref)
+            ref = self._make_comparable(extracted_ref, raw_ref[0])
 
             if ref is None:
-                raise ValueError(f"[Reference is None: {raw_ref = } {extracted_ref = }")
+                rich.print(
+                    f"[bold red on white]REF IS NONE: "
+                    f"\"{raw_ref = }\" \"{extracted_ref = }\""
+                )
 
             assert ref is not None, raw_ref
             assert raw_gen is not None
@@ -78,13 +96,18 @@ class ScratchpadAnswerAccuracy:
             if raw_gen is not None:
                 extracted_gen = self._extract_answer(raw_gen)
                 if extracted_gen is not None:
-                    gen = self._make_comparable(extracted_gen)
+                    gen = self._make_comparable(extracted_gen, raw_gen)
                 else:
                     gen = None
 
-                parsed.append((gen, ref))
+                if gen is None:
+                    num_none_parsed += 1
+                    
+                parsed.append(dict(
+                    gen=gen, ref=ref, gen_text=raw_gen, ref_text=raw_ref[0]
+                ))
                 if gen is not None:
-                    em_value.append(1.0 if gen == ref else 0.0)
+                    em_value.append(1.0 if math.isclose(gen, ref) else 0.0)
                 else:
                     LOGGER.debug(
                         f"[bold yellow]gen is None:[/] "
@@ -92,17 +115,24 @@ class ScratchpadAnswerAccuracy:
                     )
                     em_value.append(0.0)
             else:
-                parsed.append((None, ref))
+                assert False, "This should never happen."
+                parsed.append(dict(
+                    gen=None, ref=ref, gen_text=raw_gen, ref_text=raw_ref[0]
+                ))
                 em_value.append(0.0)
 
+
+        none_parsed = [x for x in parsed if x["gen"] is None]
         output = dict(em_accuracy=(em_value, np.mean(em_value)))
+
         LOGGER.info(
             f"[bold green]EM Result: [bold white]"
             f"{np.mean(em_value):0.1%}\n"
-            f"[bold red]Fraction skipped because of ref: [white]"
-            f"{qty_skipped_bc_ref / len(generated_texts):0.0%}"
+            f"[bold red on white]Fraction of no answer found: "
+            f"{num_none_parsed / len(parsed):0.1%}\n"
         )
         
+
         assert len(em_value) == len(generated_texts) == len(reference_texts), (
             f"\n{len(generated_texts)  = }\n"
             f"{len(reference_texts)  = }\n"
