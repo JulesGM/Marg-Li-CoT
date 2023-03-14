@@ -11,25 +11,17 @@ By default, we support the GPT2 model.
 
 
 """
+import os
 
-
-TOKENIZER_MODEL = "google/flan-t5-small"
-DATASET_TO_USE  = "gsm8k"
-REWARD_MODEL    = "google/flan-t5-small"
-MAIN_MODEL      = "google/flan-t5-small"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
 import collections
 import contextlib
 import enum
 import logging
-import os
-
-import itertools
 import random
-import re
-import sys
-import time
 from pathlib import Path
 from typing import *
 
@@ -43,18 +35,32 @@ import rich.logging
 import torch
 import transformers
 import trlx
-from trlx.data.configs import TRLConfig
 import yaml
-from tqdm import tqdm
+from trlx.data.configs import TRLConfig
 
 import lib_data
 import metric
 import reward
-from general_utils import parallel_guard
 
+
+TOKENIZER_MODEL = "google/flan-t5-small"
+DATASET_TO_USE  = "gsm8k"
+REWARD_MODEL    = "google/flan-t5-small"
+MAIN_MODEL      = "google/flan-t5-small"
+
+torch.cuda.manual_seed_all(0)
+torch.manual_seed(1)
+np.random.seed(2)
+random.seed(3)
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True)
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 print("Done with imports")
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -121,8 +127,8 @@ def setup(
 
 
 def stats_for_key(
-    ds: lib_data.GSM8KLMDataset, 
-    field: str, 
+    ds: lib_data.GSM8KLMDataset,
+    field: str,
     reward_tokenizer: transformers.PreTrainedTokenizer,
 ):
     """
@@ -178,25 +184,26 @@ def stats_for_key(
 
 
 class ModelClassChoices(str, enum.Enum):
-    seq2seq = "seq2seq"
-    causal_lm = "causal_lm"
+    SEQ2SEQ = "seq2seq"
+    CAUSAL_LM = "causal_lm"
 
 
 MODEL_CLASS_CHOICES = {
-    ModelClassChoices.causal_lm: transformers.AutoModelForCausalLM,
-    ModelClassChoices.seq2seq: transformers.AutoModelForSeq2SeqLM,
+    ModelClassChoices.CAUSAL_LM: transformers.AutoModelForCausalLM,
+    ModelClassChoices.SEQ2SEQ: transformers.AutoModelForSeq2SeqLM,
 }
 
 MODEL_TYPE_CHECKS = {
-    ModelClassChoices.causal_lm: {"gpt2"},
-    ModelClassChoices.seq2seq: {"bart", "t5"},
+    ModelClassChoices.CAUSAL_LM: {"gpt2"},
+    ModelClassChoices.SEQ2SEQ: {"bart", "t5"},
 }
 
 
 def sanity_check_model_type(model_class_name: str, hf_name_or_path: str):
     """
     Check that the model type is compatible with the model class.
-    Basically checks that we're not trying to instantiate a seq2seq gpt2 model or something like that.
+    Basically checks that we're not trying to instantiate a seq2seq gpt2
+    model or something like that.
     """
     config = transformers.AutoConfig.from_pretrained(hf_name_or_path)
     assert (
@@ -208,7 +215,7 @@ def train(
     main_model_hf_name_or_path: Optional[str] = MAIN_MODEL,
     reward_model_hf_name_or_path: Optional[str] = REWARD_MODEL,
     tokenizer_hf_name_or_path: Optional[str] = TOKENIZER_MODEL,
-    model_class_name: str = ModelClassChoices.seq2seq,  # One of ModelClassChoices
+    model_class_name: str = ModelClassChoices.SEQ2SEQ,  # One of ModelClassChoices
     # ds_eval: Optional[torch.data.Dataset] = None,
     # ds_train: Optional[torch.data.Dataset] = None,
     trlx_config_path: Union[Path, str] = PPO_CONFIG_PATH,
@@ -249,7 +256,7 @@ def train(
     config_dict = yaml.safe_load(Path(trlx_config_path).read_text())
 
     max_input_length = (
-        config_dict["train"]["seq_length"] - 
+        config_dict["train"]["seq_length"] -
         config_dict["method"]["gen_kwargs"]["max_new_tokens"]
     )
     ds_train_obj = lib_data.GSM8KLMDataset(
@@ -263,15 +270,19 @@ def train(
         max_length=max_input_length,
     )
 
-    # It needs to be enabled before this point to 
+    # It needs to be enabled before this point to
     # tokenize the whole dataset, but it's not needed after that.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    def merged_get_extra_info(input_str):
-        output = ds_train_obj.get_extra_info(input_str)
+    def merged_get_extra_info(input_str, miss_ok=False):
+        if isinstance(input_str, list):
+            return [merged_get_extra_info(x) for x in input_str]
+
+        assert isinstance(input_str, str), type(input_str).mro()
+        output = ds_train_obj.get_extra_info(input_str, miss_ok=True)
         if output is None:
-            output = ds_eval_obj.get_extra_info(input_str)
-        assert output is not None, input_str
+            output = ds_eval_obj.get_extra_info(input_str, miss_ok=True)
+            assert output is not None, input_str
         return output
 
 
@@ -290,38 +301,34 @@ def train(
 
     config = TRLConfig.from_dict(config_dict)
 
-    # stats_for_key(ds_train_obj, "input", reward_tokenizer)
-    # stats_for_key(ds_train_obj, "value", reward_tokenizer)
-    # stats_for_key(ds_eval_obj , "input", reward_tokenizer)
-    # stats_for_key(ds_eval_obj , "value", reward_tokenizer)
-
-    # Afaik the eval should not need the extra info engine.
-    scratchpad_reward_fn = reward.ScratchpadRewardFn(
-        reward_model_hf_name_or_path=reward_model_hf_name_or_path,
-        reward_tokenizer=reward_tokenizer,
-        ds_train_obj=ds_train_obj,
-        batch_size=config_dict["train"]["batch_size"],
-    )
-
-    # The metric does however need access to eval extra info. 
-    # This feels safe because the metric can't have an effect 
+    # The metric does however need access to eval extra info.
+    # This feels safe because the metric can't have an effect
     # on the training.
     metric_accuracy = metric.ScratchpadAnswerAccuracy(
         extra_info_engine=merged_get_extra_info,
     )
 
+    # Afaik the eval should not need the extra info engine.
+    scratchpad_reward_fn = reward.ScratchpadRewardFn(
+        batch_size                    = config_dict["train"]["batch_size"],
+        get_extra_info_fn             = merged_get_extra_info,
+        metric_fn                     = metric_accuracy,
+        reward_tokenizer              = reward_tokenizer,
+        reward_model_hf_name_or_path  = reward_model_hf_name_or_path,
+    )
+
     model = trlx.train(
-        model_path=hf_path,
-        config=config,
-        prompts=list(ds_train_obj),
-        eval_prompts=list(ds_eval_obj),
-        reward_fn=scratchpad_reward_fn,
-        metric_fn=metric_accuracy,
+        config        = config,
+        eval_prompts  = list(ds_eval_obj),
+        metric_fn     = metric_accuracy,
+        model_path    = hf_path,
+        prompts       = list(ds_train_obj),
+        reward_fn     = scratchpad_reward_fn,
     )
 
 
 if __name__ == "__main__":
-    
+
     if int(os.getenv("RANK", "0")) == 0:
         for k, v in os.environ.items():
             if "deepspeed" in k.lower():

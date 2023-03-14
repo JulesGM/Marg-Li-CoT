@@ -309,7 +309,7 @@ class ConvToNum:
 #             f"{distance           = }\n"
 #         )
         
-#         return self._ds.get_extra_info(min_distance_match)
+#         return self._ds.get_extra_info(min_distance_match, miss_ok=False)
 
 
 class ApproxMatcher:
@@ -326,26 +326,28 @@ class ApproxMatcher:
         info = (
             "\n" +
             f"delta: {delta = :0.3}\n" +
-            f"\t- {sample = }\n" +
-            f"\t- {value_right = }\n" +
-            f"\t- {value_left = }\n" +
+            f"\t- {sample                    = }\n" +
+            f"\t- {value_right               = }\n" +
+            f"\t- {value_left                = }\n" +
             f"\t- {value_right[:len(sample)] = }\n" +
-            f"\t- {value_left[:len(sample)] = }\n"
+            f"\t- {value_left[:len(sample)]  = }\n"
         )
+        
         assert value_left[:len(sample)] == sample, info
 
         rich.print(
             f"[red bold on white]PREFIX MATCHED:\n" +
             info
         )
-        
+        assert False, info
+
 
 class BaseTRLXExtraInfoDataset(torch.utils.data.Dataset, abc.ABC):
     def __init__(self):
         self._matcher = ApproxMatcher(self)
 
     @abc.abstractmethod
-    def get_extra_info(self, sample_str: str) -> dict[str, typing.Any]:
+    def get_extra_info(self, sample_str: str, miss_ok: bool) -> dict[str, typing.Any]:
         raise NotImplementedError
 
 
@@ -414,7 +416,9 @@ class ASDiv(BaseTRLXExtraInfoDataset):
             tokenized["input_ids"], skip_special_tokens=True,
         ).strip()
 
-    def get_extra_info(self, sample_str: str) -> dict[str, typing.Any]:
+    
+
+    def get_extra_info(self, sample_str: str, miss_ok) -> dict[str, typing.Any]:
         return self._extra_info[sample_str]
 
     def __len__(self) -> int:
@@ -505,19 +509,26 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
             f"{len(self._samples)} / {len(samples)}"
         )
 
-    def get_extra_info(self, sample_str: str
+    def get_extra_info(self, sample_str: str, miss_ok,
     ) -> dict[str, typing.Any]:
 
         if isinstance(sample_str, list):
-            return general_utils.dict_unzip([
-                self.get_extra_info(sample) 
+            return [
+                self.get_extra_info(sample, miss_ok=miss_ok) 
                 for sample in sample_str
-            ])
+            ]
         else:
-            assert isinstance(sample_str, str), f"{type(sample_str).mro() = }"
+            assert isinstance(sample_str, str), (
+                f"{type(sample_str).mro() = }"
+            )
             
             if sample_str not in self._extra_info:
+                if miss_ok:
+                    return None
+
                 match = self._matcher.query(sample_str)
+                assert False
+
                 rich.print(
                     f"\n"
                     f"{sample_str = }\n"

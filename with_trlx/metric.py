@@ -1,6 +1,7 @@
 import logging
 import re
 from typing import *
+import typing
 
 import datasets
 import general_utils as utils
@@ -31,7 +32,7 @@ class ScratchpadAnswerAccuracy:
         self._num_conv_instance = lib_data.ConvToNum()
         self._extract_answer    = self._num_conv_instance.extract_answer
 
-    def _make_comparable(self, match: re.Match, original_text: str = None) -> Optional[int]:
+    def _make_comparable(self, match: re.Match, original_text: typing.Optional[str] = None) -> Optional[float]:
         if match is None:
             return None
         
@@ -56,9 +57,11 @@ class ScratchpadAnswerAccuracy:
         samples: List[str],
         outputs: List[str],
     ):
+        assert prompts
+        
         extra_info = self._extra_info_fn(prompts)
         generated_texts = outputs
-        reference_texts = extra_info["answer"]
+        reference_texts = [x["answer"] for x in extra_info]
         assert len(reference_texts) == len(generated_texts), (
             len(reference_texts),
             len(generated_texts),
@@ -71,7 +74,6 @@ class ScratchpadAnswerAccuracy:
 
         parsed = [] # Only used for debugging. Convert to a dataframe as needed.
         em_value = []
-        num_none_parsed = 0
 
         for raw_gen, raw_ref in zip(generated_texts, reference_texts):
             if isinstance(raw_ref, str):
@@ -99,9 +101,6 @@ class ScratchpadAnswerAccuracy:
                     gen = self._make_comparable(extracted_gen, raw_gen)
                 else:
                     gen = None
-
-                if gen is None:
-                    num_none_parsed += 1
                     
                 parsed.append(dict(
                     gen=gen, ref=ref, gen_text=raw_gen, ref_text=raw_ref[0]
@@ -121,15 +120,15 @@ class ScratchpadAnswerAccuracy:
                 ))
                 em_value.append(0.0)
 
-
-        none_parsed = [x for x in parsed if x["gen"] is None]
-        output = dict(em_accuracy=(em_value, np.mean(em_value)))
+        num_nones_parsed = sum(x["gen"] is None for x in parsed)
+        output = dict(em_accuracy=em_value)
+        assert parsed
 
         LOGGER.info(
             f"[bold green]EM Result: [bold white]"
             f"{np.mean(em_value):0.1%}\n"
             f"[bold red on white]Fraction of no answer found: "
-            f"{num_none_parsed / len(parsed):0.1%}\n"
+            f"{num_nones_parsed / len(generated_texts):0.1%}\n"
         )
         
 

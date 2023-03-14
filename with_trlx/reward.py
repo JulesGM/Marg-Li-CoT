@@ -1,11 +1,12 @@
+import collections
 import logging
-
+import os
 import random
 import re
-import os
 import typing
 
 import accelerate
+import general_utils
 import more_itertools
 import numpy as np
 import torch
@@ -14,8 +15,6 @@ import transformers
 import bisect_tokens
 import lib_data
 import metric
-
-import general_utils
 
 LOGGER = logging.getLogger(__name__)
 
@@ -56,21 +55,25 @@ class ScratchpadRewardFn(torch.nn.Module):
         self, *, 
         reward_model_hf_name_or_path: str,
         reward_tokenizer: transformers.PreTrainedTokenizerBase, 
-        ds_train_obj: lib_data.BaseTRLXExtraInfoDataset,
+        get_extra_info_fn: typing.Callable[
+            [typing.Union[str, typing.List[str]]], 
+            typing.Union[typing.Dict, typing.List[typing.Dict]]
+        ],
+        metric_fn,
         batch_size: int,
     ):
         super().__init__()
 
-        reward_model           = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+        reward_model            = transformers.AutoModelForSeq2SeqLM.from_pretrained(
             reward_model_hf_name_or_path)
-        self._metric           = metric.ScratchpadAnswerAccuracy(
-            extra_info_engine=ds_train_obj.get_extra_info)
-        self._conv_to_num      = lib_data.ConvToNum()
-        self._ds_train_obj     = ds_train_obj
-        self._no_answer_rate   = lib_data.MovingAverage(10000)
-        self._reward_tokenizer = reward_tokenizer
-        self._reward_model     = reward_model.eval()
-        
+        self._metric            = metric_fn
+        self._conv_to_num       = lib_data.ConvToNum()
+        self._get_extra_info_fn = get_extra_info_fn
+        self._no_answer_rate    = lib_data.MovingAverage(10000)
+        self._reward_tokenizer  = reward_tokenizer
+        self._reward_model      = reward_model.eval()
+        self._show_answer_replacement = False
+
         # We put the cloned model in a list so that it's not 
         # automatically included in the parameters of this module, and distributed
         # by the accelerator.
@@ -80,11 +83,28 @@ class ScratchpadRewardFn(torch.nn.Module):
         for p in self._reward_model.parameters():
             p.requires_grad = False
 
+        for p in more_itertools.one(self._non_distributed_reward_model).parameters():
+            p.requires_grad = False
+
         assert all(isinstance(x, torch.nn.parameter.Parameter) for x in self.parameters()), (
-            f"{self.parameters() = }"
+            collections.Counter(type(x) for x in self.parameters())
         )
-        assert not any(x.requires_grad for x in self.parameters()), (
-            f"{list(self.parameters()) = }"
+        req_grad_self = [x.requires_grad for x in self.parameters()] 
+        assert not any(req_grad_self), (
+            f"{np.mean(req_grad_self) = :0.1%}"
+        )
+        reg_grad_distributed = [x.requires_grad for x in self._reward_model.parameters()]
+        assert not any(reg_grad_distributed), (
+            f"{np.mean(reg_grad_distributed) = :0.1%}"
+        )
+        req_grad_single = [
+            x.requires_grad for x in 
+            more_itertools.one(
+            self._non_distributed_reward_model
+            ).parameters()
+        ]
+        assert not any(req_grad_single), (
+            f"{np.mean(req_grad_single) = :0.1%}"
         )
 
     
@@ -98,69 +118,87 @@ class ScratchpadRewardFn(torch.nn.Module):
         # 6. Extract the logp for the answers
         # 7. Return the logp for the answers
 
+        assert prompts, is_distributed
         output = self._metric(prompts, samples, outputs)["em_accuracy"][1]
         LOGGER.info(f"[red bold]METRIC ACC: {output = :0.2%}")
 
+        #######################################################################
+        # - Sanity checks 
+        # - Varia prep
+        #######################################################################
         assert isinstance(prompts   , list), f"{type(prompts   ).mro() = }"
         assert isinstance(prompts[0], str ), f"{type(prompts[0]).mro() = }"
         assert isinstance(outputs   , list), f"{type(outputs   ).mro() = }"
         assert isinstance(outputs[0], str ), f"{type(outputs[0]).mro() = }"
 
-        # TODO: this is temporary
-        model = self._reward_model if is_distributed else self._non_distributed_reward_model[0]
-
-        questions = prompts
-        del prompts
-
-        extra_info = self._ds_train_obj.get_extra_info(questions)
-        ref_answers = extra_info["answer"]
-
-        question_tok = self._reward_tokenizer(
-            questions, padding=True, return_tensors="pt"
+        # Pick the correct model depending on whether we are distributed or not.
+        model = (
+            self._reward_model if is_distributed 
+            else more_itertools.one(self._non_distributed_reward_model)
         )
-        
-        #######################################################################
-        # We want to keep the scratchpad and remove the generated answer,
-        # then add the reference answer.
-        #######################################################################
+        assert model is not None, f"model is None. {is_distributed = }"
+        assert not model.training, f"{model.training = }"
+        assert not any( x.requires_grad for x in model.parameters()), (
+            f"{np.mean([x.requires_grad for x in model.parameters()]):0.1%}"
+        )
 
-        scratchpads = []
-        
-        # Replace the answer by the reference answer in the generated output.
+        # Get the answers.
+        extra_info = self._get_extra_info_fn(prompts, miss_ok=False)
+        ref_answers = [x["answer"] for x in extra_info]
+        question_tok = self._reward_tokenizer(
+            prompts, padding=True, return_tensors="pt"
+        )
 
         timer_flags = dict(
-            accelerate_sync=False,
-            accelerator=None,
-            cuda_sync=True,
-            disable=True,
-            logger=LOGGER,
-            log_level=logging.INFO,
+            accelerate_sync = False,
+            accelerator     = None,
+            log_level       = logging.INFO,
+            cuda_sync       = True,
+            disable         = False,
+            logger          = LOGGER,
         )
-        timer = general_utils.ctx_timeit
         
-        for output, ref_answer in zip(outputs, ref_answers):
-            scratchpads.append(self.replace_answer(
-                original_generation=self._conv_to_num(output), ref_answer=ref_answer
-            )[0])
+        #######################################################################
+        # - Replace the number words by digits.
+        # - Find the answer tokens in the generated output.
+        # - Remove it.
+        # - Put the ref answer instead.
+        # - Create a mask over the not-answer for the perplexity.
+        #######################################################################
 
-        # Find where the ref answer is in the tokenized scratchpads.
+        # Replace the number words by digits.
+        scratchpads = []
+        timer = general_utils.ctx_timeit
+        with timer("Replacing the number words by digits", **timer_flags):
+            for i, (output, ref_answer) in enumerate(
+                more_itertools.zip_equal(outputs, ref_answers)):
+
+                scratchpads.append(self.replace_answer(
+                    original_generation = self._conv_to_num(output), 
+                    ref_answer          = ref_answer,
+                )[0])
+
+        # Find the answer tokens.
         with timer("Extracting the answer tokens", **timer_flags):
-            tok_outputs, start_end_outputs, str_matches_outputs = bisect_tokens.extract_match_tokens(
-                regexes=[re.escape(ref_answer) for ref_answer in ref_answers], 
-                tokenizer=self._reward_tokenizer, 
-                strings=scratchpads,
-                tokenizer_kwargs=dict(
-                    return_tensors="pt", padding=True,
-                ),
-                verbose=False,
+            tok_outputs, start_end_outputs, str_matches_outputs = (
+                bisect_tokens.extract_match_tokens(
+                    regexes   = [re.escape(ref_answer) for ref_answer in ref_answers], 
+                    tokenizer = self._reward_tokenizer, 
+                    strings   = scratchpads,
+                    tokenizer_kwargs=dict(
+                        return_tensors = "pt", 
+                        padding        = True,
+                    ),
+                    verbose=False,
+                )
             )
-
-        # Create masks over the answer tokens for the answer perplexity.
-        masks = []
         assert len(start_end_outputs) == len(scratchpads), (
             f"{len(start_end_outputs) = }, {len(scratchpads) = }"
         )
-
+        
+        # > Replace the answer tokens by the ref answer.
+        # > Create the masks.
+        masks = []
         seq_len = tok_outputs["input_ids"].shape[1]
         with timer("Creating the masks", **timer_flags):
             for matches, scratchpad_ids, ref_answer in zip(
@@ -169,58 +207,107 @@ class ScratchpadRewardFn(torch.nn.Module):
                 start, end = matches[-1]
                 mask = [0] * start + [1] * (end + 1 - start) + [0] * (seq_len - end - 1)
 
-                # scratchpad_after = " ".join([
-                #     self._reward_tokenizer.decode(token) if m == 0 else " <<REF_ANSWER>>" 
-                #     for token, m in zip(scratchpad_ids, mask)
-                # ]).replace("<pad>", "")
-                # LOGGER.info(
-                #     f"[bold blue]ref answer:[white]        {ref_answer}\n"
-                #     f"[bold blue]start, end:[white]        {start}, {end}\n"
-                #     f"[bold blue]Scratchpad before:[white] {self._reward_tokenizer.decode(scratchpad_ids, skip_special_tokens=True)}\n"
-                #     f"[bold blue]Scratchpad after:[white]  {scratchpad_after}\n"
-                # )
+                if self._show_answer_replacement:
+                    scratchpad_before = self._reward_tokenizer.decode(scratchpad_ids, skip_special_tokens=True)
+                    scratchpad_after  = " ".join([
+                        self._reward_tokenizer.decode(token) if m == 0 else " <<REF_ANSWER>>" 
+                        for token, m in zip(scratchpad_ids, mask)
+                    ]).replace("<pad>", "")
+
+                    LOGGER.info(
+                        f"[bold blue]ref answer:[white]        {ref_answer}\n"
+                        f"[bold blue]start, end:[white]        {start}, {end}\n"
+                        f"[bold blue]Scratchpad before:[white] {scratchpad_before}\n"
+                        f"[bold blue]Scratchpad after:[white]  {scratchpad_after}\n"
+                    )
+
                 masks.append(torch.tensor(mask).to(tok_outputs["input_ids"].device))
                 assert len(mask) == seq_len, f"{len(mask) = }, {seq_len = }"
 
         ###########################################################################
         # 2. Compute the logp for the answers
         ###########################################################################
-        with timer("Computing the logits", **timer_flags):
-            if self._reward_model.config.is_encoder_decoder:
-                assert model.device.type == "cuda", (
-                    f"{model.device.type = }"
+        if self._reward_model.config.is_encoder_decoder:
+            assert model.device.type == "cuda", (
+                f"{model.device.type = }"
+            )
+            distributed_str = "DISTRIBUTED" if is_distributed else "NON-DISTRIBUTED"
+            
+            # TODO: Maybe we don't have to recompute the logits. 
+            # We should get them for generation and for training. 
+            with timer("Moving things to GPU", **timer_flags):
+                input_dict = dict(
+                    input_ids              = question_tok["input_ids"     ].to(model.device),
+                    attention_mask         = question_tok["attention_mask"].to(model.device),
+                    decoder_input_ids      = tok_outputs ["input_ids"     ].to(model.device),
+                    decoder_attention_mask = tok_outputs ["attention_mask"].to(model.device),
                 )
-                LOGGER.info(f"({is_distributed = }):\n> Starting {question_tok['input_ids'].shape = }")
-                with torch.no_grad():
-                    logits = model(
-                        input_ids              = question_tok["input_ids"     ].to(model.device),
-                        attention_mask         = question_tok["attention_mask"].to(model.device),
-                        decoder_input_ids      = tok_outputs ["input_ids"     ].to(model.device),
-                        decoder_attention_mask = tok_outputs ["attention_mask"].to(model.device),
-                    ).logits
-                LOGGER.info(f"({is_distributed = }):\n> Done with {question_tok['input_ids'].shape = }")
 
-            else:
-                assert False
-                logits = self._reward_model(
-                    full_seq["input_ids"], attention_mask=full_seq["attention_mask"]
+            with timer(
+                f"[{distributed_str}]:\n> Computing the logits with the ref model for the reward." +
+                f"{question_tok['input_ids'].shape = }"
+                , **timer_flags):
+                
+                accel_state_mixed = os.environ["ACCELERATE_MIXED_PRECISION"]
+                
+                with torch.no_grad():
+                    assert not model.training, f"{model.training = }"
+                    
+                    
+                    if not is_distributed and not accel_state_mixed == "no":
+                        if accel_state_mixed == "bf16":
+                            logits = torch.cuda.amp.autocast(
+                                dtype=torch.bfloat16)(model)(
+                                **input_dict).logits
+                            
+                        elif accel_state_mixed == "fp16": 
+                            logits = torch.cuda.amp.autocast(
+                                dtype=torch.float16)(model)(
+                                **input_dict).logits
+                            
+                        else:
+                            raise ValueError(f"{accel_state_mixed = }")
+                    else:
+                        logits = model(**input_dict).logits
+                    
+
+                    if not is_distributed:
+                        if accel_state_mixed == "bf16":
+                            assert logits.dtype == torch.bfloat16, f"{logits.dtype = }"
+                        elif accel_state_mixed == "fp16":
+                            assert logits.dtype == torch.float16 , f"{logits.dtype = }"
+                        elif accel_state_mixed == "no":
+                            assert logits.dtype == torch.float   , f"{logits.dtype = }"
+                        else:
+                            raise ValueError(f"{accel_state_mixed = }")
+
+                        logits = logits.to(torch.float32)
+        else:
+            assert False
+            logits = self._reward_model(
+                full_seq["input_ids"], attention_mask=full_seq["attention_mask"]
                 ).logits
 
 
-        with timer("Computing the softmax", **timer_flags):
+        with timer("Computing the rest of the reward", **timer_flags):
+
             reward_model_outputs_all = logits.softmax(-1)
             idx = tok_outputs["input_ids"].to(reward_model_outputs_all.device)
-            reward_model_outputs_scratchpad = torch.gather(reward_model_outputs_all, -1, idx.unsqueeze(-1)).squeeze(-1)
+            reward_model_outputs_scratchpad = torch.gather(
+                reward_model_outputs_all, -1, idx.unsqueeze(-1)
+            ).squeeze(-1)
 
             ###########################################################################
             # 3. Only keep the logp for the actual values used
             ###########################################################################
-            masks = torch.stack(masks).to(reward_model_outputs_scratchpad.device)
-            logp = masks * reward_model_outputs_scratchpad
-            logp[masks == 0] = 1
-            logp = logp.log()
+
+            masks        = torch.stack(masks).to(reward_model_outputs_scratchpad.device)
+            probs         = reward_model_outputs_scratchpad
+            probs[masks == 0] = 1
+            logp         = probs.log()
             logp_per_seq = logp.sum(-1)
             final_output = logp_per_seq.detach()
+
         return final_output
 
     def replace_answer(self, *, original_generation: str, ref_answer: str) -> tuple[str, int, int]:
@@ -231,11 +318,11 @@ class ScratchpadRewardFn(torch.nn.Module):
             self._no_answer_rate.update(1)
             ratio, (sum_, size) = self._no_answer_rate.get()
             LOGGER.info(f"[red bold]No answer: {ratio:.1%} ({sum_}/{size}) ")
-
             new_scratchpad = original_generation.strip() + " The answer is: "
-            start_pos = len(new_scratchpad)
-            end_pos = start_pos + len(ref_answer)
-            final = new_scratchpad + ref_answer + "."
+            start_pos      = len(new_scratchpad)
+            end_pos        = start_pos + len(ref_answer)
+            final          = new_scratchpad + ref_answer + "."
+
             return final, start_pos, end_pos
 
         self._no_answer_rate.update(0)
@@ -244,16 +331,16 @@ class ScratchpadRewardFn(torch.nn.Module):
         if mode == "in_place":
             # If the answer is not None, then we replace the answer with the reference answer.
             start = original_generation[:answer.start()]
-            end = original_generation[answer.end():]
+            end   = original_generation[answer.end():]
         elif mode == "remove_end":
             start = original_generation[:answer.start()]
-            end = "."
+            end   = "."
         else:
             raise ValueError(f"{mode = }")
 
         start_pos = len(start)
-        end_pos = len(start) + len(ref_answer)
-        final = start + ref_answer + end
+        end_pos   = len(start) + len(ref_answer)
+        final     = start + ref_answer + end
 
         # LOGGER.info(
         #     "\n"
