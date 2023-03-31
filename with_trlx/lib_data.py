@@ -3,6 +3,7 @@ import bisect
 import collections
 import enum
 import logging
+import os
 import re
 import time
 import typing
@@ -16,13 +17,16 @@ import itertools
 import more_itertools
 import numpy as np
 import rich
+import rich.box
+import rich.table
 import torch
 import transformers
 import wget
 from text2digits import text2digits
 
 LOGGER = logging.getLogger(__name__)
-
+RANK = int(os.environ["RANK"])
+WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 
 class MovingAverage:
     def __init__(self, window_size: int):
@@ -313,41 +317,75 @@ class ConvToNum:
 
 
 class ApproxMatcher:
-    def __init__(self, ds):
+    def __init__(self, ds, tokenizer):
         self._ds = sorted(ds)
+        self._tokenizer = tokenizer
+
+    def add_regular_row(self, table, key, value, split_at=None):
+        num_tokens = str(len(self._tokenizer(value)["input_ids"]))
+        formatted_value = value
+        if split_at is not None:
+            formatted_value = (
+                f"[bold green]{value[:split_at]}" +
+                f"[bold red  ]{value[split_at:]}"
+            )
+        
+        table.add_row(
+            key, 
+            formatted_value, 
+            str(len(value)),
+            num_tokens
+        )
+
+    def _log_table(self, delta, sample, value_right, len_sample):
+        table = rich.table.Table(
+            rich.table.Column(header="Key"  ,     style="bold blue",),
+            rich.table.Column(header="Value",     style="white"),
+            rich.table.Column(header="Num chars", style="white"),
+            rich.table.Column(header="Num BPE",   style="white"),
+            show_lines=True,
+            title=f"PREFIX MATCHED",
+            box=rich.box.ROUNDED,
+        )
+        
+        table.add_row("delta", f"{delta:0.3}", "", "")
+        self.add_regular_row(table, "sample", sample)
+        self.add_regular_row(
+            table, 
+            "value_right", 
+            value_right,
+            len_sample
+        )
+        rich.print(table)
 
     def query(self, sample):
         start = time.perf_counter()
         idx = bisect.bisect(self._ds, sample)        
         value_right = self._ds[idx]
-        value_left  = self._ds[max(idx - 1, 0)]
         delta = time.perf_counter() - start
-
-        info = (
-            "\n" +
-            f"delta: {delta = :0.3}\n" +
-            f"\t- {sample                    = }\n" +
-            f"\t- {value_right               = }\n" +
-            f"\t- {value_left                = }\n" +
-            f"\t- {value_right[:len(sample)] = }\n" +
-            f"\t- {value_left[:len(sample)]  = }\n"
-        )
         
-        assert value_left[:len(sample)] == sample, info
-
-        rich.print(
-            f"[red bold on white]PREFIX MATCHED:\n" +
-            info
-        )
-        assert False, info
-
+        if value_right[:len(sample)] == sample:
+            self._log_table(
+                value_right = value_right, 
+                len_sample  = len(sample),
+                sample      = sample, 
+                delta       = delta, 
+            )
+            return value_right
+        return None
+            
 
 class BaseTRLXExtraInfoDataset(torch.utils.data.Dataset, abc.ABC):
-    def __init__(self):
-        self._matcher = ApproxMatcher(self)
+    def __init__(self, tokenizer):
+        self._matcher = ApproxMatcher(self, tokenizer=tokenizer)
 
     @abc.abstractmethod
-    def get_extra_info(self, sample_str: str, miss_ok: bool) -> dict[str, typing.Any]:
+    def get_extra_info(
+        self, 
+        *,
+        miss_ok: bool,
+        sample_str: str, 
+    ) -> dict[str, typing.Any]:
         raise NotImplementedError
 
 
@@ -416,9 +454,11 @@ class ASDiv(BaseTRLXExtraInfoDataset):
             tokenized["input_ids"], skip_special_tokens=True,
         ).strip()
 
-    
-
-    def get_extra_info(self, sample_str: str, miss_ok) -> dict[str, typing.Any]:
+    def get_extra_info(
+            self, 
+            sample_str: str, 
+            miss_ok:    bool
+        ) -> dict[str, typing.Any]:
         return self._extra_info[sample_str]
 
     def __len__(self) -> int:
@@ -455,18 +495,20 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
 
     def __init__(
         self, 
-        ds: collections.abc.Sequence[str],
+        *,
+        max_length: int,
         tokenizer: transformers.PreTrainedTokenizerBase, 
-        max_length: int
+        ds: collections.abc.Sequence[str],
     ):
-        self._inputs_key = "question"
+
         self._outputs_key = "answer"
-        self._tokenizer = tokenizer
-        self._extra_info = {}
-        self._max_length = max_length
+        self._inputs_key  = "question"
+        self._extra_info  = {}
+        self._max_length  = max_length
+        self._tokenizer   = tokenizer
         self._populate_ds(ds)
 
-        super().__init__()
+        super().__init__(tokenizer=tokenizer)
 
     def _populate_ds(self, ds):
         samples = []
@@ -475,7 +517,6 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
         for idx in range(len(ds)):
             sample = self.preprocess_question(ds[idx][self._inputs_key])
             output = ds[idx][self._outputs_key].rsplit("####", 1)[1].strip()
-
             samples.append(sample)
             outputs.append(output.replace(",", ""))
 
@@ -483,7 +524,6 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
         tokenized_samples = self._tokenizer(samples)["input_ids"]
         tokenized_outputs = self._tokenizer(outputs)["input_ids"]
         LOGGER.info("< Done Tokenizing.")
-
 
         self._samples = []
         self._outputs = []
@@ -493,50 +533,74 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
                 continue
 
             self._samples.append(
-                self._tokenizer.decode(
-                    t_s, skip_special_tokens=True
-                )
+                self._tokenizer.decode(t_s, skip_special_tokens=True)
             )
             self._outputs.append(
-                self._tokenizer.decode(
-                    t_o, skip_special_tokens=True
-                )
+                self._tokenizer.decode(t_o, skip_special_tokens=True)
             )
 
         LOGGER.info(
             f"[red bold]With len {self._max_length} - "
-            f"Kept {len(self._samples) / len(samples):0.1%} samples, "
-            f"{len(self._samples)} / {len(samples)}"
+            f"Kept {len(self._samples)  /  len(samples):0.1%} samples, "
+            f"{     len(self._samples)} / {len(samples)}"
         )
 
-    def get_extra_info(self, sample_str: str, miss_ok,
+    def get_extra_info(
+        self, 
+        *,
+        sample_str: str,
+        miss_ok,
+        query_solve=True,
     ) -> dict[str, typing.Any]:
-
+        
+        #######################################################################
+        # If list
+        #######################################################################
         if isinstance(sample_str, list):
             return [
-                self.get_extra_info(sample, miss_ok=miss_ok) 
-                for sample in sample_str
+                self.get_extra_info(
+                    sample_str = sample, 
+                    miss_ok    = miss_ok,
+                ) for sample in sample_str
             ]
-        else:
-            assert isinstance(sample_str, str), (
-                f"{type(sample_str).mro() = }"
-            )
-            
-            if sample_str not in self._extra_info:
-                if miss_ok:
-                    return None
-
-                match = self._matcher.query(sample_str)
-                assert False
-
-                rich.print(
-                    f"\n"
-                    f"{sample_str = }\n"
-                    f"{match      = }\n"
+        
+        #######################################################################
+        # If not list
+        #######################################################################
+        assert isinstance(sample_str, str), (f"{type(sample_str).mro() = }")
+        
+        if sample_str not in self._extra_info:
+            if not query_solve and not miss_ok:
+                raise ValueError(
+                    f"Base lookup failed, "
+                    f"query_solve is [{query_solve = }] and "
+                    f"miss_ok is [{miss_ok = }]."
                 )
-                return match
-            else:
-                return self._extra_info[sample_str]
+            
+            elif not query_solve and miss_ok:
+                return None
+
+            match = self._matcher.query(sample_str)
+            if match:
+                # miss_ok can be true or false here
+                assert query_solve
+                return self._extra_info[match]
+            
+            if not miss_ok:
+                assert query_solve, query_solve
+                assert not miss_ok, miss_ok
+                raise ValueError(
+                    "\n"
+                    f"Query solve failed and miss_ok is False.\n"
+                    f"{query_solve = }\n" 
+                    f"{miss_ok     = }\n"
+                )
+            
+            assert query_solve and miss_ok, f"{query_solve = }, {miss_ok = }"
+            assert match is None
+            return match
+        else:
+            return self._extra_info[sample_str]
 
     def preprocess_question(self, question: str) -> str:
         tokenized = self._tokenizer(
@@ -546,7 +610,6 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
         return self._tokenizer.decode(
             tokenized["input_ids"], 
             skip_special_tokens=True,
-            
         ).strip()
 
     def _get_indiv_item(self, idx, dont_add_to_extra_info=False) -> str:

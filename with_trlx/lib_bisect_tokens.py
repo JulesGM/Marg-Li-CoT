@@ -12,21 +12,12 @@ import torch
 import transformers
 import re
 
-
 LOGGER = logging.getLogger(__name__)
 
 
 # Python bisect
 bisect_left = bisect.bisect_left
 bisect_right = bisect.bisect_right
-
-# Numpy bisect
-# bisect_left = lambda a, x: np.searchsorted(a, x, side="left")
-# bisect_right = lambda a, x: np.searchsorted(a, x, side="right")
-
-# Pytorch bisect
-# bisect_left  = lambda a, x: torch.searchsorted(a, x, side="left")
-# bisect_right = lambda a, x: torch.searchsorted(a, x, side="right")
 
 
 def find_lt(a, x):

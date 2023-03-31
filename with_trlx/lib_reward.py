@@ -12,11 +12,23 @@ import numpy as np
 import torch
 import transformers
 
-import bisect_tokens
+import lib_bisect_tokens
 import lib_data
-import metric
+import lib_metric
 
 LOGGER = logging.getLogger(__name__)
+LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+
+def global_do_checks(model):
+    local_rank = LOCAL_RANK
+    assert model.device.index == local_rank, (
+        f"{model.device.index = }, {local_rank = }"
+    )
+    assert (torch.cuda.current_device() == local_rank), (
+        torch.cuda.current_device(), local_rank)
+    assert torch.distributed.get_backend() == "nccl", (
+        torch.distributed.get_backend())
+    torch.distributed.barrier()
 
 
 def info(message):
@@ -29,7 +41,7 @@ def remove_special_token_ids(
     """
     Remove special tokens from the input_ids
     """
-    all_special_ids = set(tokenizer.all_special_ids)
+    all_special_ids    = set(tokenizer.all_special_ids)
     filtered_input_ids = [x for x in input_ids if x not in all_special_ids]
 
     assert len(filtered_input_ids) == len(input_ids) - 1, (
@@ -43,7 +55,10 @@ def remove_special_token_ids(
     return filtered_input_ids
 
 
-def clone_hf_model(hf_model: transformers.PreTrainedModel) -> transformers.PreTrainedModel:
+def clone_hf_model(
+        hf_model: transformers.PreTrainedModel
+) -> transformers.PreTrainedModel:
+    
     assert isinstance(hf_model, transformers.PreTrainedModel), type(hf_model)
     copy = type(hf_model)(hf_model.config)
     copy.load_state_dict(hf_model.state_dict())
@@ -54,58 +69,87 @@ class ScratchpadRewardFn(torch.nn.Module):
     def __init__(
         self, *, 
         reward_model_hf_name_or_path: str,
-        reward_tokenizer: transformers.PreTrainedTokenizerBase, 
         get_extra_info_fn: typing.Callable[
             [typing.Union[str, typing.List[str]]], 
             typing.Union[typing.Dict, typing.List[typing.Dict]]
         ],
+        reward_tokenizer: transformers.PreTrainedTokenizerBase, 
+        do_single_proc: bool,
         metric_fn,
-        batch_size: int,
     ):
         super().__init__()
 
-        reward_model            = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+        #----------------------------------------------------------------
+        # Build Models
+        #----------------------------------------------------------------
+        reward_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
             reward_model_hf_name_or_path)
-        self._metric            = metric_fn
-        self._conv_to_num       = lib_data.ConvToNum()
-        self._get_extra_info_fn = get_extra_info_fn
-        self._no_answer_rate    = lib_data.MovingAverage(10000)
-        self._reward_tokenizer  = reward_tokenizer
-        self._reward_model      = reward_model.eval()
-        self._show_answer_replacement = False
+        
+        if do_single_proc:
+            non_distributed = [clone_hf_model(
+                reward_model).eval().to(LOCAL_RANK)]
+        else:
+            non_distributed = None
 
-        # We put the cloned model in a list so that it's not 
-        # automatically included in the parameters of this module, and distributed
-        # by the accelerator.
-        self._non_distributed_reward_model = [clone_hf_model(reward_model).eval()]
-        self._non_distributed_reward_model[0].parallelize()
+        #----------------------------------------------------------------
+        # Set Attributes
+        #----------------------------------------------------------------
+        self._non_distributed_reward_model = non_distributed
+        self._show_answer_replacement      = False
+        self._get_extra_info_fn            = get_extra_info_fn
+        self._reward_tokenizer             = reward_tokenizer
+        self._do_single_proc               = do_single_proc
+        self._no_answer_rate               = lib_data.MovingAverage(10000)
+        self._reward_model                 = reward_model.eval()
+        self._conv_to_num                  = lib_data.ConvToNum()
+        self._metric                       = metric_fn
+        if os.environ["ACCELERATE_MIXED_PRECISION"] == "bf16":
+            self._dtype = torch.bfloat16
+        elif os.environ["ACCELERATE_MIXED_PRECISION"] == "fp16":
+            self._dtype = torch.float16
+        elif os.environ["ACCELERATE_MIXED_PRECISION"] == "no":
+            self._dtype = torch.float32
+        else:
+            raise ValueError(os.environ["ACCELERATE_MIXED_PRECISION"])
 
+        self._prep_models()
+
+
+    def _prep_models(self):
         for p in self._reward_model.parameters():
             p.requires_grad = False
 
-        for p in more_itertools.one(self._non_distributed_reward_model).parameters():
-            p.requires_grad = False
+        if self._non_distributed_reward_model:
+            for p in more_itertools.one(
+                self._non_distributed_reward_model).parameters():
+                p.requires_grad = False
 
-        assert all(isinstance(x, torch.nn.parameter.Parameter) for x in self.parameters()), (
-            collections.Counter(type(x) for x in self.parameters())
-        )
+        assert all(
+            isinstance(x, torch.nn.parameter.Parameter) 
+            for x in self.parameters()
+        ), (collections.Counter(type(x) for x in self.parameters()))
         req_grad_self = [x.requires_grad for x in self.parameters()] 
         assert not any(req_grad_self), (
             f"{np.mean(req_grad_self) = :0.1%}"
         )
-        reg_grad_distributed = [x.requires_grad for x in self._reward_model.parameters()]
+        reg_grad_distributed = [
+            x.requires_grad for x 
+            in self._reward_model.parameters()
+        ]
         assert not any(reg_grad_distributed), (
             f"{np.mean(reg_grad_distributed) = :0.1%}"
         )
-        req_grad_single = [
-            x.requires_grad for x in 
-            more_itertools.one(
-            self._non_distributed_reward_model
-            ).parameters()
-        ]
-        assert not any(req_grad_single), (
-            f"{np.mean(req_grad_single) = :0.1%}"
-        )
+
+        if self._non_distributed_reward_model:
+            req_grad_single = [
+                x.requires_grad for x in 
+                more_itertools.one(
+                self._non_distributed_reward_model
+                ).parameters()
+            ]
+            assert not any(req_grad_single), (
+                f"{np.mean(req_grad_single) = :0.1%}"
+            )
 
     
     def __call__(self, prompts, samples, outputs, is_distributed):
@@ -117,25 +161,39 @@ class ScratchpadRewardFn(torch.nn.Module):
         # 5. Run the reward model on the concatenated samples & answers
         # 6. Extract the logp for the answers
         # 7. Return the logp for the answers
+        if not is_distributed:
+            assert self._non_distributed_reward_model, (
+                self._non_distributed_reward_model)
 
         assert prompts, is_distributed
-        output = self._metric(prompts, samples, outputs)["em_accuracy"][1]
-        LOGGER.info(f"[red bold]METRIC ACC: {output = :0.2%}")
+        assert samples, is_distributed
+        assert outputs, is_distributed
 
         #######################################################################
         # - Sanity checks 
         # - Varia prep
         #######################################################################
+        
+        output = np.mean(self._metric(prompts, samples, outputs)["em_accuracy"])
+        LOGGER.info(f"[red bold]REWARD - INSTANT PER BATCH METRIC ACC: {output = :0.2%}")
+
         assert isinstance(prompts   , list), f"{type(prompts   ).mro() = }"
         assert isinstance(prompts[0], str ), f"{type(prompts[0]).mro() = }"
         assert isinstance(outputs   , list), f"{type(outputs   ).mro() = }"
         assert isinstance(outputs[0], str ), f"{type(outputs[0]).mro() = }"
 
+        global_do_checks(self._reward_model)
+        if self._non_distributed_reward_model:
+            global_do_checks(more_itertools.one(self._non_distributed_reward_model))
+
         # Pick the correct model depending on whether we are distributed or not.
         model = (
             self._reward_model if is_distributed 
-            else more_itertools.one(self._non_distributed_reward_model)
+            else more_itertools.one(
+                self._non_distributed_reward_model
+            )
         )
+
         assert model is not None, f"model is None. {is_distributed = }"
         assert not model.training, f"{model.training = }"
         assert not any( x.requires_grad for x in model.parameters()), (
@@ -143,7 +201,11 @@ class ScratchpadRewardFn(torch.nn.Module):
         )
 
         # Get the answers.
-        extra_info = self._get_extra_info_fn(prompts, miss_ok=False)
+        assert (torch.cuda.current_device() == torch.distributed.get_rank()), (
+            torch.cuda.current_device(), torch.distributed.get_rank())
+        
+        extra_info = self._get_extra_info_fn(
+            sample_str=prompts, miss_ok=False)
         ref_answers = [x["answer"] for x in extra_info]
         question_tok = self._reward_tokenizer(
             prompts, padding=True, return_tensors="pt"
@@ -154,7 +216,7 @@ class ScratchpadRewardFn(torch.nn.Module):
             accelerator     = None,
             log_level       = logging.INFO,
             cuda_sync       = True,
-            disable         = False,
+            disable         = True,
             logger          = LOGGER,
         )
         
@@ -171,8 +233,8 @@ class ScratchpadRewardFn(torch.nn.Module):
         timer = general_utils.ctx_timeit
         with timer("Replacing the number words by digits", **timer_flags):
             for i, (output, ref_answer) in enumerate(
-                more_itertools.zip_equal(outputs, ref_answers)):
-
+                more_itertools.zip_equal(outputs, ref_answers)
+            ):
                 scratchpads.append(self.replace_answer(
                     original_generation = self._conv_to_num(output), 
                     ref_answer          = ref_answer,
@@ -181,17 +243,23 @@ class ScratchpadRewardFn(torch.nn.Module):
         # Find the answer tokens.
         with timer("Extracting the answer tokens", **timer_flags):
             tok_outputs, start_end_outputs, str_matches_outputs = (
-                bisect_tokens.extract_match_tokens(
-                    regexes   = [re.escape(ref_answer) for ref_answer in ref_answers], 
-                    tokenizer = self._reward_tokenizer, 
-                    strings   = scratchpads,
-                    tokenizer_kwargs=dict(
+                lib_bisect_tokens.extract_match_tokens(
+                    regexes          = [
+                        re.escape(ref_answer) 
+                        for ref_answer in ref_answers
+                    ],
+                    tokenizer        = self._reward_tokenizer, 
+                    strings          = scratchpads,
+                    tokenizer_kwargs = dict(
                         return_tensors = "pt", 
                         padding        = True,
                     ),
                     verbose=False,
                 )
             )
+        
+        assert (torch.cuda.current_device() == torch.distributed.get_rank()), (
+            torch.cuda.current_device(), torch.distributed.get_rank())
         assert len(start_end_outputs) == len(scratchpads), (
             f"{len(start_end_outputs) = }, {len(scratchpads) = }"
         )
@@ -208,9 +276,11 @@ class ScratchpadRewardFn(torch.nn.Module):
                 mask = [0] * start + [1] * (end + 1 - start) + [0] * (seq_len - end - 1)
 
                 if self._show_answer_replacement:
-                    scratchpad_before = self._reward_tokenizer.decode(scratchpad_ids, skip_special_tokens=True)
+                    scratchpad_before = self._reward_tokenizer.decode(
+                        scratchpad_ids, skip_special_tokens=True)
                     scratchpad_after  = " ".join([
-                        self._reward_tokenizer.decode(token) if m == 0 else " <<REF_ANSWER>>" 
+                        self._reward_tokenizer.decode(token) 
+                        if m == 0 else " <<REF_ANSWER>>" 
                         for token, m in zip(scratchpad_ids, mask)
                     ]).replace("<pad>", "")
 
@@ -250,26 +320,23 @@ class ScratchpadRewardFn(torch.nn.Module):
                 
                 accel_state_mixed = os.environ["ACCELERATE_MIXED_PRECISION"]
                 
+                # -------------------------------------------------------------
+                # We need to handle autocast in single proc mode, because 
+                # the model is not passed tp accelerate
+                # -------------------------------------------------------------
                 with torch.no_grad():
-                    assert not model.training, f"{model.training = }"
-                    
-                    
+                    assert not model.training, f"{model.training = }"                    
                     if not is_distributed and not accel_state_mixed == "no":
                         if accel_state_mixed == "bf16":
-                            logits = torch.cuda.amp.autocast(
-                                dtype=torch.bfloat16)(model)(
-                                **input_dict).logits
-                            
+                            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                                logits = model(**input_dict).logits
                         elif accel_state_mixed == "fp16": 
-                            logits = torch.cuda.amp.autocast(
-                                dtype=torch.float16)(model)(
-                                **input_dict).logits
-                            
+                            with torch.cuda.amp.autocast(dtype=torch.float16):
+                                logits = model(**input_dict).logits
                         else:
                             raise ValueError(f"{accel_state_mixed = }")
                     else:
                         logits = model(**input_dict).logits
-                    
 
                     if not is_distributed:
                         if accel_state_mixed == "bf16":
@@ -281,13 +348,12 @@ class ScratchpadRewardFn(torch.nn.Module):
                         else:
                             raise ValueError(f"{accel_state_mixed = }")
 
-                        logits = logits.to(torch.float32)
         else:
+            # TODO(@julesgm): Fix this
             assert False
             logits = self._reward_model(
                 full_seq["input_ids"], attention_mask=full_seq["attention_mask"]
                 ).logits
-
 
         with timer("Computing the rest of the reward", **timer_flags):
 
@@ -302,13 +368,13 @@ class ScratchpadRewardFn(torch.nn.Module):
             ###########################################################################
 
             masks        = torch.stack(masks).to(reward_model_outputs_scratchpad.device)
-            probs         = reward_model_outputs_scratchpad
+            probs        = reward_model_outputs_scratchpad.clone()
             probs[masks == 0] = 1
             logp         = probs.log()
             logp_per_seq = logp.sum(-1)
             final_output = logp_per_seq.detach()
 
-        return final_output
+        return final_output, reward_model_outputs_scratchpad
 
     def replace_answer(self, *, original_generation: str, ref_answer: str) -> tuple[str, int, int]:
         answer = self._conv_to_num.extract_answer(original_generation)
