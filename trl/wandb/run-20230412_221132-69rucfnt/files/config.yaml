@@ -1,0 +1,106 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    cli_version: 0.14.0
+    code_path: code/trl/bin_gptx-neo.py
+    framework: huggingface
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    python_version: 3.9.15
+    start_time: 1681351892.271694
+    t:
+      1:
+      - 55
+      2:
+      - 1
+      - 5
+      - 11
+      - 49
+      - 51
+      - 53
+      - 55
+      - 71
+      3:
+      - 23
+      - 24
+      4: 3.9.15
+      5: 0.14.0
+      8:
+      - 8
+accelerator_kwargs/kwargs_handlers:
+  desc: null
+  value:
+  - DistributedDataParallelKwargs(dim=0, broadcast_buffers=True, bucket_cap_mb=25,
+    find_unused_parameters=True, check_reduction=False, gradient_as_bucket_view=False,
+    static_graph=False)
+adap_kl_ctrl:
+  desc: null
+  value: true
+batch_size:
+  desc: null
+  value: 512
+cliprange:
+  desc: null
+  value: 0.2
+cliprange_value:
+  desc: null
+  value: 0.2
+gamma:
+  desc: null
+  value: 1
+gradient_accumulation_steps:
+  desc: null
+  value: 1
+horizon:
+  desc: null
+  value: 10000
+init_kl_coef:
+  desc: null
+  value: 0.2
+lam:
+  desc: null
+  value: 0.95
+learning_rate:
+  desc: null
+  value: 1.41e-05
+log_with:
+  desc: null
+  value: wandb
+max_grad_norm:
+  desc: null
+  value: null
+mini_batch_size:
+  desc: null
+  value: 16
+model_name:
+  desc: null
+  value: edbeeching/gpt-neo-125M-imdb-lora-adapter-merged
+optimize_cuda_cache:
+  desc: null
+  value: false
+ppo_epochs:
+  desc: null
+  value: 4
+remove_unused_columns:
+  desc: null
+  value: true
+seed:
+  desc: null
+  value: 0
+steps:
+  desc: null
+  value: 20000
+target:
+  desc: null
+  value: 6
+total_ppo_epochs:
+  desc: null
+  value: 40
+tracker_project_name:
+  desc: null
+  value: trl
+vf_coef:
+  desc: null
+  value: 0.1

@@ -12,7 +12,7 @@ train:
   trainer:                  "AcceleratePPOTrainer"
 
 model:
-  num_layers_unfrozen: 2
+  num_layers_unfrozen: 1
   model_arch_type:     "seq2seq"
 
 tokenizer:
@@ -57,4 +57,4 @@ method:
   gen_kwargs:
     synced_gpus:    True
     max_new_tokens: 120
-    do_sample:      True
+    do_sample:      False
