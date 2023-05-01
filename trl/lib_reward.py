@@ -12,12 +12,13 @@ import numpy as np
 import torch
 import transformers
 
-import lib_bisect_tokens
 import lib_data
 import lib_metric
+import lib_bisect_tokens
 
 LOGGER = logging.getLogger(__name__)
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+
 
 def global_do_checks(model):
     local_rank = LOCAL_RANK
@@ -77,111 +78,42 @@ def clone_hf_model(
     return copy
 
 
+# lib_reward.ScratchpadRewardFn(
+#     ref_model = model,
+#     uses_peft = use_peft,
+#     tokenizer = tokenizer,
+#     metric_fn = metric_fn,
+# )
+
+
 class ScratchpadRewardFn:
     def __init__(
         self, *, 
-        reward_model_hf_name_or_path: typing.Union[str, transformers.PreTrainedModel],
-        get_extra_info_fn: typing.Callable[
-            [typing.Union[str, typing.List[str]]], 
-            typing.Union[typing.Dict, typing.List[typing.Dict]]
-        ],
-        reward_tokenizer: transformers.PreTrainedTokenizerBase, 
-        do_single_proc: bool,
+        ref_model: typing.Union[str, transformers.PreTrainedModel],
+        tokenizer: transformers.PreTrainedTokenizerBase, 
+        uses_peft: bool,
         metric_fn,
-        freeze_model,
-        use_frozen_head,
     ):
         super().__init__()
-        
-        assert isinstance(freeze_model, bool), type(freeze_model)
-        assert isinstance(use_frozen_head, bool), type(use_frozen_head)
-        assert freeze_model ^ use_frozen_head, (
-            f"{freeze_model = }, {use_frozen_head = }")
         
         #----------------------------------------------------------------
         # Build Models
         #----------------------------------------------------------------
-        if isinstance(reward_model_hf_name_or_path, str):
-            assert False
-            reward_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
-                reward_model_hf_name_or_path)
-        else:
-            assert isinstance(reward_model_hf_name_or_path, transformers.PreTrainedModel), (
-                type(reward_model_hf_name_or_path).mro()
-            )
-            reward_model = reward_model_hf_name_or_path
-
-        if do_single_proc:
-            non_distributed = [clone_hf_model(
-                reward_model).eval().to(LOCAL_RANK)]
-        else:
-            non_distributed = None
+        reward_model = ref_model
 
         #----------------------------------------------------------------
         # Set Attributes
         #----------------------------------------------------------------
-        self._use_frozen_head              = use_frozen_head
-        self._non_distributed_reward_model = non_distributed
-        self._show_answer_replacement      = False
-        self._get_extra_info_fn            = get_extra_info_fn
-        self._reward_tokenizer             = reward_tokenizer
-        self._do_single_proc               = do_single_proc
-        self._no_answer_rate               = lib_data.MovingAverage(10000)
-        self._reward_model                 = reward_model.eval()
-        self._conv_to_num                  = lib_data.ConvToNum()
-        self._metric                       = metric_fn
-        if os.environ["ACCELERATE_MIXED_PRECISION"] == "bf16":
-            self._dtype = torch.bfloat16
-        elif os.environ["ACCELERATE_MIXED_PRECISION"] == "fp16":
-            self._dtype = torch.float16
-        elif os.environ["ACCELERATE_MIXED_PRECISION"] == "no":
-            self._dtype = torch.float32
-        else:
-            raise ValueError(os.environ["ACCELERATE_MIXED_PRECISION"])
-
-        if freeze_model:
-            assert not use_frozen_head, (freeze_model, use_frozen_head)
-            self._prep_models()
-
-
-    def _prep_models(self):
-        for p in self._reward_model.parameters():
-            p.requires_grad = False
-
-        if self._non_distributed_reward_model:
-            for p in more_itertools.one(
-                self._non_distributed_reward_model).parameters():
-                p.requires_grad = False
-
-        assert all(
-            isinstance(x, torch.nn.parameter.Parameter) 
-            for x in self.parameters()
-        ), (collections.Counter(type(x) for x in self.parameters()))
-        req_grad_self = [x.requires_grad for x in self.parameters()] 
-        assert not any(req_grad_self), (
-            f"{np.mean(req_grad_self) = :0.1%}"
-        )
-        reg_grad_distributed = [
-            x.requires_grad for x 
-            in self._reward_model.parameters()
-        ]
-        assert not any(reg_grad_distributed), (
-            f"{np.mean(reg_grad_distributed) = :0.1%}"
-        )
-
-        if self._non_distributed_reward_model:
-            req_grad_single = [
-                x.requires_grad for x in 
-                more_itertools.one(
-                self._non_distributed_reward_model
-                ).parameters()
-            ]
-            assert not any(req_grad_single), (
-                f"{np.mean(req_grad_single) = :0.1%}"
-            )
+        self._show_answer_replacement = False
+        self._reward_tokenizer        = tokenizer
+        self._no_answer_rate          = lib_data.MovingAverage(10000)
+        self._model                   = reward_model.eval()
+        self._conv_to_num             = lib_data.ConvToNum()
+        self._metric                  = metric_fn
+        self._uses_peft               = uses_peft
 
     
-    def __call__(self, prompts, samples, outputs, is_distributed):
+    def __call__(self, prompts, samples, outputs, ref_answers):
         # The idea is to:
         # 1. Extract the associated answers & tokenize the answers
         # 2. Create a mask for the answers
@@ -190,62 +122,23 @@ class ScratchpadRewardFn:
         # 5. Run the reward model on the concatenated samples & answers
         # 6. Extract the logp for the answers
         # 7. Return the logp for the answers
-        if not is_distributed:
-            assert self._non_distributed_reward_model, (
-                self._non_distributed_reward_model)
-
-        assert prompts, is_distributed
-        assert samples, is_distributed
-        assert outputs, is_distributed
 
         #######################################################################
         # - Sanity checks 
         # - Varia prep
         #######################################################################
-        
         output = np.mean(self._metric(prompts, samples, outputs)["em_accuracy"])
         LOGGER.info(f"[red bold]REWARD - INSTANT PER BATCH METRIC ACC: {output = :0.2%}")
 
-        assert isinstance(prompts   , list), f"{type(prompts   ).mro() = }"
-        assert isinstance(prompts[0], str ), f"{type(prompts[0]).mro() = }"
-        assert isinstance(outputs   , list), f"{type(outputs   ).mro() = }"
-        assert isinstance(outputs[0], str ), f"{type(outputs[0]).mro() = }"
-
-        global_do_checks(self._reward_model)
-        if self._non_distributed_reward_model:
-            global_do_checks(more_itertools.one(self._non_distributed_reward_model))
-
-        # Pick the correct model depending on whether we are distributed or not.
-        model = (
-            self._reward_model if is_distributed 
-            else more_itertools.one(
-                self._non_distributed_reward_model
-            )
-        )
-
-        assert model is not None, f"model is None. {is_distributed = }"
-        # assert not model.training, f"{model.training = }"
-        # assert not any( x.requires_grad for x in model.parameters()), (
-        #     f"{np.mean([x.requires_grad for x in model.parameters()]):0.1%}"
-        # )
-
         # Get the answers.
-        assert (torch.cuda.current_device() == torch.distributed.get_rank()), (
-            torch.cuda.current_device(), torch.distributed.get_rank())
-        
-        extra_info = self._get_extra_info_fn(
-            sample_str=prompts, miss_ok=False)
-        ref_answers = [x["answer"] for x in extra_info]
-        question_tok = self._reward_tokenizer(
-            prompts, padding=True, return_tensors="pt"
-        )
+        question_tok = self._tokenizer(prompts, padding=True, return_tensors="pt")
 
         timer_flags = dict(
+            disable         = True,
+            cuda_sync       = False,
             accelerate_sync = False,
             accelerator     = None,
             log_level       = logging.INFO,
-            cuda_sync       = True,
-            disable         = True,
             logger          = LOGGER,
         )
         
@@ -256,7 +149,6 @@ class ScratchpadRewardFn:
         # - Put the ref answer instead.
         # - Create a mask over the not-answer for the perplexity.
         #######################################################################
-
         # Replace the number words by digits.
         scratchpads = []
         timer = general_utils.ctx_timeit
@@ -290,8 +182,7 @@ class ScratchpadRewardFn:
         assert (torch.cuda.current_device() == torch.distributed.get_rank()), (
             torch.cuda.current_device(), torch.distributed.get_rank())
         assert len(start_end_outputs) == len(scratchpads), (
-            f"{len(start_end_outputs) = }, {len(scratchpads) = }"
-        )
+            f"{len(start_end_outputs) = }, {len(scratchpads) = }")
         
         # > Replace the answer tokens by the ref answer.
         # > Create the masks.
@@ -327,59 +218,31 @@ class ScratchpadRewardFn:
         # 2. Compute the logp for the answers
         ###########################################################################
         if self._reward_model.config.is_encoder_decoder:
-            assert model.device.type == "cuda", (
-                f"{model.device.type = }"
+            assert self._model.device.type == "cuda", (
+                f"{self._model.device.type = }"
             )
-            distributed_str = "DISTRIBUTED" if is_distributed else "NON-DISTRIBUTED"
             
             # TODO: Maybe we don't have to recompute the logits. 
             # We should get them for generation and for training. 
             with timer("Moving things to GPU", **timer_flags):
                 input_dict = dict(
-                    input_ids              = question_tok["input_ids"     ].to(model.device),
-                    attention_mask         = question_tok["attention_mask"].to(model.device),
-                    decoder_input_ids      = tok_outputs ["input_ids"     ].to(model.device),
-                    decoder_attention_mask = tok_outputs ["attention_mask"].to(model.device),
+                    input_ids              = question_tok["input_ids"     ].to(self._inputs_device),
+                    attention_mask         = question_tok["attention_mask"].to(self._inputs_device),
+                    decoder_input_ids      = tok_outputs ["input_ids"     ].to(self._inputs_device),
+                    decoder_attention_mask = tok_outputs ["attention_mask"].to(self._inputs_device),
                 )
 
             with timer(
-                f"[{distributed_str}]:\n> Computing the logits with the ref model for the reward." +
+                f"> Computing the logits with the ref model for the reward." +
                 f"{question_tok['input_ids'].shape = }"
                 , **timer_flags):
                 
-                accel_state_mixed = os.environ["ACCELERATE_MIXED_PRECISION"]
-                
-                # -------------------------------------------------------------
-                # We need to handle autocast in single proc mode, because 
-                # the model is not passed tp accelerate
-                # -------------------------------------------------------------
-                with torch.no_grad():
-                    assert not model.training, f"{model.training = }"                    
-                    if not is_distributed and not accel_state_mixed == "no":
-                        if accel_state_mixed == "bf16":
-                            dtype = torch.bfloat16
-                        elif accel_state_mixed == "fp16": 
-                            dtype = torch.float16
-                        else:
-                            raise ValueError(f"{accel_state_mixed = }")
+                with torch.no_grad():                    
+                    if self._uses_peft:
+                        with self._model.disable_adapter():
+                            logits = self._model(**input_dict).logits
                     else:
-                        dtype = None
-                    
-                    logits = _maybe_frozen_head(
-                        _maybe_autocast(model, dtype), 
-                        input_dict, 
-                        self._use_frozen_head
-                    ).logits
-
-                    if not is_distributed:
-                        if accel_state_mixed == "bf16":
-                            assert logits.dtype == torch.bfloat16, f"{logits.dtype = }"
-                        elif accel_state_mixed == "fp16":
-                            assert logits.dtype == torch.float16 , f"{logits.dtype = }"
-                        elif accel_state_mixed == "no":
-                            assert logits.dtype == torch.float   , f"{logits.dtype = }"
-                        else:
-                            raise ValueError(f"{accel_state_mixed = }")
+                        logits = self._model(**input_dict).logits
 
         else:
             # TODO(@julesgm): Fix this

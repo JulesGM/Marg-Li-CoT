@@ -1,43 +1,44 @@
 #!/usr/bin/env python
 import os
-import wandb
-
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["NCCL_DEBUG"]             = "WARN"
-os.environ["DATASETS_VERBOSITY"]     = "warning"
 os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
+os.environ["DATASETS_VERBOSITY"]     = "warning"
+os.environ["WANDB_SILENT"]           = "true"
+os.environ["NCCL_DEBUG"]             = "WARN"
 
-import collections
-from dataclasses import dataclass
-import itertools
+
 import logging
 import random
 import typing
 
+import accelerate
 import fire
-import torch
 import numpy as np
 import datasets
 import peft
 import rich
-import rich.table
 import rich.status
+import rich.table
+import torch
 from tqdm import tqdm
 import transformers
 import trl
 import trl.core 
+import wandb
 
 import lib_trl_utils
 from accelerate.utils import DistributedDataParallelKwargs
 
+import lib_data
+import lib_metric
+import lib_reward
 
 datasets    .logging.set_verbosity_warning()
 transformers.logging.set_verbosity_warning()
 logging.getLogger("datasets"    ).setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("deepspeed"   ).setLevel(logging.WARNING)
-
 
 np.random            .seed(0)
 random               .seed(1)
@@ -46,22 +47,17 @@ torch.cuda.manual_seed_all(3)
 trl              .set_seed(4)
 
 
-DEFAULT_DATASET_NAME      = "imdb"
-DEFAULT_INPUT_MIN_LENGTH  = 10
-DEFAULT_INPUT_MAX_LENGTH  = 15
-DEFAULT_OUTPUT_MIN_LENGTH = 20
-DEFAULT_OUTPUT_MAX_LENGTH = 30
-
 DEFAULT_LOG_STATS_VERBOSE = True
 DEFAULT_REWARD_VERBOSE    = False
-PROMPT =  "" 
+PROMPT                    =  "" 
 
 DEFAULT_LORA_CONFIG = dict(
-    r              = 16,
-    lora_alpha     = 32,
-    lora_dropout   = 0.05,
     inference_mode = False,
+    lora_dropout   = 0.05,
+    lora_alpha     = 32,
     task_type      = peft.TaskType.SEQ_2_SEQ_LM,
+    bias           = "none",
+    r              = 16,
 )
 
 DEFAULT_GENERATION_KWARGS = dict(
@@ -71,206 +67,169 @@ DEFAULT_GENERATION_KWARGS = dict(
     top_p        = 1.0,
 )
 
-DEFAULT_PIPE_SENT_KWARGS = dict(
-    function_to_apply = "none", 
-    batch_size        = 512,
-    top_k             = None,
-    truncation        = True,
-)
+DEFAULT_GRADIENT_ACCUMULATION_STEPS: int                  = 1
+DEFAULT_GENERATION_BATCH_SIZE:       int                  = 16
+DEFAULT_MINI_BATCH_SIZE:             int                  = 16
+DEFAULT_LEARNING_RATE:               float                = 1.41e-5
+DEFAULT_MODEL_NAME:                  str                  = "google/flan-t5-base" 
+DEFAULT_BATCH_SIZE:                  int                  = 16
+DEFAULT_NUM_EPOCHS:                  int                  = 10
+DEFAULT_PRECISION                                         = torch.bfloat16
+DEFAULT_LOG_WITH:                    typing.Optional[str] = None
+DEFAULT_USE_PEFT:                    bool                 = True
 
-DEFAULT_PRECISION = torch.bfloat16
+
+def collator(data):
+    return dict((key, [d[key] for d in data]) for key in data[0])
 
 
-@dataclass
-class ScriptArguments:
-    """
-    The name of the Casual LM model we wish to fine with PPO
-    """
-    gradient_accumulation_steps: typing.Optional[int]   = 1 
-    learning_rate:               typing.Optional[float] = 1.41e-5
+def evaluate_or_test(
+    *,
+    generation_batch_size: int,
+    generation_kwargs: dict[str, typing.Any],
+    logging_header: str,
+    ppo_trainer: trl.core.PPOTrainer,
+    dataloader, 
+    reward_fn: typing.Callable[[list[str], list[str]], torch.Tensor],
+    tokenizer: transformers.PreTrainedTokenizerBase,
+    set_name: str, 
+    model: trl.models.modeling_base.PreTrainedModelWrapper,
+):
     
-    # model_name:                  typing.Optional[str]   = "google/flan-t5-base" 
-    model_name:                  typing.Optional[str]   = "edbeeching/gpt-neo-125M-imdb-lora-adapter-merged"
-    batch_size:                  typing.Optional[int]   = 512
-    log_with:                    typing.Optional[str]   = None
-    num_epochs:                  typing.Optional[int]   = 10
-    mini_batch_size                                     = 16
-    generation_batch_size:                        int   = 512
-
-
-def build_dataset(
-    config:                dict[str, typing.Any],
-    dataset_name:          str, 
-    input_min_length: int, 
-    input_max_length: int,
-) -> datasets.Dataset:
-    """
-
-    Build dataset for training. This builds the dataset 
-    from `load_dataset`, one should customize this function 
-    to train the model on its own dataset.
-
-    output needs to have input_ids, & query
-
-    Args:
-        dataset_name (`str`):
-            The name of the dataset to be loaded.
-    Returns:
-        dataloader (`torch.utils.data.DataLoader`):
-            The dataloader for the dataset.
-
-    """
-
-    tokenizer = lib_trl_utils.build_tokenizer(config.model_name)
-    ds = datasets.load_dataset(dataset_name, split="train")
-    ds = ds.rename_columns({"text": "review"})
-    ds = ds.filter(lambda x: len(x["review"]) > 200, batched=False)
-
-    input_size = trl.core.LengthSampler(
-        input_min_length,
-        input_max_length,
-    )
-
-    
-    def tokenize(sample):
-        prompt = PROMPT
-
-        sample["input_ids"] = tokenizer.encode(
-            prompt + sample["review"],
-            truncation=True,
-        )[: input_size()]
-        sample["query"] = tokenizer.decode(sample["input_ids"])
-        return sample
-
-    ds = ds.map(tokenize, batched=False)
-    ds.set_format(type="torch")
-
-    return ds
-
-
-def collator(
-    data: list[dict[str, lib_trl_utils.IntSequence]],
-) -> dict[str, list[lib_trl_utils.IntSequence]]:
-    
-    output_dict = {key: [d[key] for d in data] for key in data[0]}
-
-    return output_dict
-
-
-class RewardFn:
-    def __init__(
-            self, 
-            *, 
-            device: int, 
-            tokenizer: transformers, 
-            pipe_sent_kwargs: dict[str, typing.Any],
-            verbose: bool = False,
-        ):
-
-        self._sentiment_pipe = transformers.pipeline(
-            "sentiment-analysis", 
-            device = device,
-            model  = "lvwerra/distilbert-imdb", 
+    rewards = []
+    for batch_idx, batch in tqdm(
+        enumerate(dataloader), 
+        desc=logging_header
+    ):
+        
+        batch["response"] = lib_trl_utils.batched_unroll(
+            generation_batch_size = generation_batch_size,
+            generation_kwargs     = generation_kwargs, 
+            ppo_trainer           = ppo_trainer, 
+            tokenizer             = tokenizer,
+            batch                 = batch,
+            model                 = model,
         )
 
-        self._pipe_sent_kwargs = pipe_sent_kwargs
-        self._tokenizer        = tokenizer
-        self._verbose          = verbose
+        local_batch_rewards = reward_fn(
+            response_tensors = batch["response"],
+            batch_query      = batch["query"], 
+        )
+
+        gathered_batch_rewards = ppo_trainer.accelerator.gather_for_metrics(
+            local_batch_rewards.to(ppo_trainer.accelerator.device),
+        )
+
+        rewards.append(gathered_batch_rewards)
+
+    reward = torch.cat(rewards, dim=0)
     
-    def __call__(self, response_tensors, batch_query):
+    wandb.log({
+        f"{set_name}/reward_mean": reward.mean().item(),
+        f"{set_name}/reward_str":  reward.std ().item(),
         
-        batch_response  = [self._tokenizer.decode(r.squeeze()) for r in response_tensors]
-        texts           = [q + r for q, r in zip(batch_query, batch_response)]
-        pipe_outputs    = self._sentiment_pipe(texts, **self._pipe_sent_kwargs)
-        prepped_outputs = [{
-            output["label"]: torch.tensor(output["score"]) for output in outputs} 
-            for outputs in pipe_outputs
-        ]
-        final_outputs    = [{
-            output["label"]: torch.tensor(output["score"]) for output in outputs}["POSITIVE"]
-            for outputs in pipe_outputs
-        ]
-
-        if self._verbose:
-            table = rich.table.Table(
-                "Pipeline Inputs", 
-                "POSITIVE",
-                "NEGATIVE",
-                "FINAL OUTPUT",
-                title       = "Sentiment Analysis Pipeline",
-                show_lines  = True,
-            )
+    })
 
 
-            for text, output, final_output in itertools.islice(
-                zip(texts, prepped_outputs, final_outputs), 5):
-
-                table.add_row(
-                    str(text), 
-                    str(output["POSITIVE"].item()),
-                    str(output["NEGATIVE"].item()),
-                    str(final_output.item()),
-                )
-            
-            rich.print(self._pipe_sent_kwargs)
-            rich.print(table)
-        
-        
-        return final_outputs
 
 def main(
     *, 
-    reward_fn_verbose: bool                           = DEFAULT_REWARD_VERBOSE,
-    log_stats_verbose: bool                           = DEFAULT_LOG_STATS_VERBOSE,
-    generation_kwargs: dict[str, typing.Any]          = DEFAULT_GENERATION_KWARGS,
-    lora_config_dict:  dict[str, typing.Any]          = DEFAULT_LORA_CONFIG, 
-    precision:         typing.Union[str, torch.dtype] = DEFAULT_PRECISION,
-    dataset_name:      str                            = DEFAULT_DATASET_NAME, 
-    input_min_length:  str                            = DEFAULT_INPUT_MIN_LENGTH, 
-    input_max_length:  str                            = DEFAULT_INPUT_MAX_LENGTH,
-    output_min_length: str                            = DEFAULT_OUTPUT_MIN_LENGTH, 
-    output_max_length: str                            = DEFAULT_OUTPUT_MAX_LENGTH,
-    pipe_sent_kwargs:  dict[str, typing.Any]          = DEFAULT_PIPE_SENT_KWARGS,
+    gradient_accumulation_steps: int          = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
+    generation_batch_size: int                = DEFAULT_GENERATION_BATCH_SIZE,
+    reward_fn_verbose: bool                   = DEFAULT_REWARD_VERBOSE,
+    generation_kwargs: dict[str, typing.Any]  = DEFAULT_GENERATION_KWARGS,
+    log_stats_verbose: bool                   = DEFAULT_LOG_STATS_VERBOSE,
+    lora_config_dict:  dict[str, typing.Any]  = DEFAULT_LORA_CONFIG, 
+    mini_batch_size: int                      = DEFAULT_MINI_BATCH_SIZE,
+    learning_rate: float                      = DEFAULT_LEARNING_RATE,
+    model_name: str                           = DEFAULT_MODEL_NAME,
+    batch_size: int                           = DEFAULT_BATCH_SIZE,
+    num_epochs: int                           = DEFAULT_NUM_EPOCHS,
+    precision: typing.Union[str, torch.dtype] = DEFAULT_PRECISION,
+    log_with: str                             = DEFAULT_LOG_WITH,
+
+    input_max_length: int                     = 115,
+    dataset_name: str                         = lib_data.GSM8K,
+    use_peft: bool                            = DEFAULT_USE_PEFT,
 ):
-    parser = transformers.HfArgumentParser(ScriptArguments)
-    script_args = parser.parse_args_into_dataclasses()[0]
+    args = locals().copy()
+
+    ###########################################################################
+    # Find the type of model we are using
+    ###########################################################################
+    if "gpt" in model_name.lower():
+        assert lora_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
+        model_type = peft.TaskType.CAUSAL_LM
+    elif "t5" in model_name.lower():
+        assert lora_config_dict["task_type"] == peft.TaskType.SEQ_2_SEQ_LM
+        model_type = peft.TaskType.SEQ_2_SEQ_LM
+    else:
+        raise ValueError(f"Unknown model type: {model_name}")
 
     config = trl.PPOConfig(
-        gradient_accumulation_steps = script_args.gradient_accumulation_steps,
-        mini_batch_size             = script_args.mini_batch_size,
-        learning_rate               = script_args.learning_rate,
-        model_name                  = script_args.model_name,
-        batch_size                  = script_args.batch_size,
-        log_with                    = script_args.log_with,
-        accelerator_kwargs = dict(kwargs_handlers=
-            [DistributedDataParallelKwargs(
-                find_unused_parameters=True
-            )]
-        )
+        gradient_accumulation_steps = gradient_accumulation_steps,
+        accelerator_kwargs          = dict(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]),
+        mini_batch_size             = mini_batch_size,
+        learning_rate               = learning_rate,
+        model_name                  = model_name,
+        batch_size                  = batch_size,
+        log_with                    = log_with,
     )
+
     if lib_trl_utils.get_rank() == 0:
         wandb.init(
-            project="trl", 
-            entity="julesgm", 
-            save_code=True,
+            save_code = True,
+            project   = "trl", 
+            config    = args,
+            entity    = "julesgm", 
+            name      = None,
         )
 
-    
-    dataset = build_dataset(
-        config,
-        dataset_name=dataset_name, 
-        input_min_length=input_min_length, 
-        input_max_length=input_max_length,
-    )
+    if dataset_name == lib_data.GSM8K:
+        dataset = lib_data.GSM8K(
+            input_max_length, 
+            tokenizer, 
+            datasets.load_dataset("gsm8k", "main", split="train"),
+        )
+        eval_dataset = lib_data.GSM8K(
+            input_max_length, 
+            tokenizer, 
+            datasets.load_dataset("gsm8k", "main", split="test")
+        )
+        
+    elif dataset_name == lib_data.ASDiv:
+        dataset = lib_data.ASDiv(
+            input_max_length, 
+            tokenizer, 
+            datasets.load_dataset("asdiv"),
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
     model, tokenizer = lib_trl_utils.init_model(
         lora_config_dict = lora_config_dict,
         model_name       = config.model_name,
         precision        = precision,
+        model_type       = model_type,
     )
+
+
+    ###########################################################################
+    # Set model name specific flags
+    ###########################################################################
+    if "gpt" in config.model_name:
+        assert lora_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
+        generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
+        generation_kwargs["eos_token_id"] = -1
+        generation_kwargs["min_length"]   = -1
+    
+
+    ###########################################################################
+    # Prep Training
+    ###########################################################################
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), 
-        lr=config.learning_rate
+        lr=config.learning_rate,
     )
     ppo_trainer = trl.PPOTrainer(
         config, 
@@ -281,49 +240,26 @@ def main(
         tokenizer     = tokenizer,
         dataset       = dataset,
     )
-
-    if "gpt" in config.model_name:
-        generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
-        generation_kwargs["eos_token_id"] = -1
-        generation_kwargs["min_length"]   = -1
-
-    ###########################################################################
-    ###########################################################################
-    reward_fn = RewardFn(
-        pipe_sent_kwargs = pipe_sent_kwargs,
-        tokenizer        = tokenizer,
-        verbose          = reward_fn_verbose,
-        device           = lib_trl_utils.get_local_rank(),
+    metric_accuracy = lib_metric.ScratchpadAnswerAccuracy()
+    reward_fn = lib_reward.ScratchpadRewardFn(
+        ref_model = model,
+        uses_peft = use_peft,
+        tokenizer = tokenizer,
+        metric_fn = metric_accuracy,
     )
     
 
-    output_length_sampler = trl.core.LengthSampler(
-        output_min_length, 
-        output_max_length,
-    )
-    assert output_min_length <= output_max_length, (
-        output_min_length,
-        output_max_length,
-    )
-    assert generation_kwargs["min_length"] <= output_min_length, (
-        generation_kwargs["min_length"],
-        output_min_length,
-    )
-
     ###########################################################################
+    # Training Loop
     ###########################################################################
-    
-    assert lib_trl_utils.print_trainable_parameters(model, False) > 0
-
-    for epoch in range(script_args.num_epochs):
+    for epoch in range(num_epochs):
         for batch_idx, batch in tqdm(
             enumerate(ppo_trainer.dataloader), 
             desc="Training",
             disable=lib_trl_utils.get_rank() != 0
         ):
             batch["response"] = lib_trl_utils.batched_unroll(
-                output_length_sampler = output_length_sampler,
-                generation_batch_size = script_args.generation_batch_size,
+                generation_batch_size = generation_batch_size,
                 generation_kwargs     = generation_kwargs, 
                 ppo_trainer           = ppo_trainer, 
                 tokenizer             = tokenizer,
@@ -331,7 +267,6 @@ def main(
                 model                 = model,
             )
 
-            # Compute rewards
             rewards = reward_fn(
                 response_tensors = batch["response"],
                 batch_query      = batch["query"], 
@@ -392,6 +327,7 @@ def main(
                 stats   = stats,
             )
 
+    
 
 if __name__ == "__main__":
     fire.Fire(main)

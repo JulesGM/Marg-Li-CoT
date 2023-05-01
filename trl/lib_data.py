@@ -10,10 +10,7 @@ import typing
 import xml
 from pathlib import Path
 
-# import datasketch
-import editdistance
-import general_utils
-import itertools
+
 import more_itertools
 import numpy as np
 import rich
@@ -284,111 +281,6 @@ class ConvToNum:
         return self.conv_words_to_numbers(text)
 
 
-# class ApproxMatcher:
-#     def __init__(self, ds):
-#         self._ds = ds
-
-#     def query(self, sample):
-#         start = time.perf_counter()
-#         min_distance_match, distance = min(
-#             ((k, editdistance.distance(sample, k)) 
-#             for k in self._ds)
-#             , key=lambda x: x[1]
-#         )
-#         delta = time.perf_counter() - start
-#         rich.print(
-#             f"{sample             = }\n" +
-#             f"{min_distance_match = }\n" + 
-#             f"{distance = } {delta = :0.3}\n" + 
-#             f"-" * 80 + "\n"
-#         )
-        
-#         if distance < 10: 
-#             rich.print(
-
-#             f"\n"
-#             f"[bold white on red]LARGE DISTANCE:[green on black]\n"
-#             f"{sample             = }\n"
-#             f"{min_distance_match = }\n"
-#             f"{distance           = }\n"
-#         )
-        
-#         return self._ds.get_extra_info(min_distance_match, miss_ok=False)
-
-
-class ApproxMatcher:
-    def __init__(self, ds, tokenizer):
-        self._ds = sorted(ds)
-        self._tokenizer = tokenizer
-
-    def add_regular_row(self, table, key, value, split_at=None):
-        num_tokens = str(len(self._tokenizer(value)["input_ids"]))
-        formatted_value = value
-        if split_at is not None:
-            formatted_value = (
-                f"[bold green]{value[:split_at]}" +
-                f"[bold red  ]{value[split_at:]}"
-            )
-        
-        table.add_row(
-            key, 
-            formatted_value, 
-            str(len(value)),
-            num_tokens
-        )
-
-    def _log_table(self, delta, sample, value_right, len_sample):
-        table = rich.table.Table(
-            rich.table.Column(header="Key"  ,     style="bold blue",),
-            rich.table.Column(header="Value",     style="white"),
-            rich.table.Column(header="Num chars", style="white"),
-            rich.table.Column(header="Num BPE",   style="white"),
-            show_lines=True,
-            title=f"PREFIX MATCHED",
-            box=rich.box.ROUNDED,
-        )
-        
-        table.add_row("delta", f"{delta:0.3}", "", "")
-        self.add_regular_row(table, "sample", sample)
-        self.add_regular_row(
-            table, 
-            "value_right", 
-            value_right,
-            len_sample
-        )
-        rich.print(table)
-
-    def query(self, sample):
-        start = time.perf_counter()
-        idx = bisect.bisect(self._ds, sample)        
-        value_right = self._ds[idx]
-        delta = time.perf_counter() - start
-        
-        if value_right[:len(sample)] == sample:
-            self._log_table(
-                value_right = value_right, 
-                len_sample  = len(sample),
-                sample      = sample, 
-                delta       = delta, 
-            )
-            return value_right
-        return None
-            
-
-class BaseTRLXExtraInfoDataset(torch.utils.data.Dataset, abc.ABC):
-    def __init__(self, tokenizer):
-        self._matcher = ApproxMatcher(self, tokenizer=tokenizer)
-
-    @abc.abstractmethod
-    def get_extra_info(
-        self, 
-        *,
-        miss_ok: bool,
-        sample_str: str, 
-    ) -> dict[str, typing.Any]:
-        raise NotImplementedError
-
-
 class ASDivRaw(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -428,7 +320,7 @@ class ASDivRaw(torch.utils.data.Dataset):
         return self._data[index]
 
 
-class ASDiv(BaseTRLXExtraInfoDataset):
+class ASDiv:
     def __init__(self, *args, **kwargs):
         
         assert False
@@ -453,13 +345,6 @@ class ASDiv(BaseTRLXExtraInfoDataset):
         return self._tokenizer.decode(
             tokenized["input_ids"], skip_special_tokens=True,
         ).strip()
-
-    def get_extra_info(
-            self, 
-            sample_str: str, 
-            miss_ok:    bool
-        ) -> dict[str, typing.Any]:
-        return self._extra_info[sample_str]
 
     def __len__(self) -> int:
         return len(self._ds)
@@ -489,8 +374,7 @@ class ASDiv(BaseTRLXExtraInfoDataset):
             ]
         
 
-
-class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
+class GSM8K:
     _int_patt = re.compile(r"\-?\d+")
 
     def __init__(
@@ -503,12 +387,9 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
 
         self._outputs_key = "answer"
         self._inputs_key  = "question"
-        self._extra_info  = {}
         self._max_length  = max_length
         self._tokenizer   = tokenizer
         self._populate_ds(ds)
-
-        super().__init__(tokenizer=tokenizer)
 
     def _populate_ds(self, ds):
         samples = []
@@ -528,16 +409,13 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
         self._samples = []
         self._outputs = []
         
-        for t_s, t_o in zip(tokenized_samples, tokenized_outputs):
-            if len(t_s) > self._max_length:
-                continue
-
-            self._samples.append(
-                self._tokenizer.decode(t_s, skip_special_tokens=True)
-            )
-            self._outputs.append(
-                self._tokenizer.decode(t_o, skip_special_tokens=True)
-            )
+        for t_s, t_o in more_itertools.zip_equal(
+            tokenized_samples, 
+            tokenized_outputs, 
+        ):
+            if len(t_s) <= self._max_length:
+                self._samples.append(t_s)
+                self._outputs.append(t_o)
 
         LOGGER.info(
             f"[red bold]With len {self._max_length} - "
@@ -545,100 +423,15 @@ class GSM8KLMDataset(BaseTRLXExtraInfoDataset):
             f"{     len(self._samples)} / {len(samples)}"
         )
 
-    def get_extra_info(
-        self, 
-        *,
-        sample_str: str,
-        miss_ok,
-        query_solve=True,
-    ) -> dict[str, typing.Any]:
-        
-        #######################################################################
-        # If list
-        #######################################################################
-        if isinstance(sample_str, list):
-            return [
-                self.get_extra_info(
-                    sample_str = sample, 
-                    miss_ok    = miss_ok,
-                ) for sample in sample_str
-            ]
-        
-        #######################################################################
-        # If not list
-        #######################################################################
-        assert isinstance(sample_str, str), (f"{type(sample_str).mro() = }")
-        
-        if sample_str not in self._extra_info:
-            if not query_solve and not miss_ok:
-                raise ValueError(
-                    f"Base lookup failed, "
-                    f"query_solve is [{query_solve = }] and "
-                    f"miss_ok is [{miss_ok = }]."
-                )
-            
-            elif not query_solve and miss_ok:
-                return None
-
-            match = self._matcher.query(sample_str)
-            if match:
-                # miss_ok can be true or false here
-                assert query_solve
-                return self._extra_info[match]
-            
-            if not miss_ok:
-                assert query_solve, query_solve
-                assert not miss_ok, miss_ok
-                raise ValueError(
-                    "\n"
-                    f"Query solve failed and miss_ok is False.\n"
-                    f"{query_solve = }\n" 
-                    f"{miss_ok     = }\n"
-                )
-            
-            assert query_solve and miss_ok, f"{query_solve = }, {miss_ok = }"
-            assert match is None
-            return match
-        else:
-            return self._extra_info[sample_str]
-
-    def preprocess_question(self, question: str) -> str:
-        tokenized = self._tokenizer(
-            question,
-            add_special_tokens=False,
-        )
-        return self._tokenizer.decode(
-            tokenized["input_ids"], 
-            skip_special_tokens=True,
-        ).strip()
-
-    def _get_indiv_item(self, idx, dont_add_to_extra_info=False) -> str:
-        assert isinstance(idx, int), f"{type(idx) = }"
-        assert idx >= 0, f"{idx = }"
-        sample = self._samples[idx]
-        output = self._outputs[idx]
-
-        if not dont_add_to_extra_info:
-            self._extra_info[sample] = dict(answer=output)
-
-        assert isinstance(sample, str)
-        return sample
-
     def __len__(self):
+        assert len(self._samples) == len(self._outputs), (
+            f"{len(self._samples) = }, {len(self._outputs) = }")
         return len(self._samples)
 
     def __getitem__(
             self, idx_or_slice: typing.Union[int, slice]
         ) -> typing.Union[str, list[str]]:
-
-        if isinstance(idx_or_slice, int):
-            return self._get_indiv_item(idx_or_slice)
-
-        elif isinstance(idx_or_slice, slice):
-            return [
-                self._get_indiv_item(i).strip() for i in 
-                range(idx_or_slice.start, idx_or_slice.stop, idx_or_slice.step)
-            ]
+        return self._samples[idx_or_slice], self._outputs[idx_or_slice]
         
 
 
@@ -676,6 +469,6 @@ class DatasetChoices(str, enum.Enum):
 
 DATASET_KEY_TO_CLASS = {
     DatasetChoices.ASDIV: ASDiv,
-    DatasetChoices.GSM8K: GSM8KLMDataset,
+    DatasetChoices.GSM8K: GSM8K,
     DatasetChoices.ARITHMETIC_DUMMY: ArithmeticDummyDS,
 }

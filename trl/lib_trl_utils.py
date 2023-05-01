@@ -26,11 +26,6 @@ def get_world_size():
     return int(os.getenv("WORLD_SIZE", "1"))
 
 
-class ModelClass(str, enum.Enum):
-    CAUSAL_LM = "causal_lm"
-    SEQ_2_SEQ_LM = "seq_2_seq_lm"
-
-
 IntSequence = typing.TypeVar(
     "IntSequence", 
     list[int], 
@@ -71,26 +66,6 @@ def check_all_start_with_token_id(tensors: IntSequence, token_id: int):
         )
 
 
-# def pad(
-#     input_ids: IntSequence,
-#     pad_token_id: int,
-# ) -> IntSequence:
-    
-#     """
-#     Description: raw padding function without all the extra stuff from transformers tokenziers.
-#     Intent: 
-#     """
-    
-#     max_len = max(len(x) for x in input_ids)
-#     if isinstance(input_ids[0], torch.Tensor):
-#         return torch.nn.utils.rnn.pad_sequence(
-#             input_ids, 
-#             batch_first   = True, 
-#             padding_value = pad_token_id,
-#         )
-#     return [x + [pad_token_id] * (max_len - len(x)) for x in input_ids]
-
-
 def print_trainable_parameters(
     model: torch.nn.Module,
     do_print: bool = True,
@@ -126,6 +101,7 @@ def init_model(
     precision, 
     model_name: str, 
     lora_config_dict: dict[str, typing.Any],
+    model_type,
 ) -> transformers.PreTrainedModel:
     """
     
@@ -145,9 +121,6 @@ def init_model(
     The question is, why does peft + value-model work with gpt and not t5?
 
     It further doesn't work with "prepare_for_int8" training, but that's not the question right now.
-
-    
-
         
     """
     
@@ -155,19 +128,9 @@ def init_model(
     tokenizer = build_tokenizer(model_name)
 
     ###########################################################################
-    # Detect the Model Type
-    ###########################################################################
-    if "gpt" in model_name.lower():
-        model_class = ModelClass.CAUSAL_LM
-    elif "t5" in model_name.lower():
-        model_class = ModelClass.SEQ_2_SEQ_LM
-    else:
-        raise ValueError(model_name)
-
-    ###########################################################################
     # Model Class Specific Options
     ###########################################################################
-    if model_class == ModelClass.CAUSAL_LM:
+    if model_type == peft.TaskType.CAUSAL_LM:
         lora_config.task_type = peft.TaskType.CAUSAL_LM
         transformers_cls      = transformers.AutoModelForCausalLM
         trl_cls               = trl.models.  AutoModelForCausalLMWithValueHead
@@ -176,7 +139,7 @@ def init_model(
         tokenizer.pad_token   = tokenizer.eos_token
         dmap_keys = ["transformer", "lm_head"]
 
-    elif model_class == ModelClass.SEQ_2_SEQ_LM:
+    elif model_type == peft.TaskType.SEQ_2_SEQ_LM:
         lora_config.task_type = peft.TaskType.SEQ_2_SEQ_LM
         transformers_cls      = transformers.AutoModelForSeq2SeqLM
         trl_cls               = trl.models.  AutoModelForSeq2SeqLMWithValueHead
@@ -250,6 +213,8 @@ def init_model(
     model.gradient_checkpointing_enable  = model.pretrained_model.gradient_checkpointing_enable
     print_trainable_parameters(model)
 
+    assert print_trainable_parameters(model, False) > 0
+
     return model, tokenizer
 
 
@@ -295,12 +260,12 @@ def unroll(
 def batched_unroll(
     *,
     output_length_sampler: typing.Optional[trl.core.LengthSampler],
+    generation_batch_size: int,
     generation_kwargs:     dict[str, typing.Any],
     ppo_trainer:           trl.PPOTrainer,
+    tokenizer:             transformers.PreTrainedTokenizer,
     batch:                 dict[str, IntSequence],
     model:                 transformers.PreTrainedModel,
-    tokenizer:             transformers.PreTrainedTokenizer,
-    generation_batch_size: int,
 ) -> IntSequenceContainer:
     """
     Requires 

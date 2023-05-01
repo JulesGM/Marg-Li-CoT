@@ -47,37 +47,33 @@ trl              .set_seed(4)
 
 
 DEFAULT_DATASET_NAME      = "imdb"
-DEFAULT_INPUT_MIN_LENGTH  = 10
-DEFAULT_INPUT_MAX_LENGTH  = 15
-DEFAULT_OUTPUT_MIN_LENGTH = 20
-DEFAULT_OUTPUT_MAX_LENGTH = 30
+DEFAULT_INPUT_MIN_LENGTH  = 2
+DEFAULT_INPUT_MAX_LENGTH  = 5
+DEFAULT_OUTPUT_MIN_LENGTH = 10
+DEFAULT_OUTPUT_MAX_LENGTH = 20
 
 DEFAULT_LOG_STATS_VERBOSE = True
 DEFAULT_REWARD_VERBOSE    = False
 PROMPT =  "" 
-
 DEFAULT_LORA_CONFIG = dict(
-    r              = 16,
-    lora_alpha     = 32,
-    lora_dropout   = 0.05,
     inference_mode = False,
-    task_type      = peft.TaskType.SEQ_2_SEQ_LM,
+    lora_dropout   = 0.05,
+    lora_alpha     = 32,
+    task_type      = peft.TaskType.CAUSAL_LM,
+    bias           = "none",
+    r              = 8,
 )
-
 DEFAULT_GENERATION_KWARGS = dict(
     min_length   = 3,
     do_sample    = True,
     top_k        = 0.0,
     top_p        = 1.0,
 )
-
 DEFAULT_PIPE_SENT_KWARGS = dict(
     function_to_apply = "none", 
-    batch_size        = 512,
-    top_k             = None,
+    batch_size        = 256,
     truncation        = True,
-)
-
+    top_k             = None,)
 DEFAULT_PRECISION = torch.bfloat16
 
 
@@ -87,15 +83,13 @@ class ScriptArguments:
     The name of the Casual LM model we wish to fine with PPO
     """
     gradient_accumulation_steps: typing.Optional[int]   = 1 
-    learning_rate:               typing.Optional[float] = 1.41e-5
-    
-    # model_name:                  typing.Optional[str]   = "google/flan-t5-base" 
-    model_name:                  typing.Optional[str]   = "edbeeching/gpt-neo-125M-imdb-lora-adapter-merged"
-    batch_size:                  typing.Optional[int]   = 512
-    log_with:                    typing.Optional[str]   = None
-    num_epochs:                  typing.Optional[int]   = 10
+    generation_batch_size:                        int   = 256
     mini_batch_size                                     = 16
-    generation_batch_size:                        int   = 512
+    learning_rate:               typing.Optional[float] = 1.41e-5
+    model_name:                  typing.Optional[str]   = "edbeeching/gpt-neo-125M-imdb-lora-adapter-merged"
+    batch_size:                  typing.Optional[int]   = 256
+    num_epochs:                  typing.Optional[int]   = 10000
+    log_with:                    typing.Optional[str]   = None
 
 
 def build_dataset(
@@ -214,8 +208,7 @@ class RewardFn:
             
             rich.print(self._pipe_sent_kwargs)
             rich.print(table)
-        
-        
+    
         return final_outputs
 
 def main(
@@ -235,6 +228,15 @@ def main(
     parser = transformers.HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
 
+    if "gpt" in script_args.model_name.lower():
+        assert lora_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
+        model_type = peft.TaskType.CAUSAL_LM
+    elif "t5" in script_args.model_name.lower():
+        assert lora_config_dict["task_type"] == peft.TaskType.SEQ_2_SEQ_LM
+        model_type = peft.TaskType.SEQ_2_SEQ_LM
+    else:
+        raise ValueError(f"Unknown model type: {script_args.model_name}")
+
     config = trl.PPOConfig(
         gradient_accumulation_steps = script_args.gradient_accumulation_steps,
         mini_batch_size             = script_args.mini_batch_size,
@@ -242,10 +244,8 @@ def main(
         model_name                  = script_args.model_name,
         batch_size                  = script_args.batch_size,
         log_with                    = script_args.log_with,
-        accelerator_kwargs = dict(kwargs_handlers=
-            [DistributedDataParallelKwargs(
-                find_unused_parameters=True
-            )]
+        accelerator_kwargs = dict(
+            kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]
         )
     )
     if lib_trl_utils.get_rank() == 0:
@@ -267,6 +267,7 @@ def main(
         lora_config_dict = lora_config_dict,
         model_name       = config.model_name,
         precision        = precision,
+        model_type       = model_type,
     )
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), 
@@ -295,8 +296,6 @@ def main(
         verbose          = reward_fn_verbose,
         device           = lib_trl_utils.get_local_rank(),
     )
-    
-
     output_length_sampler = trl.core.LengthSampler(
         output_min_length, 
         output_max_length,
