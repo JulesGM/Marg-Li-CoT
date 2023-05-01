@@ -101,7 +101,6 @@ def init_model(
     precision, 
     model_name: str, 
     lora_config_dict: dict[str, typing.Any],
-    model_type,
 ) -> transformers.PreTrainedModel:
     """
     
@@ -125,12 +124,13 @@ def init_model(
     """
     
     lora_config = peft.LoraConfig(**lora_config_dict)
-    tokenizer = build_tokenizer(model_name)
+    tokenizer   = build_tokenizer(model_name)
+    config      = transformers.AutoConfig.from_pretrained(model_name)
 
     ###########################################################################
     # Model Class Specific Options
     ###########################################################################
-    if model_type == peft.TaskType.CAUSAL_LM:
+    if not config.is_encoder_decoder:
         lora_config.task_type = peft.TaskType.CAUSAL_LM
         transformers_cls      = transformers.AutoModelForCausalLM
         trl_cls               = trl.models.  AutoModelForCausalLMWithValueHead
@@ -139,7 +139,7 @@ def init_model(
         tokenizer.pad_token   = tokenizer.eos_token
         dmap_keys = ["transformer", "lm_head"]
 
-    elif model_type == peft.TaskType.SEQ_2_SEQ_LM:
+    elif config.is_encoder_decoder:
         lora_config.task_type = peft.TaskType.SEQ_2_SEQ_LM
         transformers_cls      = transformers.AutoModelForSeq2SeqLM
         trl_cls               = trl.models.  AutoModelForSeq2SeqLMWithValueHead
@@ -169,7 +169,7 @@ def init_model(
 
         pretrained_model = peft.prepare_model_for_int8_training(
             pretrained_model, 
-            output_embedding_layer_name="lm_head"
+            output_embedding_layer_name = "lm_head"
         )
 
     else:
@@ -218,48 +218,8 @@ def init_model(
     return model, tokenizer
 
 
-def unroll(
-    *,
-    output_length_sampler: typing.Optional[trl.core.LengthSampler],
-    generation_kwargs:     dict[str, typing.Any],
-    ppo_trainer:           trl.PPOTrainer,
-    batch:                 dict[str, IntSequence],
-    model:                 transformers.PreTrainedModel,
-) -> IntSequenceContainer:
-    """
-    Requires 
-    """
-
-    # Unroll the policy
-    model.gradient_checkpointing_disable()
-    model.pretrained_model.config.use_cache = True
-    model.eval()
-
-    response_tensors = []  
-    for query in tqdm(
-        batch["input_ids"], 
-        disable = get_rank() != 0,
-        desc    = "Unrolling policy", 
-    ):
-        if output_length_sampler:
-            gen_len = output_length_sampler()
-            generation_kwargs["max_new_tokens"] = gen_len
-
-        with torch.no_grad():
-            response = ppo_trainer.generate(query, **generation_kwargs)
-        response_tensors.append(response.squeeze())
-    
-    model.train()
-    model.gradient_checkpointing_enable()
-    model.pretrained_model.config.use_cache = False
-    
-    exit()
-    return response_tensors
-
-
 def batched_unroll(
     *,
-    output_length_sampler: typing.Optional[trl.core.LengthSampler],
     generation_batch_size: int,
     generation_kwargs:     dict[str, typing.Any],
     ppo_trainer:           trl.PPOTrainer,
@@ -267,47 +227,41 @@ def batched_unroll(
     batch:                 dict[str, IntSequence],
     model:                 transformers.PreTrainedModel,
 ) -> IntSequenceContainer:
+    
     """
     Requires 
     """
 
-    # Unroll the policy
-    model.gradient_checkpointing_disable()
-    model.pretrained_model.config.use_cache = True
-    model.eval()
-    response_tensors = []
-
-
-    if output_length_sampler:
-        gen_len = output_length_sampler()
-        generation_kwargs["max_new_tokens"] = gen_len
+    assert tokenizer.padding_side == "left", tokenizer.padding_side
 
     model = ppo_trainer.accelerator.unwrap_model(model)
+    responses_list = []
 
     for i in tqdm(
         range(0, len(batch["input_ids"]), generation_batch_size), 
         disable=get_rank() != 0,
         desc="Unrolling",
     ):
+        
+        tokenized = tokenizer(
+            batch["query"][i:i + generation_batch_size],
+            return_tensors = "pt", 
+            truncation     = True,
+            padding        = True, 
+        ).to(get_local_rank())
+        
         responses = model.generate(
-            **tokenizer(
-                batch["query"][i:i + generation_batch_size],
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-            ).to(get_local_rank()),
+            **tokenized,
             **generation_kwargs
         )
-    
-        for response in responses:
-            response_tensors.append(
-                response[response != tokenizer.pad_token_id]
-            )
 
-    model.train()
-    model.gradient_checkpointing_enable()
-    model.pretrained_model.config.use_cache = False
+        if not model.config.is_encoder_decoder:
+            responses = responses[:, tokenized["input_ids"].shape[1]:]
+
+        responses = ppo_trainer.accelerator.gather_for_metrics(responses)
+        responses_list.append(responses)
     
+    response_tensors = torch.cat(responses_list, dim=0)
     return response_tensors
 
 

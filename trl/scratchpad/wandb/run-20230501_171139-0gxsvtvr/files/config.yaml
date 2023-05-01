@@ -1,0 +1,102 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    cli_version: 0.14.0
+    code_path: code/trl/scratchpad/gpt2-sentiment-control.py
+    framework: huggingface
+    huggingface_version: 4.27.4
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    python_version: 3.9.15
+    start_time: 1682975499.613747
+    t:
+      1:
+      - 1
+      - 5
+      - 11
+      - 49
+      - 51
+      - 53
+      - 55
+      - 71
+      2:
+      - 1
+      - 5
+      - 11
+      - 49
+      - 51
+      - 53
+      - 55
+      - 71
+      3:
+      - 13
+      - 16
+      - 23
+      - 24
+      4: 3.9.15
+      5: 0.14.0
+      6: 4.27.4
+      8:
+      - 8
+generation_kwargs:
+  desc: null
+  value:
+    do_sample: true
+    eos_token_id: -1
+    max_new_tokens: 20
+    min_length: -1
+    pad_token_id: 50256
+    top_k: 0.0
+    top_p: 1.0
+ppo_config:
+  desc: null
+  value:
+    learning_rate: 1.41e-05
+    log_with: wandb
+    model_name: lvwerra/gpt2-imdb
+    remove_unused_columns: false
+    steps: 51200
+reward_kwargs:
+  desc: null
+  value:
+    function_to_apply: none
+    top_k: null
+script_kwargs:
+  desc: null
+  value:
+    learning_rate: 1.41e-05
+    model_name: lvwerra/gpt2-imdb
+    name: controled
+    num_steps: 51200
+    pipeline_model_name: lvwerra/distilbert-imdb
+    seed: 0
+    txt_in_len: 5
+    txt_out_len: 20
+trl_ppo_config:
+  desc: null
+  value:
+    adap_kl_ctrl: true
+    batch_size: 256
+    cliprange: 0.2
+    cliprange_value: 0.2
+    gamma: 1
+    gradient_accumulation_steps: 1
+    horizon: 10000
+    init_kl_coef: 0.2
+    lam: 0.95
+    learning_rate: 1.41e-05
+    log_with: wandb
+    max_grad_norm: null
+    mini_batch_size: 1
+    model_name: lvwerra/gpt2-imdb
+    optimize_cuda_cache: false
+    ppo_epochs: 4
+    remove_unused_columns: false
+    seed: 0
+    steps: 51200
+    target: 6
+    total_ppo_epochs: 200
+    tracker_project_name: trl
+    vf_coef: 0.1

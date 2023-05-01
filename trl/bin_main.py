@@ -14,6 +14,7 @@ import typing
 
 import accelerate
 import fire
+
 import numpy as np
 import datasets
 import peft
@@ -55,7 +56,6 @@ DEFAULT_LORA_CONFIG = dict(
     inference_mode = False,
     lora_dropout   = 0.05,
     lora_alpha     = 32,
-    task_type      = peft.TaskType.SEQ_2_SEQ_LM,
     bias           = "none",
     r              = 16,
 )
@@ -130,6 +130,39 @@ def evaluate_or_test(
         
     })
 
+class RewardForwardWrapper:
+    """
+    Meant to work with either a fixed trlAutoModelWithValueHead or a PeftModel
+    """
+    def __init__(self, ppo_trainer_model, ppo_trainer_ref_model):
+        self._ppo_model = ppo_trainer_model
+        self._ppo_ref   = ppo_trainer_ref_model
+
+    def reward_forward_fn(self, *args, **kwargs):
+        peft_mode = (
+            isinstance(self._ppo_model, peft.PeftModel) and 
+            self._ppo_ref is None
+        )
+        ref_mode = (
+            (not isinstance(self._ppo_model, peft.PeftModel)) and 
+            self._ppo_ref is not None
+        )
+
+        assert peft_mode ^ ref_mode
+        rich.print(f"[red bold]{peft_mode = } {ref_mode = }")
+
+        if peft_mode:
+            assert isinstance(self._ppo_model, peft.PeftModel)
+            with self._ppo_model.disable_adapter():
+                with self._ppo_model.no_grad():
+                    return self._ppo_model(*args, **kwargs)
+            
+        elif ref_mode:
+            self._ppo_ref.eval()
+            with self._ppo_ref.no_grad():
+                return self._ppo_ref(*args, **kwargs)
+
+        raise ValueError("Should not be here")
 
 
 def main(
@@ -157,16 +190,16 @@ def main(
     ###########################################################################
     # Find the type of model we are using
     ###########################################################################
-    if "gpt" in model_name.lower():
-        assert lora_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
-        model_type = peft.TaskType.CAUSAL_LM
-    elif "t5" in model_name.lower():
-        assert lora_config_dict["task_type"] == peft.TaskType.SEQ_2_SEQ_LM
-        model_type = peft.TaskType.SEQ_2_SEQ_LM
+    config = transformers.AutoConfig.from_pretrained(model_name)
+    assert "task_type" not in lora_config_dict
+    if not config.is_encoder_decoder:
+        lora_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
+    elif config.is_encoder_decoder:
+        lora_config_dict["task_type"] == peft.TaskType.SEQ_2_SEQ_LM
     else:
         raise ValueError(f"Unknown model type: {model_name}")
 
-    config = trl.PPOConfig(
+    ppo_config_dict = dict(
         gradient_accumulation_steps = gradient_accumulation_steps,
         accelerator_kwargs          = dict(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]),
         mini_batch_size             = mini_batch_size,
@@ -176,13 +209,22 @@ def main(
         log_with                    = log_with,
     )
 
+    config = trl.PPOConfig(
+        **ppo_config_dict,
+    )
+
     if lib_trl_utils.get_rank() == 0:
         wandb.init(
             save_code = True,
-            project   = "trl", 
-            config    = args,
-            entity    = "julesgm", 
+            project   = "trl-main",
+            entity    = "julesgm",
             name      = None,
+            config    = dict(
+                generation_kwargs = generation_kwargs,
+                lora_config_dict  = lora_config_dict,
+                ppo_config_args   = ppo_config_dict,
+                script_args       = args,
+            ),
         )
 
     if dataset_name == lib_data.GSM8K:
@@ -210,9 +252,7 @@ def main(
         lora_config_dict = lora_config_dict,
         model_name       = config.model_name,
         precision        = precision,
-        model_type       = model_type,
     )
-
 
     ###########################################################################
     # Set model name specific flags
@@ -227,24 +267,23 @@ def main(
     ###########################################################################
     # Prep Training
     ###########################################################################
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), 
-        lr=config.learning_rate,
-    )
     ppo_trainer = trl.PPOTrainer(
         config, 
-        model, 
+        model,
         data_collator = collator,
         ref_model     = None,
-        optimizer     = optimizer,
         tokenizer     = tokenizer,
         dataset       = dataset,
     )
+    reward_forward_fn = RewardForwardWrapper(
+        ppo_trainer_model     = ppo_trainer.model,
+        ppo_trainer_ref_model = ppo_trainer.ref_model,
+    )
     metric_accuracy = lib_metric.ScratchpadAnswerAccuracy()
     reward_fn = lib_reward.ScratchpadRewardFn(
-        ref_model = model,
+        ref_model = reward_forward_fn,
+        tokenizer = tokenizer, 
         uses_peft = use_peft,
-        tokenizer = tokenizer,
         metric_fn = metric_accuracy,
     )
     

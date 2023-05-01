@@ -78,14 +78,6 @@ def clone_hf_model(
     return copy
 
 
-# lib_reward.ScratchpadRewardFn(
-#     ref_model = model,
-#     uses_peft = use_peft,
-#     tokenizer = tokenizer,
-#     metric_fn = metric_fn,
-# )
-
-
 class ScratchpadRewardFn:
     def __init__(
         self, *, 
