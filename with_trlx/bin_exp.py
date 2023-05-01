@@ -11,9 +11,13 @@ There are wrappers for GSM8K and for the ASDiv datasets.
 By default, we support the GPT2 model.
 
 """
-
-print("Doing imports.")
 import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["NCCL_DEBUG"]             = "WARN"
+os.environ["DATASETS_VERBOSITY"]     = "warning"
+os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
+
 import collections
 import contextlib
 import enum
@@ -27,26 +31,45 @@ import datasets
 import fire
 import general_utils
 import numpy as np
+import peft
 import rich
 import rich.logging
+import rich.status
 import torch
 import transformers
 import trlx
 import yaml
 from trlx.data.configs import TRLConfig
+from trlx.models.modeling_ppo import AutoModelForSeq2SeqLMWithHydraValueHead
 
 import lib_data
 import lib_metric
 import lib_reward
-print("Done with imports")
+import lib_modeling
 
 
+datasets    .logging.set_verbosity_warning()
+transformers.logging.set_verbosity_warning()
+logging.getLogger("datasets"    ).setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
+logging.getLogger("deepspeed"   ).setLevel(logging.WARNING)
+
+DEFAULT_MODEL_PRECISION = torch.bfloat16
+DEFAULT_INT8_MODE       = True
+DEFAULT_USE_LORA        = True
 DEFAULT_DETERMINISTIC   = False
 DEFAULT_DO_SINGLE_PROC  = False
 DEFAULT_DATASET_TO_USE  = "gsm8k"
-DEFAULT_REWARD_MODEL    = "google/flan-t5-xl"
+DEFAULT_REWARD_MODEL    = "google/flan-t5-xxl"
 DEFAULT_MAIN_MODEL      = DEFAULT_REWARD_MODEL
 DEFAULT_TOKENIZER_MODEL = DEFAULT_REWARD_MODEL
+DEFAULT_PEFT_CONFIG     = dict(
+    r              = 8,
+    lora_alpha     = 32,
+    task_type      = peft.TaskType.SEQ_2_SEQ_LM,
+    lora_dropout   = 0,
+    inference_mode = False,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -70,6 +93,13 @@ assert Path(DEFAULT_PPO_CONFIG_PATH).exists(), (
     f"{DEFAULT_PPO_CONFIG_PATH = }")
 torch.cuda.set_device(LOCAL_RANK)
 
+@contextlib.contextmanager
+def main_status(msg):
+    if os.environ["RANK"] == "0":
+        with rich.status.Status(msg) as status:
+            yield status
+    else:
+        yield
 
 
 class MergedExtraInfo:
@@ -345,6 +375,43 @@ def _setup_config(
     return config
 
 
+def init_model(
+        *, 
+        model_precision, 
+        model_name_or_path, 
+        accelerator_device,
+    ):
+
+    if model_precision in (torch.float16, torch.bfloat16):
+
+        assert model_precision in (
+            torch.bfloat16, torch.float16
+        ), (model_precision)
+        model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+            model_name_or_path, torch_dtype=model_precision
+        )
+    elif model_precision == "int8":
+        dmap_keys = ["encoder", "lm_head", "shared", "decoder"]
+        dmap = {k: accelerator_device for k in dmap_keys}
+        model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+            model_name_or_path, 
+            load_in_8bit = True,
+            torch_dtype  = torch.float16, # Required for 8-bit
+            device_map   = dmap,
+        )
+
+    elif model_precision == torch.float32 or model_precision is None:
+        assert False
+        model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+            model_name_or_path
+        )
+    else:
+        assert False
+        raise ValueError(f"Unknown model precision: {model_precision}")
+    
+    return model
+
+
 def train(
     *,
     reward_model_hf_name_or_path: Optional[str] = DEFAULT_REWARD_MODEL,
@@ -353,16 +420,22 @@ def train(
     model_class_name: str                       = ModelClassChoices.SEQ2SEQ,
     trlx_config_path: Union[Path, str]          = DEFAULT_PPO_CONFIG_PATH,
     val_subset_size: Optional[int]              = None,
+    model_precision: str                        = DEFAULT_MODEL_PRECISION,
     dataset_to_use: str                         = DEFAULT_DATASET_TO_USE,
     do_single_proc: int                         = DEFAULT_DO_SINGLE_PROC,
     deterministic: bool                         = DEFAULT_DETERMINISTIC,
+    peft_config: bool                           = DEFAULT_PEFT_CONFIG,
+    
     log_level: str                              = "INFO",
+    int8_mode: bool                             = DEFAULT_INT8_MODE,
+    use_lora: bool                              = DEFAULT_USE_LORA,
 ):
     # -------------------------------------------------------------------------
     # Logging stuff.
     # -------------------------------------------------------------------------
     args = locals().copy()
     _logging(args=args, log_level=log_level)
+    logging.getLogger("lib_data").setLevel(logging.WARNING)
 
     if RANK == 0:
         rich.print(
@@ -386,15 +459,16 @@ def train(
     # -------------------------------------------------------------------------
     # Dataset
     # -------------------------------------------------------------------------
-    _sanity_check_model_type(model_class_name, reward_model_hf_name_or_path)
-    _sanity_check_model_type(model_class_name, main_model_hf_name_or_path)
-    config_dict = yaml.safe_load(Path(trlx_config_path).read_text())
-    ds_train_obj, ds_eval_obj, reward_tokenizer = _build_dataset(
-        tokenizer_hf_name_or_path  = tokenizer_hf_name_or_path,
-        val_subset_size            = val_subset_size,
-        dataset_to_use             = dataset_to_use,
-        config_dict                = config_dict, 
-    )
+    with main_status("[bold]Building Dataset..."):
+        _sanity_check_model_type(model_class_name, reward_model_hf_name_or_path)
+        _sanity_check_model_type(model_class_name, main_model_hf_name_or_path)
+        config_dict = yaml.safe_load(Path(trlx_config_path).read_text())
+        ds_train_obj, ds_eval_obj, reward_tokenizer = _build_dataset(
+            tokenizer_hf_name_or_path  = tokenizer_hf_name_or_path,
+            val_subset_size            = val_subset_size,
+            dataset_to_use             = dataset_to_use,
+            config_dict                = config_dict, 
+        )
     
     # -------------------------------------------------------------------------
     # Setup Config.
@@ -416,26 +490,53 @@ def train(
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     # -------------------------------------------------------------------------
-    # Metric and Reward.
+    # Model, Metric and Reward.
     # -------------------------------------------------------------------------
     # The metric and the reward need access to the labe.
     # -------------------------------------------------------------------------
     # The metric needs 
     merger = MergedExtraInfo(
         ds_train_obj = ds_train_obj,
-        ds_eval_obj  = ds_eval_obj,
-    )
-    
+        ds_eval_obj  = ds_eval_obj ,)
     metric_accuracy = lib_metric.ScratchpadAnswerAccuracy(
-        extra_info_engine = merger.merged_get_extra_info,
-    )
+        extra_info_engine = merger.merged_get_extra_info)
+    assert main_model_hf_name_or_path == reward_model_hf_name_or_path, (
+        f"For now, the main and reward model must be the same. "
+        f"{main_model_hf_name_or_path} "
+        f"{reward_model_hf_name_or_path}")
+
+    with main_status("[bold]Loading interior model..."):
+        interior_model = init_model(
+            model_precision    = model_precision,
+            accelerator_device = int(os.environ["LOCAL_RANK"]),
+            model_name_or_path = main_model_hf_name_or_path,
+        )
+        assert int8_mode
+
+    with main_status("[bold]Hydra Value Head..."):
+        if use_lora:
+            model = lib_modeling.AutoModelForSeq2SeqLMWithHydraValueHead(
+                interior_model,
+                peft.LoraConfig(**peft_config),
+                int(os.environ["LOCAL_RANK"]),
+            )
+            reward_model_hf_name_or_path = interior_model
+
+        else:
+            assert False
+            model = AutoModelForSeq2SeqLMWithHydraValueHead(
+                interior_model,
+                num_layers_unfrozen=1,
+            )
 
     # Afaik the eval should not need the extra info engine.
     scratchpad_reward_fn = lib_reward.ScratchpadRewardFn(
         reward_model_hf_name_or_path = reward_model_hf_name_or_path,
         get_extra_info_fn            = merger.merged_get_extra_info,
         reward_tokenizer             = reward_tokenizer,
+        use_frozen_head              = True,
         do_single_proc               = do_single_proc,
+        freeze_model                 = False,
         metric_fn                    = metric_accuracy,
     )
 
@@ -444,7 +545,7 @@ def train(
     # -------------------------------------------------------------------------
     model = trlx.train(
         eval_prompts  = list(ds_eval_obj),
-        model_path    = main_model_hf_name_or_path,
+        model_path    = model,
         metric_fn     = metric_accuracy,
         reward_fn     = scratchpad_reward_fn,
         prompts       = list(ds_train_obj),
@@ -453,4 +554,5 @@ def train(
 
 
 if __name__ == "__main__":
-    fire.Fire(train)
+    with torch.autograd.detect_anomaly():
+        fire.Fire(train)
