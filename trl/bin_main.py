@@ -7,7 +7,7 @@ os.environ["DATASETS_VERBOSITY"]     = "warning"
 os.environ["WANDB_SILENT"]           = "true"
 os.environ["NCCL_DEBUG"]             = "WARN"
 
-
+import enum
 import logging
 import random
 import typing
@@ -34,6 +34,8 @@ from accelerate.utils import DistributedDataParallelKwargs
 import lib_data
 import lib_metric
 import lib_reward
+
+from scratchpad import gpt2_sentiment_control
 
 datasets    .logging.set_verbosity_warning()
 transformers.logging.set_verbosity_warning()
@@ -138,7 +140,7 @@ class RewardForwardWrapper:
         self._ppo_model = ppo_trainer_model
         self._ppo_ref   = ppo_trainer_ref_model
 
-    def reward_forward_fn(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs):
         peft_mode = (
             isinstance(self._ppo_model, peft.PeftModel) and 
             self._ppo_ref is None
@@ -164,6 +166,31 @@ class RewardForwardWrapper:
 
         raise ValueError("Should not be here")
 
+def make_sentiment_pipeline(
+    *,
+    pipeline_model_name, 
+    accelerator_num_process, 
+    accelerator_device,
+):
+    if accelerator_num_process == 1:
+        device = 0 if torch.cuda.is_available() else "cpu"  # to avoid a `pipeline` bug
+    else:
+        device = accelerator_device
+
+    assert device != "cpu", "CPU is not supported for sentiment analysis"
+
+    sentiment_pipe = transformers.pipeline(
+        "sentiment-analysis", 
+        pipeline_model_name,
+        device=device)
+    
+    return sentiment_pipe
+
+
+class Task(str, enum.Enum):
+    SENTIMENT = "sentiment"
+    GSM8K = "gsk8k"
+
 
 def main(
     *, 
@@ -182,8 +209,9 @@ def main(
     log_with: str                             = DEFAULT_LOG_WITH,
 
     input_max_length: int                     = 115,
-    dataset_name: str                         = lib_data.GSM8K,
+    task_name: Task                           = Task("sentiment"),
     use_peft: bool                            = DEFAULT_USE_PEFT,
+    name: str                                 = None,
 ):
     args = locals().copy()
 
@@ -213,21 +241,20 @@ def main(
         **ppo_config_dict,
     )
 
-    if lib_trl_utils.get_rank() == 0:
-        wandb.init(
-            save_code = True,
-            project   = "trl-main",
-            entity    = "julesgm",
-            name      = None,
-            config    = dict(
-                generation_kwargs = generation_kwargs,
-                lora_config_dict  = lora_config_dict,
-                ppo_config_args   = ppo_config_dict,
-                script_args       = args,
-            ),
-        )
+    wandb.init(
+        save_code = True,
+        project   = "trl-main",
+        entity    = "julesgm",
+        name      = name,
+        config    = dict(
+            generation_kwargs = generation_kwargs,
+            lora_config_dict  = lora_config_dict,
+            ppo_config_args   = ppo_config_dict,
+            script_args       = args,
+        ),
+    )
 
-    if dataset_name == lib_data.GSM8K:
+    if task_name == Task.GSM8K:
         dataset = lib_data.GSM8K(
             input_max_length, 
             tokenizer, 
@@ -239,14 +266,21 @@ def main(
             datasets.load_dataset("gsm8k", "main", split="test")
         )
         
-    elif dataset_name == lib_data.ASDiv:
+    elif task_name == "asdiv":
         dataset = lib_data.ASDiv(
             input_max_length, 
             tokenizer, 
             datasets.load_dataset("asdiv"),
         )
+
+    elif task_name == Task.SENTIMENT:
+        dataset, tokenizer = gpt2_sentiment_control.prep_dataset(
+            config.model_name, 
+            txt_in_len = 5,
+        )
+
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
+        raise ValueError(f"Unknown task: {task_name}")
 
     model, tokenizer = lib_trl_utils.init_model(
         lora_config_dict = lora_config_dict,
@@ -257,7 +291,7 @@ def main(
     ###########################################################################
     # Set model name specific flags
     ###########################################################################
-    if "gpt" in config.model_name:
+    if not model.config.is_encoder_decoder:
         assert lora_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
         generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
         generation_kwargs["eos_token_id"] = -1
@@ -275,18 +309,42 @@ def main(
         tokenizer     = tokenizer,
         dataset       = dataset,
     )
-    reward_forward_fn = RewardForwardWrapper(
-        ppo_trainer_model     = ppo_trainer.model,
-        ppo_trainer_ref_model = ppo_trainer.ref_model,
-    )
-    metric_accuracy = lib_metric.ScratchpadAnswerAccuracy()
-    reward_fn = lib_reward.ScratchpadRewardFn(
-        ref_model = reward_forward_fn,
-        tokenizer = tokenizer, 
-        uses_peft = use_peft,
-        metric_fn = metric_accuracy,
-    )
+
+    if task_name == Task.GSM8K:
+        reward_forward_fn = RewardForwardWrapper(
+            ppo_trainer_model     = ppo_trainer.model,
+            ppo_trainer_ref_model = ppo_trainer.ref_model,
+        )
+        reward_fn = lib_reward.ScratchpadRewardFn(
+            ref_model = reward_forward_fn,
+            tokenizer = tokenizer, 
+            uses_peft = use_peft,
+            metric_fn = metric_accuracy,
+        )
+
+    elif task_name == Task.SENTIMENT:
+        pipeline = gpt2_sentiment_control.make_reward(
+            pipeline_model_name="lvwerra/distilbert-imdb", 
+            accelerator_num_process=ppo_trainer.accelerator.num_processes,
+            accelerator_device=ppo_trainer.accelerator.device,
+        )
+
+        def reward_fn(prompts, outputs, ref_answers):
+            assert ref_answers is None, "ref_answers should be None with task 'sentiment'"
+            return gpt2_sentiment_control.compute_reward(
+                query_no_ctrl = prompts, 
+                reward_kwargs = pipeline, 
+                generated     = outputs, 
+                reward_fn     = reward_fn, 
+                task_list     = ["positive"] * len(prompts),
+            )
+    else:
+        raise ValueError(f"Unknown task: {task_name}")
     
+    if task_name == Task.GSM8K:
+        metric_accuracy = lib_metric.ScratchpadAnswerAccuracy()
+    elif task_name == Task.SENTIMENT:
+        metric_accuracy = reward_fn
 
     ###########################################################################
     # Training Loop
@@ -294,21 +352,25 @@ def main(
     for epoch in range(num_epochs):
         for batch_idx, batch in tqdm(
             enumerate(ppo_trainer.dataloader), 
-            desc="Training",
+            desc=f"Training - Epoch {epoch}",
             disable=lib_trl_utils.get_rank() != 0
         ):
-            batch["response"] = lib_trl_utils.batched_unroll(
-                generation_batch_size = generation_batch_size,
-                generation_kwargs     = generation_kwargs, 
-                ppo_trainer           = ppo_trainer, 
-                tokenizer             = tokenizer,
-                batch                 = batch,
-                model                 = model,
+            batch["response"], _ = lib_trl_utils.batched_unroll(
+                generation_kwargs = generation_kwargs, 
+                query_tensors     = batch["input_ids"], 
+                ppo_trainer       = ppo_trainer, 
+                tokenizer         = tokenizer,
             )
 
+            if task_name == "sentiment":
+                ref_answers = None
+            else:
+                ref_answers = batch["ref_answer"]
+
             rewards = reward_fn(
-                response_tensors = batch["response"],
-                batch_query      = batch["query"], 
+                prompts     = batch["query"],
+                responses   = batch["response"],
+                ref_answers = ref_answers,
             )
 
             ###########################################################################

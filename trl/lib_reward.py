@@ -16,8 +16,11 @@ import lib_data
 import lib_metric
 import lib_bisect_tokens
 
+
 LOGGER = logging.getLogger(__name__)
-LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+RANK = int(os.getenv("RANK", "0"))
+LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
+WORLD_SIZE = int(os.getenv("WORLD_SIZE", "0"))
 
 
 def global_do_checks(model):

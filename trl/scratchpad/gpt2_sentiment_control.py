@@ -81,6 +81,21 @@ import datasets
 import transformers
 import trl
 
+from pathlib import Path
+import sys
+
+try:
+    import pretty_traceback
+    pretty_traceback.install()
+except ImportError:
+    pass
+
+
+SCRIPT_DIR = Path(__file__).absolute().parent
+sys.path.append(str(SCRIPT_DIR.parent))
+import lib_trl_utils
+
+
 
 def collator(data):
     return dict((key, [d[key] for d in data]) for key in data[0])
@@ -154,6 +169,7 @@ def make_reward(
         "sentiment-analysis", 
         pipeline_model_name,
         device=device)
+    
     return sentiment_pipe
 
 
@@ -165,21 +181,23 @@ def compute_reward(query_no_ctrl, generated, reward_fn, reward_kwargs, task_list
 
 def unroll(
     *,
-    query_tensors, 
-    ppo_trainer, 
     generation_kwargs, 
     gpt2_tokenizer, 
+    query_tensors, 
     txt_out_len,
+    ppo_trainer, 
+    log_header,
 ):
+    
     response_tensors = []
-    for query in tqdm(query_tensors, desc="generating one by one"):
+    for query in tqdm(query_tensors, desc=f"{log_header} Generating one by one"):
         response = ppo_trainer.generate(query, **generation_kwargs)
         response_tensors.append(response.squeeze()[-txt_out_len:])
         
-    return [
-        gpt2_tokenizer.decode(r.squeeze()) 
-        for r in response_tensors
-    ], response_tensors
+    return (
+        gpt2_tokenizer.batch_decode(response_tensors), 
+        response_tensors,
+    )
 
 
 def per_ctrl_stats(ctrl_str, rewards, task_list):
@@ -195,23 +213,24 @@ def per_ctrl_stats(ctrl_str, rewards, task_list):
 
 def main(
     pipeline_model_name = "lvwerra/distilbert-imdb",
-    learning_rate       = "1.41e-5",
+    learning_rate       = 1.41e-5,
     txt_out_len         = 20,
     txt_in_len          = 5,
     model_name          = "lvwerra/gpt2-imdb",
     num_steps           = 51200,
     seed                = 0,
     name                = None,
+    qty_print           = 6,
+    use_new_unroll      = True,
 ):
-    script_kwargs = locals().copy()
+    
 
+    script_kwargs = locals().copy()
     np.random.seed(seed)
     reward_kwargs = {
         "function_to_apply": "none",
         "top_k":              None, 
     }
-
-
     ppo_trainer_config_dict = dict(
         remove_unused_columns = False, 
         learning_rate         = learning_rate,
@@ -219,13 +238,8 @@ def main(
         log_with              = "wandb",
         steps                 = num_steps,
     )
-
-    config = trl.PPOConfig(
-        **ppo_trainer_config_dict
-    )
-
+    config = trl.PPOConfig(**ppo_trainer_config_dict)
     dataset, gpt2_tokenizer = prep_dataset(config.model_name, txt_in_len)
-
     generation_kwargs = {
         "max_new_tokens": txt_out_len,
         "pad_token_id":   gpt2_tokenizer.eos_token_id,
@@ -252,18 +266,18 @@ def main(
     gpt2_model_ref = trl.create_reference_model(gpt2_model)
 
     ppo_trainer = trl.PPOTrainer(
-        tokenizer     = gpt2_tokenizer, 
-        dataset       = dataset, 
-        model_ref     = gpt2_model_ref, 
         data_collator = collator,
+        tokenizer     = gpt2_tokenizer, 
+        ref_model     = gpt2_model_ref, 
+        dataset       = dataset, 
         model         = gpt2_model, 
-        **ppo_trainer_config_dict
+        config        = config,
     )
 
     reward_model = make_reward(
-        pipeline_model_name=pipeline_model_name, 
-        accelerator_num_process=ppo_trainer.accelerator.num_processes, 
-        accelerator_device=ppo_trainer.accelerator.device,
+        accelerator_num_process = ppo_trainer.accelerator.num_processes, 
+        pipeline_model_name     = pipeline_model_name, 
+        accelerator_device      = ppo_trainer.accelerator.device,
     )
 
 
@@ -271,15 +285,21 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
     assert device.type == "cuda", device.type
     ctrl_tokens = {
-        "s": 
-        gpt2_tokenizer.encode(s, return_tensors="pt").squeeze().to(device) 
+        s: gpt2_tokenizer.encode(s, return_tensors="pt").squeeze().to(device) 
         for s in ctrl_str
     }
 
     for epoch in range(2):
+        for model in [ppo_trainer.model, ppo_trainer.ref_model]:
+            if model:
+                for param_name, param in model.named_parameters():
+                    assert param.device.type == "cuda", f"{param_name} {param.device.type}"
+        
         for batch_idx, batch in enumerate(
-            tqdm(ppo_trainer.dataloader), 
-            desc=f"Epoch {epoch} - Training Loop"
+            tqdm(
+                ppo_trainer.dataloader, 
+                desc=f"Epoch {epoch} - Training Loop"
+            )
         ):
             
             logs = dict()
@@ -294,13 +314,23 @@ def main(
             ]
 
             #### get response from gpt2
-            game_data["response"], response_tensors = unroll(
-                generation_kwargs = generation_kwargs, 
-                gpt2_tokenizer    = gpt2_tokenizer, 
-                query_tensors     = query_tensors, 
-                ppo_trainer       = ppo_trainer, 
-                txt_out_len       = txt_out_len,
-            )
+            if use_new_unroll:
+                response_tensors, game_data["response"] = lib_trl_utils.batched_unroll(
+                    generation_kwargs = generation_kwargs, 
+                    query_tensors     = query_tensors, 
+                    ppo_trainer       = ppo_trainer, 
+                    tokenizer         = gpt2_tokenizer, 
+                )
+
+            else:
+                game_data["response"], response_tensors = unroll(
+                    generation_kwargs = generation_kwargs, 
+                    gpt2_tokenizer    = gpt2_tokenizer, 
+                    query_tensors     = query_tensors, 
+                    ppo_trainer       = ppo_trainer, 
+                    txt_out_len       = txt_out_len,
+                    log_header        = f"(e{epoch}b{batch_idx})"
+                )
 
             #### sentiment analysis
             rewards = compute_reward(
@@ -311,8 +341,23 @@ def main(
                 task_list     = task_list,
             )
 
+            #### print table
+            lib_trl_utils.print_table(
+                log_header = f"(e{epoch}b{batch_idx})", 
+                response   = game_data["response"],
+                queries    = game_data["query"], 
+                tasks      = None,
+                name       = name,
+                qty        = qty_print,
+                rewards    = rewards,
+            )
+
             #### Run PPO training
-            stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+            stats = ppo_trainer.step(
+                queries   = query_tensors, 
+                responses = response_tensors, 
+                scores    = rewards,
+            )
 
             #### Add per ctrl stats
             stats = dict(**stats, **per_ctrl_stats(

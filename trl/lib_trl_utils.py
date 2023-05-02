@@ -1,5 +1,6 @@
 import collections
 import enum
+import itertools
 import os
 import typing
 
@@ -39,6 +40,41 @@ IntSequenceContainer = typing.TypeVar(
     list[torch.LongTensor], 
     list[list[int]],
 )
+
+
+def print_table(
+    *,
+    name:       str, 
+    log_header: bool, 
+    queries:    list[str],
+    response:   list[str],
+    qty:        int,
+    rewards:    list[float], 
+    tasks:      typing.Optional[list[str]] = None,
+):
+
+    table = rich.table.Table(
+        "Query", 
+        "Response", 
+        "Task", 
+        title=f"{name} - {log_header} - Samples:",
+        show_lines=True,
+    )
+    if tasks:
+        assert len(tasks) == len(queries) == len(response), (
+            f"{len(tasks) = } != {len(queries) = } != {len(response) = }")
+        
+        for t, q, resp, rew in itertools.islice(zip(tasks, queries, response, rewards), qty):
+            table.add_row(t, q, f"[black on white]{resp}", f"{rew:0.3}")
+
+    else:
+        assert len(queries) == len(response), (
+            f"{len(queries) = } != {len(response) = }")
+        
+        for q, resp, rew in itertools.islice(zip(queries, response, rewards), qty):
+            table.add_row(f"[black on white]{q}", f"[black on white]{resp}", f"{rew:0.3}")
+    
+    rich.print(table)
 
 
 def build_tokenizer(model_name):
@@ -98,9 +134,10 @@ def print_trainable_parameters(
 
 def init_model(
     *, 
-    precision, 
     model_name: str, 
-    lora_config_dict: dict[str, typing.Any],
+    use_peft: bool,
+    peft_config_dict: dict[str, typing.Any],
+    precision = None, 
 ) -> transformers.PreTrainedModel:
     """
     
@@ -123,7 +160,9 @@ def init_model(
         
     """
     
-    lora_config = peft.LoraConfig(**lora_config_dict)
+    assert precision in [None, torch.bfloat16, torch.float32], precision
+
+    lora_config = peft.LoraConfig(**peft_config_dict)
     tokenizer   = build_tokenizer(model_name)
     config      = transformers.AutoConfig.from_pretrained(model_name)
 
@@ -131,23 +170,16 @@ def init_model(
     # Model Class Specific Options
     ###########################################################################
     if not config.is_encoder_decoder:
-        lora_config.task_type = peft.TaskType.CAUSAL_LM
+        assert lora_config.task_type == peft.TaskType.CAUSAL_LM
         transformers_cls      = transformers.AutoModelForCausalLM
         trl_cls               = trl.models.  AutoModelForCausalLMWithValueHead
-        transformers.GPTNeoForCausalLM
-
         tokenizer.pad_token   = tokenizer.eos_token
         dmap_keys = ["transformer", "lm_head"]
 
     elif config.is_encoder_decoder:
-        lora_config.task_type = peft.TaskType.SEQ_2_SEQ_LM
+        assert lora_config.task_type == peft.TaskType.SEQ_2_SEQ_LM
         transformers_cls      = transformers.AutoModelForSeq2SeqLM
         trl_cls               = trl.models.  AutoModelForSeq2SeqLMWithValueHead
-        transformers.T5ForConditionalGeneration
-
-        assert "t5" in model_name.lower(), model_name
-        dmap_keys = ["encoder", "decoder", "lm_head", "shared"]
-
     else:
         raise ValueError(model_name)
 
@@ -173,95 +205,67 @@ def init_model(
         )
 
     else:
-        assert precision in [torch.float16, torch.bfloat16], precision 
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
             torch_dtype=precision,
         )
-
-    ###########################################################################
-    # Model Instance Specific Fixes
-    ###########################################################################
-    if "gpt-neox" in model_name.lower():
-        assert False
-        # workaround to use 8bit training on this model
-        # hacky workaround due to issues with "EleutherAI/gpt-neox-20b"
-        lora_config.target_modules = ["query_key_value", "xxx"]  
-
-        for name, param in pretrained_model.named_parameters():
-            # freeze base model's layers
-            param.requires_grad = False
-
-            if getattr(pretrained_model, "is_loaded_in_8bit", False):
-                # cast layer norm in fp32 for stability for 8bit models
-                if param.ndim == 1 and "layer_norm" in name:
-                    param.data = param.data.to(torch.float16)
     
     ###########################################################################
     # 
     ###########################################################################
-    peft_model = peft.get_peft_model(pretrained_model, lora_config,)
+    if use_peft:
+        assert False
+        pretrained_model = peft.get_peft_model(pretrained_model, lora_config,)
 
     if precision == "int8":
-        model = trl_cls.from_pretrained(peft_model)
+        assert False
+        model = trl_cls.from_pretrained(pretrained_model)
     else:
-        peft_model.to(precision)
-        model = trl_cls.from_pretrained(peft_model, torch_dtype=precision)
-        model.to(precision)
+        model = trl_cls.from_pretrained(pretrained_model, torch_dtype=precision)
 
     model.gradient_checkpointing_disable = model.pretrained_model.gradient_checkpointing_disable
     model.gradient_checkpointing_enable  = model.pretrained_model.gradient_checkpointing_enable
-    print_trainable_parameters(model)
-
-    assert print_trainable_parameters(model, False) > 0
+    output = print_trainable_parameters(model, True)
+    assert output > 0
 
     return model, tokenizer
 
 
 def batched_unroll(
     *,
-    generation_batch_size: int,
     generation_kwargs:     dict[str, typing.Any],
+    query_tensors:         list[torch.Tensor],
     ppo_trainer:           trl.PPOTrainer,
     tokenizer:             transformers.PreTrainedTokenizer,
-    batch:                 dict[str, IntSequence],
-    model:                 transformers.PreTrainedModel,
-) -> IntSequenceContainer:
+) -> tuple[str, torch.Tensor]:
     
     """
     Requires 
     """
 
+    model = ppo_trainer.accelerator.unwrap_model(ppo_trainer.model)
+
+    # Assignment in python can create new attributes
+    # so we make sure that it existed before
+    assert hasattr(tokenizer, "padding_side"), tokenizer
+    tokenizer.padding_side = "left"
+
     assert tokenizer.padding_side == "left", tokenizer.padding_side
 
-    model = ppo_trainer.accelerator.unwrap_model(model)
-    responses_list = []
-
-    for i in tqdm(
-        range(0, len(batch["input_ids"]), generation_batch_size), 
-        disable=get_rank() != 0,
-        desc="Unrolling",
-    ):
-        
-        tokenized = tokenizer(
-            batch["query"][i:i + generation_batch_size],
-            return_tensors = "pt", 
-            truncation     = True,
-            padding        = True, 
-        ).to(get_local_rank())
-        
-        responses = model.generate(
-            **tokenized,
-            **generation_kwargs
-        )
-
-        if not model.config.is_encoder_decoder:
-            responses = responses[:, tokenized["input_ids"].shape[1]:]
-
-        responses = ppo_trainer.accelerator.gather_for_metrics(responses)
-        responses_list.append(responses)
+    tokenized = tokenizer.pad(
+        dict(input_ids=query_tensors),
+        return_tensors = "pt", 
+        padding        = True, 
+    ).to(get_local_rank())
     
-    response_tensors = torch.cat(responses_list, dim=0)
-    return response_tensors
+    responses = model.generate(
+        **tokenized,
+        **generation_kwargs
+    )
+
+    if not model.config.is_encoder_decoder:
+        responses = responses[:, tokenized["input_ids"].shape[1]:]
+    
+    return [x for x in responses], tokenizer.batch_decode(responses)
 
 

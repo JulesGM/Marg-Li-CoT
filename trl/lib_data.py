@@ -22,8 +22,8 @@ import wget
 from text2digits import text2digits
 
 LOGGER = logging.getLogger(__name__)
-RANK = int(os.environ["RANK"])
-WORLD_SIZE = int(os.environ["WORLD_SIZE"])
+RANK = int(os.getenv("RANK", "0"))
+WORLD_SIZE = int(os.getenv("WORLD_SIZE", "0"))
 
 class MovingAverage:
     def __init__(self, window_size: int):

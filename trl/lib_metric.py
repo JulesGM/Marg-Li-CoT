@@ -19,8 +19,8 @@ import lib_data
 
 
 LOGGER = logging.getLogger(__name__)
-RANK = int(os.environ["RANK"])
-LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+RANK = int(os.getenv("RANK", "0"))
+WORLD_SIZE = int(os.getenv("WORLD_SIZE", "0"))
 
 
 class ScratchpadAnswerAccuracy:
