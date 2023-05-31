@@ -3,27 +3,61 @@ import enum
 import itertools
 import os
 import typing
+from dataclasses import dataclass
 
+import more_itertools
+import numpy as np
 import peft
 import rich
+import rich.table
 import torch
 import transformers
+from beartype import beartype
 from tqdm import tqdm
 
+import lib_sentiment_specific
 import trl
 import trl.core
 import trl.models
 
 
-def get_rank():
+@beartype
+@dataclass
+class BatchedUnrollReturn:
+    response_tensors: list[torch.Tensor]
+    response_text:    list[str]
+
+    @beartype
+    @dataclass
+    class IndivualReturn:
+        response_tensor: torch.Tensor
+        response_text:   str
+
+    def __len__(self):
+        assert len(self.response_tensors) == len(self.response_text), (
+            f"{len(self.response_tensors) = } "
+            f"{len(self.response_text) = } "
+        )
+        return len(self.response_tensors)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self.IndivualReturn(
+                response_tensor = self.response_tensors[i],
+                response_text   = self.response_text[i], 
+            )
+
+
+
+def get_rank() -> int:
     return int(os.getenv("RANK", "0"))
 
 
-def get_local_rank():
+def get_local_rank() -> int:
     return int(os.getenv("LOCAL_RANK", "0"))
 
 
-def get_world_size():
+def get_world_size() -> int:
     return int(os.getenv("WORLD_SIZE", "1"))
 
 
@@ -42,43 +76,159 @@ IntSequenceContainer = typing.TypeVar(
 )
 
 
+def keep_good_one_generation(
+        *, 
+        num_return_seq: int,
+        other_rewards:  typing.Optional[torch.Tensor], 
+        generations:    BatchedUnrollReturn, 
+        ref_answers:    typing.Union[list[list[str]], torch.Tensor], 
+        extract_fn:     typing.Callable,
+        batch_size:     int,
+        tokenizer:      typing.Optional[transformers.PreTrainedTokenizerBase],
+    ) -> BatchedUnrollReturn:
+
+    """
+
+    Return the index of the generation with the:
+        - Max reward of the generations with good answers if there is one
+        - Max reward of the generations with bad  answers otherwise
+        
+    """
+    assert isinstance(generations, BatchedUnrollReturn), type(
+        generations)
+    
+    array_response_text = np.array(
+        generations.response_text, 
+        dtype=object,
+    ).reshape((batch_size, num_return_seq))
+    
+    array_response_tensors = torch.stack(
+        typing.cast(list[torch.Tensor], generations.response_tensors), dim=0
+    ).reshape((
+        batch_size, 
+        num_return_seq, 
+        generations.response_tensors[0].shape[-1],
+    ))
+
+    del generations
+
+    assert isinstance(ref_answers[0][0], str), type(
+        ref_answers[0][0])
+
+    selections = []
+    for b_idx in range(batch_size):
+        ref_comparable = extract_fn(ref_answers[b_idx])
+        generated_answers = [extract_fn(gen) for gen in array_response_text[b_idx]]
+        goods = [ref_comparable == gen for gen in generated_answers]
+        goods_str = " ".join([f"[green]{g}[/]" if g else str(g) for g in goods])
+        ratio = np.mean(np.array(goods, dtype=np.float32))
+
+        table = rich.table.Table("Name", "Value", show_lines=True)
+        # table.add_row("[bold white on red]Ref Answer",        f"{ref_answers[b_idx]}")
+        table.add_row("[bold white on red]Ref Comparable",    f"{ref_comparable}")
+        table.add_row("[bold white on red]Generated answers", f"{generated_answers}")
+        table.add_row("[bold white on red]Comparaisons",      f"{goods_str}")
+        table.add_row("[bold white on red]Ratio",             f"[green]{ratio:0.2%}[/] or [green]{np.sum(goods)}[/]/[green]{len(goods)}[/]")
+        rich.print(table)
+
+        if any(goods):
+            # Return the good with the max other reward
+            good_idx = [i for i, g in enumerate(goods) if g]
+            if other_rewards:
+                good_rewards = other_rewards[b_idx][torch.tensor(good_idx)]
+                selection = torch.argmax(good_rewards)
+            else:
+                good_idx_id = torch.randint(0, len(good_idx), (1,))
+                selection = good_idx[good_idx_id]
+        else:
+            # Return the one with the max other reward
+            if other_rewards:
+                selection = torch.argmax(other_rewards[b_idx])
+            else:
+                selection = torch.randint(0, num_return_seq, (1,))[0]        
+        selections.append(selection)
+
+    selections = torch.tensor(selections)
+
+    assert selections.shape == (batch_size,), (
+        f"{selections.shape = } {batch_size = }"
+    )
+
+    output_generations_text = []
+    output_generations_tensors = []
+    for idx in range(batch_size):
+        output_generations_text.append(
+            array_response_text[idx][selections[idx]])
+        output_generations_tensors.append(
+            array_response_tensors[idx][selections[idx]])
+
+    return BatchedUnrollReturn(
+        response_text    = output_generations_text,
+        response_tensors = output_generations_tensors,
+    )
+
+
 def print_table(
     *,
-    name:       str, 
-    log_header: bool, 
-    queries:    list[str],
-    response:   list[str],
-    qty:        int,
-    rewards:    list[float], 
-    tasks:      typing.Optional[list[str]] = None,
+    extra_columns: typing.Optional[dict[str, list]] = None,
+    log_header:    str, 
+    responses:     list[str],
+    queries:       list[str],
+    rewards:       list[float],
+    name:          str, 
+    qty:           int,
+    
+    # queries_ids:   list[list[int]],
+    # responses_ids: list[list[int]],
+    # model: trl.AutoModelForSeq2SeqLMWithValueHead = None,
 ):
+    
+    # queries_ids_qty = queries_ids[:qty]
+    # responses_ids_qty = responses_ids[:qty]
+    # values = model.v_head(responses_ids_qty, queries_ids_qty).tolist()
+
+    if extra_columns is None:
+        extra_columns = {}
+
+    assert len(rewards) == len(responses) == len(queries), (
+        f"{len(rewards) = } {len(responses) = } {len(queries) = }")
+    
+    for k, v in extra_columns.items():
+        assert len(v) == len(rewards), (
+            f"{k = } {len(v) = } {len(rewards) = }")
 
     table = rich.table.Table(
         "Query", 
         "Response", 
-        "Task", 
-        title=f"{name} - {log_header} - Samples:",
-        show_lines=True,
+        "Reward",
+        *extra_columns.keys(), 
+        show_lines = True,
+        title      = f"{name} - {log_header} - Samples:",
     )
-    if tasks:
-        assert len(tasks) == len(queries) == len(response), (
-            f"{len(tasks) = } != {len(queries) = } != {len(response) = }")
-        
-        for t, q, resp, rew in itertools.islice(zip(tasks, queries, response, rewards), qty):
-            table.add_row(t, q, f"[black on white]{resp}", f"{rew:0.3}")
 
-    else:
-        assert len(queries) == len(response), (
-            f"{len(queries) = } != {len(response) = }")
-        
-        for q, resp, rew in itertools.islice(zip(queries, response, rewards), qty):
-            table.add_row(f"[black on white]{q}", f"[black on white]{resp}", f"{rew:0.3}")
-    
+    for query, response, reward, *extra in itertools.islice(
+        more_itertools.zip_equal(
+            queries, 
+            responses, 
+            rewards, 
+            *extra_columns.values(),
+        ), qty,
+    ):
+        table.add_row(
+            f"[black on white]{query}", 
+            f"[black on white]{response}", 
+            f"{reward:0.3}",
+            *map(str, extra),
+        )
+
     rich.print(table)
 
 
-def build_tokenizer(model_name):
-    tok = transformers.AutoTokenizer.from_pretrained(model_name, padding_side="left")
+def build_tokenizer(model_name: str) -> transformers.PreTrainedTokenizerBase:
+    tok = transformers.AutoTokenizer.from_pretrained(
+        model_name, 
+        padding_side="left",
+    )
     
     if "gpt" in model_name.lower():
         tok.pad_token = tok.eos_token
@@ -86,7 +236,7 @@ def build_tokenizer(model_name):
     return tok
 
 
-def check_all_start_with_token_id(tensors: IntSequence, token_id: int):
+def check_all_start_with_token_id(tensors, token_id: int):
     """
     Description: Makes sure all the tensors in the list start with the same token id.
     
@@ -132,13 +282,20 @@ def print_trainable_parameters(
     return trainable_params
 
 
+
 def init_model(
     *, 
     model_name: str, 
     use_peft: bool,
     peft_config_dict: dict[str, typing.Any],
     precision = None, 
-) -> transformers.PreTrainedModel:
+) -> tuple[
+    typing.Union[
+        trl.models.AutoModelForCausalLMWithValueHead, 
+        trl.models.AutoModelForSeq2SeqLMWithValueHead
+    ],
+    transformers.PreTrainedTokenizerBase,
+]:
     """
     
     Description: Initializes the model, tokenizer, and LoRA config, & does the precision stuff.
@@ -160,7 +317,12 @@ def init_model(
         
     """
     
-    assert precision in [None, torch.bfloat16, torch.float32], precision
+    assert precision in [
+        None, "int8", torch.float16, torch.bfloat16, torch.float32
+    ], precision
+
+    if precision is None:
+        precision = torch.float32
 
     lora_config = peft.LoraConfig(**peft_config_dict)
     tokenizer   = build_tokenizer(model_name)
@@ -171,15 +333,21 @@ def init_model(
     ###########################################################################
     if not config.is_encoder_decoder:
         assert lora_config.task_type == peft.TaskType.CAUSAL_LM
-        transformers_cls      = transformers.AutoModelForCausalLM
-        trl_cls               = trl.models.  AutoModelForCausalLMWithValueHead
-        tokenizer.pad_token   = tokenizer.eos_token
+        transformers_cls    = transformers.AutoModelForCausalLM
+        trl_cls             = trl.models.  AutoModelForCausalLMWithValueHead
+        tokenizer.pad_token = tokenizer.eos_token
         dmap_keys = ["transformer", "lm_head"]
+        output_layer_name     = "lm_head"
 
     elif config.is_encoder_decoder:
+        assert not ((config.model_type == "t5") and (precision == torch.float16)), (
+            "fp16 doesn't work with t5")
         assert lora_config.task_type == peft.TaskType.SEQ_2_SEQ_LM
         transformers_cls      = transformers.AutoModelForSeq2SeqLM
         trl_cls               = trl.models.  AutoModelForSeq2SeqLMWithValueHead
+        dmap_keys             = ["decoder", "encoder", "lm_head", "shared"]
+        output_layer_name     = "lm_head"
+
     else:
         raise ValueError(model_name)
 
@@ -192,17 +360,12 @@ def init_model(
         pretrained_model = transformers_cls.from_pretrained(
             model_name, 
             load_in_8bit = True, 
-            device_map   = dmap
+            device_map   = dmap,
         )
         # https://github.com/huggingface/peft/blob/main/src/peft/utils/other.py#L35
         # Casts the layer norm to fp32 for stability purposes
         # Upcasts lm_head to fp32 for stability purposes
         # Make the output embedding layer require grads 
-
-        pretrained_model = peft.prepare_model_for_int8_training(
-            pretrained_model, 
-            output_embedding_layer_name = "lm_head"
-        )
 
     else:
         pretrained_model = transformers_cls.from_pretrained(
@@ -210,22 +373,44 @@ def init_model(
             torch_dtype=precision,
         )
     
-    ###########################################################################
-    # 
-    ###########################################################################
+    # Peft-ize the model
     if use_peft:
-        assert False
-        pretrained_model = peft.get_peft_model(pretrained_model, lora_config,)
+        if precision == "int8":
+            pretrained_model = peft.prepare_model_for_int8_training(
+                pretrained_model,
+                output_embedding_layer_name = output_layer_name,
+            )
+        pretrained_model = peft.get_peft_model(
+            pretrained_model, lora_config,
+        )
 
+    # Initialize the trl model
     if precision == "int8":
-        assert False
-        model = trl_cls.from_pretrained(pretrained_model)
+        model = trl_cls.from_pretrained(
+            pretrained_model,
+        )
     else:
-        model = trl_cls.from_pretrained(pretrained_model, torch_dtype=precision)
+        model = trl_cls.from_pretrained(
+            pretrained_model, 
+            torch_dtype=precision,
+        )
 
-    model.gradient_checkpointing_disable = model.pretrained_model.gradient_checkpointing_disable
-    model.gradient_checkpointing_enable  = model.pretrained_model.gradient_checkpointing_enable
+    # Set the precision of the value head
+    if precision != torch.float32 and precision != "int8":
+        model = model.to(precision)
+
+    model.gradient_checkpointing_disable = typing.cast(
+        transformers.PreTrainedModel, 
+        model.pretrained_model,
+    ).gradient_checkpointing_disable
+
+    model.gradient_checkpointing_enable  = typing.cast(
+        transformers.PreTrainedModel, 
+        model.pretrained_model,
+    ).gradient_checkpointing_enable
+
     output = print_trainable_parameters(model, True)
+
     assert output > 0
 
     return model, tokenizer
@@ -236,36 +421,46 @@ def batched_unroll(
     generation_kwargs:     dict[str, typing.Any],
     query_tensors:         list[torch.Tensor],
     ppo_trainer:           trl.PPOTrainer,
-    tokenizer:             transformers.PreTrainedTokenizer,
-) -> tuple[str, torch.Tensor]:
+    tokenizer:             transformers.PreTrainedTokenizerBase,
+) -> BatchedUnrollReturn:
     
     """
     Requires 
     """
-
-    model = ppo_trainer.accelerator.unwrap_model(ppo_trainer.model)
-
+    model: transformers.PreTrainedModel = typing.cast(
+        transformers.PreTrainedModel,
+        ppo_trainer.accelerator.unwrap_model(ppo_trainer.model)
+    )
     # Assignment in python can create new attributes
     # so we make sure that it existed before
     assert hasattr(tokenizer, "padding_side"), tokenizer
     tokenizer.padding_side = "left"
-
     assert tokenizer.padding_side == "left", tokenizer.padding_side
 
     tokenized = tokenizer.pad(
-        dict(input_ids=query_tensors),
+        dict(input_ids=typing.cast(
+            transformers.tokenization_utils.EncodedInput, 
+            query_tensors,
+        )),
         return_tensors = "pt", 
         padding        = True, 
-    ).to(get_local_rank())
-    
+    ).to(torch.device(get_local_rank()))
+
     responses = model.generate(
         **tokenized,
-        **generation_kwargs
+        **generation_kwargs,
     )
 
     if not model.config.is_encoder_decoder:
-        responses = responses[:, tokenized["input_ids"].shape[1]:]
+        seq_len = typing.cast(
+            torch.Tensor, 
+            tokenized["input_ids"],
+        ).shape[1]
+        responses = responses[:, seq_len:]
     
-    return [x for x in responses], tokenizer.batch_decode(responses)
+    return BatchedUnrollReturn(
+        response_tensors = list(responses),
+        response_text    = tokenizer.batch_decode(responses),
+    )
 
 

@@ -2,15 +2,15 @@ import bisect
 import collections
 import copy
 import logging
+import re
+import time
 
 import fire
 import numpy as np
 import rich
 import rich.logging
-import time
 import torch
 import transformers
-import re
 
 LOGGER = logging.getLogger(__name__)
 

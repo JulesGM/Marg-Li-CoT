@@ -9,13 +9,18 @@ import accelerate
 import general_utils
 import more_itertools
 import numpy as np
+import peft
+import rich
+import rich.console
 import torch
+import torch.cuda.amp
+import torch.distributed
 import transformers
 
+import lib_base_classes
+import lib_bisect_tokens
 import lib_data
 import lib_metric
-import lib_bisect_tokens
-
 
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
@@ -65,10 +70,12 @@ def _maybe_frozen_head(model, input_dict, use_frozen_head):
             return model(**input_dict)
     return model(**input_dict)
 
-def _maybe_autocast(model_or_fn, dtype):
+
+def _maybe_autocast(model_or_fn: typing.Callable, dtype: torch.dtype):
     if dtype is None:
         return model_or_fn
-    return torch.cuda.amp.autocast(dtype=dtype)(model_or_fn)
+    return torch.autocast( # type: ignore
+        device_type="cuda", dtype=dtype)(model_or_fn)
 
 
 def clone_hf_model(
@@ -78,37 +85,41 @@ def clone_hf_model(
     assert isinstance(hf_model, transformers.PreTrainedModel), type(hf_model)
     copy = type(hf_model)(hf_model.config)
     copy.load_state_dict(hf_model.state_dict())
+
     return copy
 
 
-class ScratchpadRewardFn:
+class ScratchpadRewardFn(lib_base_classes.Reward):
     def __init__(
         self, *, 
-        ref_model: typing.Union[str, transformers.PreTrainedModel],
+        ref_model_is_encoder_decoder: bool,
+        ref_inference_fn: typing.Callable,
+        inputs_device: torch.device,
         tokenizer: transformers.PreTrainedTokenizerBase, 
-        uses_peft: bool,
-        metric_fn,
+        metric_fn: typing.Callable,
     ):
         super().__init__()
-        
-        #----------------------------------------------------------------
-        # Build Models
-        #----------------------------------------------------------------
-        reward_model = ref_model
 
         #----------------------------------------------------------------
         # Set Attributes
         #----------------------------------------------------------------
-        self._show_answer_replacement = False
-        self._reward_tokenizer        = tokenizer
-        self._no_answer_rate          = lib_data.MovingAverage(10000)
-        self._model                   = reward_model.eval()
-        self._conv_to_num             = lib_data.ConvToNum()
-        self._metric                  = metric_fn
-        self._uses_peft               = uses_peft
+        self._ref_model_is_encoder_decoder = ref_model_is_encoder_decoder
+        self._show_answer_replacement      = False
+        self._reward_tokenizer             = tokenizer
+        self._ref_inference_fn             = ref_inference_fn
+        self._no_answer_rate               = lib_data.MovingAverage(10000)
+        self._inputs_device                = inputs_device
+        self._conv_to_num                  = lib_data.ConvToNum()
+        self._tokenizer                    = tokenizer
+        self._metric                       = metric_fn
 
-    
-    def __call__(self, prompts, samples, outputs, ref_answers):
+    def __call__(
+        self,
+        *,
+        queries: list[str],
+        responses: list[str],
+        ref_answers: list[str],
+    ):
         # The idea is to:
         # 1. Extract the associated answers & tokenize the answers
         # 2. Create a mask for the answers
@@ -122,11 +133,16 @@ class ScratchpadRewardFn:
         # - Sanity checks 
         # - Varia prep
         #######################################################################
-        output = np.mean(self._metric(prompts, samples, outputs)["em_accuracy"])
-        LOGGER.info(f"[red bold]REWARD - INSTANT PER BATCH METRIC ACC: {output = :0.2%}")
+        output = np.mean(self._metric(
+            queries     = queries,
+            responses   = responses,
+            ref_answers = ref_answers,
+        )["em_accuracy"])
+        
+        rich.print(f"[red bold]REWARD - INSTANT PER BATCH METRIC ACC: {output = :0.2%}")
 
         # Get the answers.
-        question_tok = self._tokenizer(prompts, padding=True, return_tensors="pt")
+        question_tok = self._tokenizer(queries, padding=True, return_tensors="pt")
 
         timer_flags = dict(
             disable         = True,
@@ -149,7 +165,7 @@ class ScratchpadRewardFn:
         timer = general_utils.ctx_timeit
         with timer("Replacing the number words by digits", **timer_flags):
             for i, (output, ref_answer) in enumerate(
-                more_itertools.zip_equal(outputs, ref_answers)
+                more_itertools.zip_equal(responses, ref_answers)
             ):
                 scratchpads.append(self.replace_answer(
                     original_generation = self._conv_to_num(output), 
@@ -174,8 +190,8 @@ class ScratchpadRewardFn:
                 )
             )
         
-        assert (torch.cuda.current_device() == torch.distributed.get_rank()), (
-            torch.cuda.current_device(), torch.distributed.get_rank())
+        assert (torch.cuda.current_device() == RANK), (
+            torch.cuda.current_device(), RANK)
         assert len(start_end_outputs) == len(scratchpads), (
             f"{len(start_end_outputs) = }, {len(scratchpads) = }")
         
@@ -199,7 +215,7 @@ class ScratchpadRewardFn:
                         for token, m in zip(scratchpad_ids, mask)
                     ]).replace("<pad>", "")
 
-                    LOGGER.info(
+                    rich.print(
                         f"[bold blue]ref answer:[white]        {ref_answer}\n"
                         f"[bold blue]start, end:[white]        {start}, {end}\n"
                         f"[bold blue]Scratchpad before:[white] {scratchpad_before}\n"
@@ -212,11 +228,7 @@ class ScratchpadRewardFn:
         ###########################################################################
         # 2. Compute the logp for the answers
         ###########################################################################
-        if self._reward_model.config.is_encoder_decoder:
-            assert self._model.device.type == "cuda", (
-                f"{self._model.device.type = }"
-            )
-            
+        if self._ref_model_is_encoder_decoder:
             # TODO: Maybe we don't have to recompute the logits. 
             # We should get them for generation and for training. 
             with timer("Moving things to GPU", **timer_flags):
@@ -232,17 +244,12 @@ class ScratchpadRewardFn:
                 f"{question_tok['input_ids'].shape = }"
                 , **timer_flags):
                 
-                with torch.no_grad():                    
-                    if self._uses_peft:
-                        with self._model.disable_adapter():
-                            logits = self._model(**input_dict).logits
-                    else:
-                        logits = self._model(**input_dict).logits
-
+                logits = self._ref_inference_fn(**input_dict).logits
+                
         else:
             # TODO(@julesgm): Fix this
             assert False
-            logits = self._reward_model(
+            logits = self._ref_model(
                 full_seq["input_ids"], attention_mask=full_seq["attention_mask"]
                 ).logits
 
@@ -265,7 +272,7 @@ class ScratchpadRewardFn:
             logp_per_seq = logp.sum(-1)
             final_output = logp_per_seq.detach()
 
-        return final_output, reward_model_outputs_scratchpad
+        return list(final_output)
 
     def replace_answer(self, *, original_generation: str, ref_answer: str) -> tuple[str, int, int]:
         answer = self._conv_to_num.extract_answer(original_generation)
@@ -309,3 +316,43 @@ class ScratchpadRewardFn:
         # )
 
         return final, start_pos, end_pos
+    
+
+class RewardForwardWrapper:
+    """
+    Meant to work with either a fixed trlAutoModelWithValueHead or a PeftModel
+    """
+    def __init__(
+        self, 
+        *,
+        ppo_trainer_model, 
+        ppo_trainer_ref_model, 
+        use_peft,
+    ):
+        self._ppo_model = ppo_trainer_model
+        self._ppo_ref   = ppo_trainer_ref_model
+        self._use_peft  = use_peft
+
+    def __call__(self, *args, **kwargs):
+        is_peft = isinstance(self._ppo_model.pretrained_model, peft.PeftModel)
+        assert self._use_peft == is_peft, f"{self._use_peft} == {is_peft}"
+
+        if is_peft:
+            assert self._ppo_ref is None
+        ref_mode = ((not is_peft) and (self._ppo_ref is not None))
+
+        assert is_peft ^ ref_mode, f"{is_peft} ^ {ref_mode}"
+        rich.print(f"[red bold]{is_peft = } {ref_mode = }")
+
+        if is_peft:
+            with self._ppo_model.pretrained_model.disable_adapter():
+                with torch.no_grad():
+                    return self._ppo_model.pretrained_model(*args, **kwargs)
+            
+        elif ref_mode:
+            self._ppo_ref.eval()
+            with torch.no_grad():
+                return self._ppo_ref(*args, **kwargs)
+
+        raise ValueError("Should not be here")
+    

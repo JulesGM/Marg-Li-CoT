@@ -3,13 +3,13 @@ import bisect
 import collections
 import enum
 import logging
+import math
 import os
 import re
 import time
 import typing
 import xml
 from pathlib import Path
-
 
 import more_itertools
 import numpy as np
@@ -24,6 +24,7 @@ from text2digits import text2digits
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "0"))
+
 
 class MovingAverage:
     def __init__(self, window_size: int):
@@ -44,11 +45,17 @@ class MovingAverage:
         self._window[self._pointer] = value
         self._pointer = (self._pointer + 1) % self._window_size
         self._size = min(self._size + 1, self._window_size)
+        return self.get()
 
-    def get(self):
+    def get(self) -> tuple[float, tuple[float, int]]:
         if self._size == 0:
-            raise ValueError("No data in the moving average window. self._size == 0")
-        return self._window.sum() / self._size, (self._window.sum(), self._size)
+            raise ValueError(
+                "No data in the moving average window. "
+                "self._size == 0"
+            )
+        
+        window_sum = typing.cast(float, self._window.sum())
+        return window_sum / self._size, (window_sum, self._size)
 
 
 class ConvToNum:
@@ -99,7 +106,16 @@ class ConvToNum:
         )
 
     @classmethod
-    def _log_answers(cls, *, level, initial_answer, intermediate_answer, new_answer, final_answer):
+    def _log_answers(
+        cls, 
+        *, 
+        level, 
+        initial_answer, 
+        intermediate_answer, 
+        new_answer, 
+        final_answer,
+    ):
+        
         LOGGER.log(
             level,
             "\n" +
@@ -251,7 +267,8 @@ class ConvToNum:
                 self._no_answer_rate.update(1)
                 ratio, (sum_, size) = self._no_answer_rate.get()
                 LOGGER.info(
-                    f"[red bold] No answer found in final text. {ratio:0.1%} {sum_}/{size}"
+                    f"[red bold] No answer found in final text. "
+                    f"{ratio:0.1%} {sum_}/{size}"
                 )
             else:
                 self._no_answer_rate.update(0)
@@ -272,7 +289,9 @@ class ConvToNum:
         )
 
         if output is None:
-            # LOGGER.debug(f"[dark_orange bold on white]EXTRACT ANSWER FAILED: `{text}`")
+            # LOGGER.debug(
+            #   f"[dark_orange bold on white]EXTRACT ANSWER FAILED: `{text}`"
+            # )
             pass
 
         return output
@@ -320,7 +339,7 @@ class ASDivRaw(torch.utils.data.Dataset):
         return self._data[index]
 
 
-class ASDiv:
+class ASDiv(torch.utils.data.Dataset):
     def __init__(self, *args, **kwargs):
         
         assert False
@@ -337,10 +356,11 @@ class ASDiv:
         
     def preprocess_question(self, question: str) -> str:
         tokenized = self._tokenizer(
-            question, add_special_tokens=False,
-        )
-        assert isinstance(tokenized["input_ids"], list), f"{type(tokenized['input_ids']).mro() = }"
-        assert isinstance(tokenized["input_ids"][0], int), f"{type(tokenized['input_ids'][0]).mro() = }"
+            question, add_special_tokens=False)
+        assert isinstance(tokenized["input_ids"], list), (
+            f"{type(tokenized['input_ids']).mro() = }")
+        assert isinstance(tokenized["input_ids"][0], int), (
+            f"{type(tokenized['input_ids'][0]).mro() = }")
 
         return self._tokenizer.decode(
             tokenized["input_ids"], skip_special_tokens=True,
@@ -374,7 +394,7 @@ class ASDiv:
             ]
         
 
-class GSM8K:
+class GSM8K(torch.utils.data.Dataset):
     _int_patt = re.compile(r"\-?\d+")
 
     def __init__(
@@ -382,58 +402,112 @@ class GSM8K:
         *,
         max_length: int,
         tokenizer: transformers.PreTrainedTokenizerBase, 
+        device: torch.device,
         ds: collections.abc.Sequence[str],
     ):
-
-        self._outputs_key = "answer"
-        self._inputs_key  = "question"
-        self._max_length  = max_length
-        self._tokenizer   = tokenizer
+        
+        self._queries         = []
+        self._ref_answers     = []
+        self._ref_scratchpads = []
+        self._ref_equations   = []
+        self._input_ids       = []
+        self._outputs_key     = "answer"
+        self._inputs_key      = "question"
+        self._max_length      = max_length
+        self._tokenizer       = tokenizer
+        self._device          = device
         self._populate_ds(ds)
 
     def _populate_ds(self, ds):
-        samples = []
-        outputs = []
+        queries     = []
+        scratchpads = []
+        responses   = []
 
         for idx in range(len(ds)):
-            sample = self.preprocess_question(ds[idx][self._inputs_key])
-            output = ds[idx][self._outputs_key].rsplit("####", 1)[1].strip()
-            samples.append(sample)
-            outputs.append(output.replace(",", ""))
+            sample = ds[idx][self._inputs_key].strip()
+            scratchpad, answer = ds[idx][self._outputs_key].split("####")
+            
+            scratchpad = scratchpad.strip()
+            answer     = answer.strip().replace(",", "")
+
+            if str(int(answer)) != answer.strip():
+                assert False, f"{answer = }"
+
+            queries    .append(sample)
+            scratchpads.append(scratchpad)
+            responses  .append(answer)
 
         LOGGER.info("> Tokenizing.")
-        tokenized_samples = self._tokenizer(samples)["input_ids"]
-        tokenized_outputs = self._tokenizer(outputs)["input_ids"]
+        
+        tokenized_queries       = [
+            torch.tensor(x, dtype=torch.long) 
+            for x in self._tokenizer(queries)["input_ids"]]
+        
+        tokenized_ref_answers   = [
+            torch.tensor(x, dtype=torch.long) 
+            for x in self._tokenizer(responses)["input_ids"]]
+        
+        tokenized_scratchpads = [
+            torch.tensor(x, dtype=torch.long)
+            for x in self._tokenizer(scratchpads)["input_ids"]]
+
+        detokenized_queries        = self._tokenizer.batch_decode(tokenized_queries)
+        detokenized_ref_answers    = self._tokenizer.batch_decode(tokenized_ref_answers)
+        detokenized_ref_scratchpad = self._tokenizer.batch_decode(tokenized_scratchpads)
+
         LOGGER.info("< Done Tokenizing.")
 
-        self._samples = []
-        self._outputs = []
-        
-        for t_s, t_o in more_itertools.zip_equal(
-            tokenized_samples, 
-            tokenized_outputs, 
+        for r_s, t_q, dt_q, dt_ra, dt_rs  in more_itertools.zip_equal(
+            scratchpads,
+            tokenized_queries, 
+            detokenized_queries,
+            detokenized_ref_answers,
+            detokenized_ref_scratchpad,
         ):
-            if len(t_s) <= self._max_length:
-                self._samples.append(t_s)
-                self._outputs.append(t_o)
+            if len(t_q) <= self._max_length:
+                splitted = re.findall(r"<<[\(\)0-9\+\-/\*=\.]+>>", r_s)
+                count_left_side = r_s.count("<<")
+                assert len(splitted) == count_left_side, (
+                    len(splitted), count_left_side, r_s, splitted
+                )
+
+                for eqn_str in splitted:
+                    assert eqn_str[ :2] == "<<", f"`{eqn_str}`"
+                    assert eqn_str[-2:] == ">>", f"`{eqn_str}`"
+                    eqn_str = eqn_str[2:-2]
+                    left, answer = eqn_str.split("=")
+                    self._ref_equations.append(dict(
+                        left           = left,
+                        answer         = answer,
+                    ))
+
+                self._input_ids      .append(t_q)
+                self._queries        .append(dt_q)
+                self._ref_answers    .append(dt_ra)
+                self._ref_scratchpads.append(dt_rs)
 
         LOGGER.info(
             f"[red bold]With len {self._max_length} - "
-            f"Kept {len(self._samples)  /  len(samples):0.1%} samples, "
-            f"{     len(self._samples)} / {len(samples)}"
+            f"Kept {len(self._queries)  /  len(queries):0.1%} samples, "
+            f"{     len(self._queries)} / {len(queries)}"
         )
 
     def __len__(self):
-        assert len(self._samples) == len(self._outputs), (
-            f"{len(self._samples) = }, {len(self._outputs) = }")
-        return len(self._samples)
+        assert len(self._queries) == len(self._ref_answers), (
+            f"{len(self._queries) = }, {len(self._ref_answers) = }")
+        return len(self._queries)
 
     def __getitem__(
             self, idx_or_slice: typing.Union[int, slice]
         ) -> typing.Union[str, list[str]]:
-        return self._samples[idx_or_slice], self._outputs[idx_or_slice]
-        
 
+        return dict(
+            query          = self._queries        [idx_or_slice],
+            input_ids      = self._input_ids      [idx_or_slice],
+            ref_answer     = self._ref_answers    [idx_or_slice],
+            ref_scratchpad = self._ref_scratchpads[idx_or_slice],
+        )
+        
 
 class ArithmeticDummyDS:
     """
