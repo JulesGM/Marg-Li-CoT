@@ -1,6 +1,7 @@
 import abc
 import bisect
 import collections
+import collections.abc
 import enum
 import logging
 import math
@@ -9,6 +10,7 @@ import re
 import time
 import typing
 import xml
+import xml.etree
 from pathlib import Path
 
 import more_itertools
@@ -17,6 +19,8 @@ import rich
 import rich.box
 import rich.table
 import torch
+import torch.utils
+import torch.utils.data
 import transformers
 import wget
 from text2digits import text2digits
@@ -80,7 +84,7 @@ class ConvToNum:
             (f"[on black]{final_}" if final_ == conv else f"[on red]{final_}") 
             for final_, conv in zip(
                 final, 
-                converted
+                converted,
             )
         ])
 
@@ -153,7 +157,7 @@ class ConvToNum:
         # It breaks the text2digits library.
         # .5 -> 0.5
 
-        text_ = re.sub(r"(?P<nan>\D)\.(?P<num>\d)", "\g<nan> 0.\g<num>", text)
+        text_ = re.sub(r"(?P<nan>\D)\.(?P<num>\d)", r"\g<nan> 0.\g<num>", text)
         if text_ != text:
             LOGGER.debug(
                 "[bold blue]B) Added one or more zeros:\n"
@@ -404,19 +408,24 @@ class GSM8K(torch.utils.data.Dataset):
         tokenizer: transformers.PreTrainedTokenizerBase, 
         device: torch.device,
         ds: collections.abc.Sequence[str],
+        question_prefix: str,
+        question_suffix: str,
     ):
         
-        self._queries         = []
-        self._ref_answers     = []
+        self._question_prefix = question_prefix
         self._ref_scratchpads = []
+        self._question_suffix   = question_suffix
         self._ref_equations   = []
-        self._input_ids       = []
         self._outputs_key     = "answer"
+        self._ref_answers     = []
         self._inputs_key      = "question"
         self._max_length      = max_length
         self._tokenizer       = tokenizer
+        self._input_ids       = []
+        self._queries         = []
         self._device          = device
         self._populate_ds(ds)
+
 
     def _populate_ds(self, ds):
         queries     = []
@@ -433,7 +442,7 @@ class GSM8K(torch.utils.data.Dataset):
             if str(int(answer)) != answer.strip():
                 assert False, f"{answer = }"
 
-            queries    .append(sample)
+            queries    .append(self._question_prefix + sample + self._question_suffix)
             scratchpads.append(scratchpad)
             responses  .append(answer)
 

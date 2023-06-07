@@ -1,12 +1,14 @@
 import datasets
 import torch
 import transformers
+import typing
 
 import lib_base_classes
 
 
 class SentimentRewardFn(lib_base_classes.Reward):
     def __init__(self, ppo_trainer):
+        
         self._pipeline = _make_sentiment_pipeline(
             pipeline_model_name="lvwerra/distilbert-imdb", 
             accelerator_num_process=ppo_trainer.accelerator.num_processes,
@@ -56,6 +58,7 @@ def _make_sentiment_pipeline(
     accelerator_num_process, 
     accelerator_device,
 ):
+    
     if accelerator_num_process == 1:
         device = 0 if torch.cuda.is_available() else "cpu"  # to avoid a `pipeline` bug
     else:
@@ -72,11 +75,13 @@ def _make_sentiment_pipeline(
 
 
 def _extract_pipe_output(outputs):
+
     positive_logits = []
     for out in outputs:
         for element in out:
             if element["label"] == "POSITIVE":
                 positive_logits.append(torch.tensor(element["score"]))
+
     return positive_logits
 
 
@@ -87,6 +92,7 @@ def _pos_logit_to_reward(logit, task):
         task [neutral]: reward = -2*abs(logit)+4
         task [positive]: reward = logit
     """
+
     for i in range(len(logit)):
         if task[i] == "[negative]":
             logit[i] = -logit[i]
@@ -96,6 +102,7 @@ def _pos_logit_to_reward(logit, task):
             pass
         else:
             raise ValueError("task has to be in [0, 1, 2]!")
+        
     return logit
 
 
@@ -107,11 +114,13 @@ def _compute_reward(
         reward_kwargs, 
         task_list,
     ):
+    
     assert isinstance(query_no_ctrl[0], str), type(query_no_ctrl[0])
     assert isinstance(generated[0], str), type(generated[0])
 
     texts = [q + r for q, r in zip(query_no_ctrl, generated)]
     logits = _extract_pipe_output(reward_fn(texts, **reward_kwargs))
+
     return _pos_logit_to_reward(logits, task_list)
 
 
@@ -119,7 +128,7 @@ def prep_dataset(tokenizer, txt_in_len):
     
     assert tokenizer.pad_token == tokenizer.eos_token
 
-    dataset = datasets.load_dataset("imdb", split="train")
+    dataset = typing.cast(datasets.Dataset, datasets.load_dataset("imdb", split="train"))
     dataset = dataset.rename_columns({"text": "review", "label": "sentiment"})
     dataset = dataset.filter(lambda x: len(x["review"]) > 500, batched=False)
     dataset = dataset.map(lambda x: {"review": x["review"][:1000]}, batched=False)

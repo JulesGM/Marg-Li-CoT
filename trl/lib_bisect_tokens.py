@@ -60,7 +60,14 @@ def find_ge(a, x):
     raise ValueError
 
 
-def extract_match_tokens(*, regexes, strings, tokenizer, tokenizer_kwargs=None, verbose=False):
+def extract_match_tokens(
+    *, 
+    tokenizer_kwargs=None, 
+    tokenizer, 
+    verbose=False,
+    regexes, 
+    strings, 
+):
     ########################################################################
     # Preliminary checks and setup
     ########################################################################
@@ -91,7 +98,12 @@ def extract_match_tokens(*, regexes, strings, tokenizer, tokenizer_kwargs=None, 
 
     left_boundaries = []
     right_boundaries = []
-    for offset, mask in zip(offsets, tok_output["attention_mask"]):
+    
+    for offset, mask in zip(
+        offsets, 
+        tok_output["attention_mask"],
+    ):
+        
         left_local = []
         right_local = []
         largest = 0

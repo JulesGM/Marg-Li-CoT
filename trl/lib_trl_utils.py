@@ -1,5 +1,4 @@
 import collections
-import enum
 import itertools
 import os
 import typing
@@ -15,10 +14,12 @@ import transformers
 from beartype import beartype
 from tqdm import tqdm
 
-import lib_sentiment_specific
 import trl
 import trl.core
 import trl.models
+
+import lib_utils
+
 
 
 @beartype
@@ -316,13 +317,9 @@ def init_model(
     It further doesn't work with "prepare_for_int8" training, but that's not the question right now.
         
     """
-    
-    assert precision in [
-        None, "int8", torch.float16, torch.bfloat16, torch.float32
-    ], precision
-
     if precision is None:
-        precision = torch.float32
+        precision = lib_utils.ValidPrecisions.float32
+    precision = lib_utils.ValidPrecisions(precision)
 
     lora_config = peft.LoraConfig(**peft_config_dict)
     tokenizer   = build_tokenizer(model_name)
@@ -336,17 +333,30 @@ def init_model(
         transformers_cls    = transformers.AutoModelForCausalLM
         trl_cls             = trl.models.  AutoModelForCausalLMWithValueHead
         tokenizer.pad_token = tokenizer.eos_token
-        dmap_keys = ["transformer", "lm_head"]
-        output_layer_name     = "lm_head"
+
+        if config.model_type == "llama":
+            dmap_keys = ["model", "lm_head"]
+        else:
+            dmap_keys = ["transformer", "lm_head"]
+
 
     elif config.is_encoder_decoder:
-        assert not ((config.model_type == "t5") and (precision == torch.float16)), (
-            "fp16 doesn't work with t5")
+        assert not (
+            (config.model_type == "t5") and 
+            (precision == lib_utils.ValidPrecisions.float16)
+        ), ("fp16 doesn't work with t5")
+        
         assert lora_config.task_type == peft.TaskType.SEQ_2_SEQ_LM
         transformers_cls      = transformers.AutoModelForSeq2SeqLM
         trl_cls               = trl.models.  AutoModelForSeq2SeqLMWithValueHead
-        dmap_keys             = ["decoder", "encoder", "lm_head", "shared"]
-        output_layer_name     = "lm_head"
+
+        if config.model_type == "t5":
+            dmap_keys             = [
+                "decoder", "encoder", "lm_head", "shared"
+            ]
+
+        else:
+            raise ValueError(config.model_type)
 
     else:
         raise ValueError(model_name)
@@ -355,49 +365,64 @@ def init_model(
     # Init the Pre-Trained Model
     # -> Precision specific
     ###########################################################################
-    if precision == "int8":
+    if precision in (
+        lib_utils.ValidPrecisions.int4, 
+        lib_utils.ValidPrecisions.int8,
+    ):
+        assert not precision == lib_utils.ValidPrecisions.int4, (
+            "We need to update transformers to nightly")
+
         dmap = {k: int(get_local_rank()) for k in dmap_keys}
         pretrained_model = transformers_cls.from_pretrained(
             model_name, 
-            load_in_8bit = True, 
-            device_map   = dmap,
+            device_map = dmap,
+            # load_in_4bit = precision == lib_utils.ValidPrecisions.int4,
+            load_in_8bit  = precision == lib_utils.ValidPrecisions.int8,
         )
-        # https://github.com/huggingface/peft/blob/main/src/peft/utils/other.py#L35
-        # Casts the layer norm to fp32 for stability purposes
-        # Upcasts lm_head to fp32 for stability purposes
-        # Make the output embedding layer require grads 
+
+        devices = set()
+        for name, parameter in pretrained_model.named_parameters():
+            assert parameter.device.type == "cuda", (
+                f"{name = }\n"
+                f"{parameter.device = }"
+            )
+            devices.add(parameter.device.index)
+        assert len(devices) == 1, devices
+
+
+        child_names = lib_utils.child_names(pretrained_model)
+        assert child_names == set(dmap_keys), (child_names, dmap_keys)
 
     else:
+        assert isinstance(precision.value, torch.dtype), (
+            f"{type(precision.value) = }")
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
-            torch_dtype=precision,
+            torch_dtype=precision.value,
         )
-    
+
+
     # Peft-ize the model
     if use_peft:
-        if precision == "int8":
+        if precision == lib_utils.ValidPrecisions.int8:
             pretrained_model = peft.prepare_model_for_int8_training(
                 pretrained_model,
-                output_embedding_layer_name = output_layer_name,
             )
         pretrained_model = peft.get_peft_model(
             pretrained_model, lora_config,
         )
 
     # Initialize the trl model
-    if precision == "int8":
+    if isinstance(precision.value, torch.dtype):
+        model = trl_cls.from_pretrained(
+            pretrained_model, 
+            torch_dtype=precision.value,
+        )
+        model = model.to(precision.value)
+    else:
         model = trl_cls.from_pretrained(
             pretrained_model,
         )
-    else:
-        model = trl_cls.from_pretrained(
-            pretrained_model, 
-            torch_dtype=precision,
-        )
-
-    # Set the precision of the value head
-    if precision != torch.float32 and precision != "int8":
-        model = model.to(precision)
 
     model.gradient_checkpointing_disable = typing.cast(
         transformers.PreTrainedModel, 

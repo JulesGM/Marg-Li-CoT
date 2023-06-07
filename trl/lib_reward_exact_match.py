@@ -26,7 +26,8 @@ class ExactMatchReward(lib_base_classes.Reward):
         
         moving_average_accuracies = {
             n: lib_data.MovingAverage(n)
-            for n in [8, 16, 32]}
+            for n in [8, 16, 32]
+        }
         
         metric = self._metric(
             queries     = queries,

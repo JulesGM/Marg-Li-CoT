@@ -84,7 +84,8 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
             if ref is None:
                 rich.print(
                     f"[bold red on white]REF IS NONE: "
-                    f"\"{raw_ref = }\" \"{extracted_ref = }\"")
+                    f"\"{raw_ref = }\" \"{extracted_ref = }\""
+                )
 
             assert ref is not None, raw_ref
 
@@ -155,11 +156,11 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
         num_nones_parsed = sum(x["gen"] is None for x in parsed)
         assert parsed
 
-        LOGGER.info(
-            f"[bold green]EM Result: [bold white]"
-            f"{np.mean(em_values):0.2%}\n"
+        LOGGER.debug(
+            f"[bold green]EM Result:[bold white] {np.mean(em_values):0.2%}\n"
             f"[bold red on white]Fraction of no answer found: "
-            f"{num_nones_parsed / len(generated_texts):0.1%}\n")
+            f"{num_nones_parsed / len(generated_texts):0.1%}\n"
+        )
 
         assert (
             len(em_values) == 

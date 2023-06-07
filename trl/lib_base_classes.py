@@ -64,6 +64,7 @@ class DictDataset(torch.utils.data.Dataset):
 
 FloatSequence = typing.Union[list[float], torch.Tensor, np.ndarray]
 
+
 # @beartype
 @dataclass
 class MetricOutput:

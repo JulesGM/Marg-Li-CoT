@@ -21,6 +21,7 @@ import numpy as np
 import peft
 import rich
 import rich.console
+import rich.logging
 import rich.status
 import rich.table
 import torch
@@ -33,6 +34,8 @@ from tqdm import tqdm
 
 import lib_base_classes
 import lib_data
+import lib_eval
+import lib_utils
 import lib_metric
 import lib_reward_exact_match
 import lib_reward_ppl
@@ -42,12 +45,8 @@ import trl
 import trl.core
 import wandb
 
+
 LOGGER = logging.getLogger(__name__)
-
-
-def progress(seq, description, total=None, disable=False):
-    yield from tqdm(seq, desc=description, total=total, disable=True)
-
 
 datasets    .logging.set_verbosity_warning()
 transformers.logging.set_verbosity_warning()
@@ -63,7 +62,6 @@ trl              .set_seed(4)
 
 DEFAULT_LOG_STATS_VERBOSE = True
 DEFAULT_REWARD_VERBOSE    = False
-PROMPT                    =  "" 
 
 ##############################################################################
 ##############################################################################
@@ -74,13 +72,16 @@ DEFAULT_GEN_KWARGS = dict(
     top_k              = 0.0,
     top_p              = 1.0,
     early_stopping     = True,
+    synced_gpus        = True,
 )
 
 DEFAULT_TASK_NAME: str = "gsm8k"
-DEFAULT_EVAL_EVERY: int = 25
+DEFAULT_EVAL_EVERY: int = 16
 
 if DEFAULT_TASK_NAME == "gsm8k":
     DEFAULT_WANDB_PROJECT: str                 = "gsm8k"
+    DEFAULT_TASK_NAME:                     str = "gsm8k"
+    DEFAULT_REWARD_TYPE:  typing.Optional[str] = "exact_match"
 
     # -------------------------------------------------------
     DEFAULT_GEN_KWARGS["temperature"]          = 0.1
@@ -91,17 +92,17 @@ if DEFAULT_TASK_NAME == "gsm8k":
     # -------------------------------------------------------
 
     DEFAULT_GEN_KWARGS["max_new_tokens"]       = 192
-    DEFAULT_GENERATION_BATCH_SIZE:         int = 1
     DEFAULT_MINI_BATCH_SIZE:               int = 1
     DEFAULT_BATCH_SIZE:                    int = 1
-    DEFAULT_GRADIENT_ACCUMULATION_STEPS:   int = 32
+    DEFAULT_GRADIENT_ACCUMULATION_STEPS:   int = 16
 
-    DEFAULT_PRECISION                          = torch.bfloat16
+    DEFAULT_PRECISION                          = lib_utils.ValidPrecisions.bfloat16
+    DEFAULT_MODEL_NAME:                    str = "openaccess-ai-collective/wizard-mega-13b"
 
-    DEFAULT_REWARD_TYPE:  typing.Optional[str] = "exact_match"
-    DEFAULT_MODEL_NAME:                    str = "google/flan-t5-small"
-    DEFAULT_TASK_NAME:                     str = "gsm8k"
+    DEFAULT_CAUSAL_QUESTION_PREFIX:        str = "### Instruction: "
+    DEFAULT_CAUSAL_QUESTION_SUFFIX:        str = "\n\n### Assistant:\n"
 
+    DEFAULT_INFERENCE_BATCH_SIZE:          int = 1
     DEFAULT_INFERENCE_GEN_KWARGS = DEFAULT_GEN_KWARGS.copy()
     DEFAULT_INFERENCE_GEN_KWARGS["num_beams"] = 8
     DEFAULT_INFERENCE_GEN_KWARGS["do_sample"] = False
@@ -113,16 +114,19 @@ elif DEFAULT_TASK_NAME == "sentiment":
     DEFAULT_WANDB_PROJECT: str                = "sentiment"
     DEFAULT_GEN_KWARGS["max_new_tokens"]      = 20
     DEFAULT_GEN_KWARGS["do_sample"]           = True
-    DEFAULT_GENERATION_BATCH_SIZE:        int = 16
+    DEFAULT_EVAL_BATCH_SIZE:              int = 16
     DEFAULT_MINI_BATCH_SIZE:              int = 16
     DEFAULT_BATCH_SIZE:                   int = 16
     DEFAULT_GRADIENT_ACCUMULATION_STEPS: int  = 1
 
     DEFAULT_REWARD_TYPE: typing.Optional[str] = None
 
-    DEFAULT_PRECISION                         = "int8"
+    DEFAULT_PRECISION                         = lib_utils.ValidPrecisions.int8
     DEFAULT_MODEL_NAME:                   str = "edbeeching/gpt-neo-125M-imdb-lora-adapter-merged"
+    DEFAULT_CAUSAL_ANSWER_PREFIX:                str = ""
+    DEFAULT_CAUSAL_QUESTION_PREFIX:              str = ""
 
+    DEFAULT_INFERENCE_BATCH_SIZE:          int = 4
     # DEFAULT_MODEL_NAME:            str = "edbeeching/gpt-neo-2.7B-imdb"
     # DEFAULT_MODEL_NAME:            str = "edbeeching/gpt-neox-20b-imdb-lora-lr5e-5-adapter-merged"
     DEFAULT_INFERENCE_GEN_KWARGS = DEFAULT_GEN_KWARGS.copy()
@@ -142,9 +146,9 @@ DEFAULT_LEARNING_RATE:               float = 1.41e-5
 DEFAULT_PEFT_CONFIG = dict(
     inference_mode = False,
     lora_dropout   = 0.05,
-    lora_alpha     = 256,
+    lora_alpha     = 4,
     bias           = "none",
-    r              = 256,
+    r              = 4,
 )
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
@@ -152,109 +156,17 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "0"))
 RANK       = int(os.environ.get("RANK",       "0"))
 
 
-class Task(str, enum.Enum):
-    SENTIMENT = "sentiment"
-    GSM8K     = "gsm8k"
-
-
-class GSM8KRewardChoices(str, enum.Enum):
-    EXACT_MATCH = "exact_match"
-    REF_PPL = "ref_ppl"
-
-
-def evaluate_or_test(
-    *,
-    generation_kwargs:     dict[str, typing.Any],
-    logging_header:        str,
-    ppo_trainer:           trl.PPOTrainer,
-    dataloader, 
-    reward_fn:             typing.Callable[[list[str], list[str]], torch.Tensor],
-    tokenizer:             transformers.PreTrainedTokenizerBase,
-    task_type:             Task,
-    set_name:              str,
-    metric,
-):
-    
-    assert isinstance(
-        dataloader.sampler, 
-        torch.utils.data.sampler.SequentialSampler,
-    )
-
-    rewards = []
-    metrics = []
-
-    for batch_idx, batch in enumerate(progress(
-        description = logging_header,
-        total       = len(dataloader),
-        seq         = dataloader,
-    )):
-        ############################################################
-        # Keys of batch:
-        #   - "query"
-        #   - "input_ids"
-        #   - "ref_answer"
-        #   - "ref_scratchpad"
-        ############################################################
-
-        output = lib_trl_utils.batched_unroll(
-            generation_kwargs = generation_kwargs, 
-            query_tensors     = batch["input_ids"],
-            ppo_trainer       = ppo_trainer, 
-            tokenizer         = tokenizer,
-        )
-
-        reward_kwargs = dict(
-            responses = output.response_text,
-            queries = batch["query"], 
-        )
-
-        if task_type == Task.GSM8K:
-            reward_kwargs["ref_answers"] = batch["ref_answer"]
-        
-
-        local_batch_rewards: lib_base_classes.RewardOutput = reward_fn(**reward_kwargs)
-        local_batch_metrics: lib_base_classes.MetricOutput = metric   (**reward_kwargs)
-
-        gathered_batch_rewards = ppo_trainer.accelerator.gather_for_metrics(
-            tensor=torch.tensor(local_batch_rewards.values
-                ).to(ppo_trainer.accelerator.device),
-        )
-
-        gathered_batch_metrics = (
-            ppo_trainer.accelerator.gather_for_metrics(
-                tensor=torch.tensor(
-                    local_batch_metrics.values
-                ).to(ppo_trainer.accelerator.device),
-            )
-        )
-
-        rewards.append(gathered_batch_rewards)
-        metrics.append(gathered_batch_metrics)
-
-    reward = torch.cat(rewards, dim=0)
-    metric = torch.cat(metrics, dim=0)
-
-    wandb.log({
-        f"inference_loop_fn/set_{set_name}/reward_mean": reward.mean().item(),
-        f"inference_loop_fn/set_{set_name}/reward_std" : reward.std ().item(),
-        f"inference_loop_fn/set_{set_name}/metric_mean": metric.mean().item(),
-        f"inference_loop_fn/set_{set_name}/metric_std" : metric.std ().item(),
-    })
-
-
-def collator(data):
-    return dict((key, [d[key] for d in data]) for key in data[0])
-
-
 def prep_dataset(
     *,
     input_max_length: int, 
+    question_prefix: str,
+    question_suffix: str,
     task_name: str, 
     tokenizer: transformers.PreTrainedTokenizerBase,
     split: str,
 ) -> torch.utils.data.Dataset:
     
-    if task_name == Task.GSM8K:
+    if task_name == lib_utils.Task.GSM8K:
         assert isinstance(LOCAL_RANK, int), type(LOCAL_RANK)
         dataset = lib_data.GSM8K(
             max_length = input_max_length, 
@@ -265,6 +177,8 @@ def prep_dataset(
                 path  = "gsm8k", 
                 name  = "main", 
             ),
+            question_prefix = question_prefix,
+            question_suffix = question_suffix,
         )
         
     elif task_name == "asdiv":
@@ -275,7 +189,7 @@ def prep_dataset(
             datasets.load_dataset("asdiv"),
         )
 
-    elif task_name == Task.SENTIMENT:
+    elif task_name == lib_utils.Task.SENTIMENT:
         assert split == "train", "split must be None for sentiment"
         dataset = lib_sentiment_specific.prep_dataset(
             txt_in_len = 5,
@@ -288,150 +202,47 @@ def prep_dataset(
     return dataset
 
 
-def make_eval_dataloader(
-    *,
-    subset_size: typing.Optional[int] = None,
-    accelerator: accelerate.Accelerator,
-    batch_size: int,
-    collator: typing.Callable,
-    dataset: torch.utils.data.Dataset,
-) -> torch.utils.data.DataLoader:
-    
-    if subset_size is not None:
-        dataset = torch.utils.data.Subset(
-            dataset, range(subset_size))
-
-    dataloader = torch.utils.data.DataLoader(
-        num_workers = 0,
-        batch_size  = batch_size,
-        collate_fn  = collator,
-        dataset     = dataset,
-        shuffle     = False,
-    )
-
-    prepared = accelerator.prepare_data_loader(
-        dataloader)
-
-    return prepared
-
-
-def make_metric_and_reward_fn(
-    *,
-    ppo_trainer: trl.PPOTrainer,
-    reward_type,
-    task_name: Task,
-    tokenizer: transformers.PreTrainedTokenizerBase,
-    use_peft: bool,
-) -> typing.Tuple[typing.Callable, typing.Callable]:
-    
-    if task_name == Task.GSM8K:  
-        metric_accuracy = lib_metric.ScratchpadAnswerAccuracy()
-
-        if reward_type == GSM8KRewardChoices.REF_PPL:
-            reward_forward_fn = lib_reward_ppl.RewardForwardWrapper(
-                ppo_trainer_ref_model = ppo_trainer.ref_model,
-                ppo_trainer_model     = ppo_trainer.model,
-                use_peft              = use_peft,
-            )
-
-            reward_fn = lib_reward_ppl.ScratchpadRewardFn(
-                ref_model_is_encoder_decoder = ppo_trainer.model.config.is_encoder_decoder,
-                ref_inference_fn             = reward_forward_fn,
-                inputs_device                = ppo_trainer.accelerator.device,
-                metric_fn                    = metric_accuracy,
-                tokenizer                    = tokenizer,
-            )
-
-        elif reward_type == GSM8KRewardChoices.EXACT_MATCH:
-            reward_fn = lib_reward_exact_match.ExactMatchReward(
-                metric_fn=metric_accuracy,
-            )
-
-        else:
-            raise ValueError(
-                f"Unknown reward type: {reward_type}. "
-                f"Must be one of {GSM8KRewardChoices}"
-            )
-
-    elif task_name == Task.SENTIMENT:
-        reward_fn = lib_sentiment_specific.SentimentRewardFn(ppo_trainer)
-        metric_accuracy = reward_fn
-
-    else:
-        raise ValueError(f"Unknown task: {task_name}")
-
-    return metric_accuracy, reward_fn
-
-class EvalLoop:
-    def __init__(
-            self,
-            inference_gen_kwargs: typing.Dict[str, typing.Any],
-            eval_subset_size:     int,
-            metric_accuracy:      typing.Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-            ppo_trainer:          trl.PPOTrainer,
-            reward_fn,
-            tokenizer:            transformers.PreTrainedTokenizerBase,
-            task_name:            Task,
-            batch_size:           int,
-            dataset:              torch.utils.data.Dataset,
-            split:                str,
-        ):
-
-        dataloader = make_eval_dataloader(
-                accelerator = ppo_trainer.accelerator,
-                batch_size  = batch_size,
-                collator    = collator,
-                dataset     = dataset,
-                subset_size = eval_subset_size,
-            )
-
-        self._inference_gen_kwargs = inference_gen_kwargs
-        self._metric_accuracy      = metric_accuracy 
-        self._set_dataloader       = dataloader
-        self._ppo_trainer          = ppo_trainer
-        self._reward_fn            = reward_fn
-        self._tokenizer            = tokenizer
-        self._task_name            = task_name
-        self._split                = split
-
-    def __call__(self):
-        evaluate_or_test(
-            generation_kwargs     = self._inference_gen_kwargs,
-            logging_header        = f"Doing Evaluation of set: {self._split}",
-            ppo_trainer           = self._ppo_trainer,
-            dataloader            = self._set_dataloader,
-            reward_fn             = self._reward_fn,
-            tokenizer             = self._tokenizer,
-            task_type             = self._task_name,
-            set_name              = self._split,
-            metric                = self._metric_accuracy,
-        )
-
-
 def main(
     *, 
     gradient_accumulation_steps: int          = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
     inference_gen_kwargs: dict[str, typing.Any] = DEFAULT_INFERENCE_GEN_KWARGS,
+    inference_batch_size: int                 = DEFAULT_INFERENCE_BATCH_SIZE,
     generation_kwargs: dict[str, typing.Any]  = DEFAULT_GEN_KWARGS,
     peft_config_dict:  dict[str, typing.Any]  = DEFAULT_PEFT_CONFIG, 
     input_max_length: int                     = 115,
     eval_subset_size: int                     = DEFAULT_EVAL_QTY,
     mini_batch_size: int                      = DEFAULT_MINI_BATCH_SIZE,
+    causal_question_prefix: str                      = DEFAULT_CAUSAL_QUESTION_PREFIX,
+    causal_question_suffix: str                      = DEFAULT_CAUSAL_QUESTION_SUFFIX,
     learning_rate: float                      = DEFAULT_LEARNING_RATE,
     wandb_project: str                        = DEFAULT_WANDB_PROJECT,
     just_metrics: bool                        = False,
-    reward_type: typing.Union[None, str, GSM8KRewardChoices] = DEFAULT_REWARD_TYPE,
+    reward_type: typing.Union[None, str, lib_utils.GSM8KRewardChoices] = DEFAULT_REWARD_TYPE,
     model_name: str                           = DEFAULT_MODEL_NAME,
     batch_size: int                           = DEFAULT_BATCH_SIZE,
     eval_every: int                           = DEFAULT_EVAL_EVERY,
-    precision: typing.Union[str, torch.dtype] = DEFAULT_PRECISION,
-    task_name: Task                           = Task(DEFAULT_TASK_NAME),
+    precision: typing.Union[str, torch.dtype, lib_utils.ValidPrecisions
+                                            ] = DEFAULT_PRECISION,
+    task_name: lib_utils.Task                 = lib_utils.Task(DEFAULT_TASK_NAME),
     use_peft: bool                            = DEFAULT_USE_PEFT,
     name: typing.Optional[str]                = None,
 ):
-    
+    precision = lib_utils.ValidPrecisions(precision)  # type: ignore
     args = locals().copy()
-    task_name = Task(task_name)
+    
+  
+
+    logging.basicConfig(
+        level=logging.INFO,
+        datefmt="%H:%M:%S",  
+        handlers=[rich.logging.RichHandler(markup=True)],
+        format=f"[{RANK}/{WORLD_SIZE}]%(funcName)s:%(lineno)d - %(message)s",
+    )
+  
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    # logging.getLogger("lib_metric").setLevel(logging.ERROR)
+
+    task_name = lib_utils.Task(task_name)
 
     ###########################################################################
     # Find the type of model we are using
@@ -440,15 +251,23 @@ def main(
     assert "task_type" not in peft_config_dict
     if not config.is_encoder_decoder:
         peft_config_dict["task_type"] = peft.TaskType.CAUSAL_LM
+    
     elif config.is_encoder_decoder:
+        causal_question_prefix = ""
+        causal_question_suffix = ""
         peft_config_dict["task_type"] = peft.TaskType.SEQ_2_SEQ_LM
     else:
         raise ValueError(f"Unknown model type: {model_name}")
 
+    assert "target_modules" not in peft_config_dict, peft_config_dict
+    peft_config_dict["target_modules"] = (
+        peft.utils.other.TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[
+            config.model_type])
+
     ppo_config_dict = dict(
         gradient_accumulation_steps = gradient_accumulation_steps,
         accelerator_kwargs          = dict(kwargs_handlers=[
-            DistributedDataParallelKwargs(find_unused_parameters=True)]),
+            DistributedDataParallelKwargs(find_unused_parameters=True)]), # type: ignore
         mini_batch_size             = mini_batch_size,
         learning_rate               = learning_rate,
         model_name                  = model_name,
@@ -460,8 +279,8 @@ def main(
         **ppo_config_dict,
     )
 
-    if task_name == Task.GSM8K:
-        reward_type = GSM8KRewardChoices(reward_type)
+    if task_name == lib_utils.Task.GSM8K:
+        reward_type = lib_utils.GSM8KRewardChoices(reward_type)
 
     wandb.init(
         save_code = True,
@@ -491,6 +310,8 @@ def main(
         task_name        = task_name, 
         tokenizer        = tokenizer,
         split            = "train",
+        question_prefix  = causal_question_prefix,
+        question_suffix  = causal_question_suffix,
     )
 
     eval_dataset =  prep_dataset(
@@ -498,6 +319,8 @@ def main(
         task_name        = task_name, 
         tokenizer        = tokenizer,
         split            = "test",
+        question_prefix  = causal_question_prefix,
+        question_suffix  = causal_question_suffix,
     )
 
     ###########################################################################
@@ -513,7 +336,7 @@ def main(
     # Prep Training
     ###########################################################################
     ppo_trainer = trl.PPOTrainer(
-        data_collator = collator,
+        data_collator = lib_utils.collator,
         ref_model     = None,
         tokenizer     = typing.cast(
             typing.Union[
@@ -526,7 +349,7 @@ def main(
         model         = model,
     )
 
-    metric_accuracy, reward_fn = make_metric_and_reward_fn(
+    metric_accuracy, reward_fn = lib_eval.make_metric_and_reward_fn(
         ppo_trainer = ppo_trainer,
         reward_type = reward_type,
         task_name   = task_name,
@@ -534,12 +357,12 @@ def main(
         use_peft    = use_peft,
     )
 
-    train_eval = EvalLoop(
+    train_eval = lib_eval.EvalLoop(
         inference_gen_kwargs = inference_gen_kwargs,
+        batch_size           = inference_batch_size,
         eval_subset_size     = eval_subset_size,
         metric_accuracy      = metric_accuracy,
         ppo_trainer          = ppo_trainer,
-        batch_size           = batch_size,
         reward_fn            = reward_fn,
         tokenizer            = tokenizer,
         task_name            = task_name,
@@ -547,12 +370,12 @@ def main(
         split                = "train",
     )
 
-    eval_eval = EvalLoop(
+    eval_eval = lib_eval.EvalLoop(
         inference_gen_kwargs = inference_gen_kwargs,
+        batch_size           = inference_batch_size,
         eval_subset_size     = eval_subset_size,
         metric_accuracy      = metric_accuracy,
         ppo_trainer          = ppo_trainer,
-        batch_size           = batch_size,
         reward_fn            = reward_fn,
         tokenizer            = tokenizer,
         task_name            = task_name,
@@ -574,9 +397,9 @@ def main(
         ))
 
     for epoch in itertools.count():
-        for batch_idx, batch in enumerate(progress(
+        for batch_idx, batch in enumerate(lib_utils.progress(
             description = f"Training - Epoch {epoch}",
-            disable     = lib_trl_utils.get_rank() != 0,
+            disable     = True,
             seq         = ppo_trainer.dataloader, 
         )):
             ############################################################
@@ -588,8 +411,9 @@ def main(
             ############################################################
             
             if batch_idx % eval_every == 0: 
-                rich.print("[red bold]DOING EVAL")
+                rich.print("[red bold]DOING EVAL: [white]TRAIN SET")
                 train_eval()
+                rich.print("[red bold]DOING EVAL: [white]EVAL SET")
                 eval_eval()
                 rich.print("[red bold]DONE WITH EVAL")
 
@@ -600,7 +424,7 @@ def main(
                 tokenizer         = tokenizer,
             )
 
-            if task_name == Task.GSM8K:
+            if task_name == lib_utils.Task.GSM8K:
                 outputs = lib_trl_utils.keep_good_one_generation(
                     num_return_seq = generation_kwargs["num_return_sequences"],
                     other_rewards  = None, 
@@ -610,6 +434,7 @@ def main(
                     batch_size     = batch_size,
                     tokenizer      = tokenizer,
                 )
+
             else:
                 assert generation_kwargs["num_return_sequences"] == 1, (
                     generation_kwargs["num_return_sequences"])
@@ -617,7 +442,7 @@ def main(
                 assert len(outputs.response_tensors) == batch_size, (
                     len(outputs.response_tensors), batch_size)
 
-            if task_name == Task.SENTIMENT:
+            if task_name == lib_utils.Task.SENTIMENT:
                 ref_answers = None
             else:
                 ref_answers = batch["ref_answer"]
@@ -664,7 +489,7 @@ def main(
             
             stats = ppo_trainer.step(
                 queries   = batch["input_ids"],
-                responses = outputs.response_tensors,
+                responses = typing.cast(list[torch.LongTensor], outputs.response_tensors),
                 scores    = reward_output.values,
             )
 
