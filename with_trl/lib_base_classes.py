@@ -1,3 +1,5 @@
+"""Base classes for metrics and rewards."""
+
 import enum
 import typing
 from dataclasses import dataclass
@@ -14,7 +16,7 @@ class DictDataset(torch.utils.data.Dataset):
     def __init__(self, keys):
         self._dataset = {k: [] for k in keys}
 
-    def __getitem__(self, key: typing.Union[str, int]) -> list[typing.Any]:
+    def __getitem__(self, key: typing.Union[str, int]):
         if isinstance(key, int):
             return {k: v[key] for k, v in self._dataset.items()}
         elif isinstance(key, str):
@@ -25,7 +27,7 @@ class DictDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         one_len = len(next(iter(self._dataset.values())))
         return one_len
-    
+
     def check_lens(self):
         lengths = []
         for v in self._dataset.values():
@@ -33,12 +35,14 @@ class DictDataset(torch.utils.data.Dataset):
             lengths.append(len(v))
 
         assert all(lengths[0] == l for l in lengths[1:]), lengths
-        return lengths
+        return tuple(lengths)
 
     def append(self, dict_) -> None:
         assert dict_.keys() == self._dataset.keys(), (
-            dict_.keys(), self._dataset.keys())
-        
+            dict_.keys(),
+            self._dataset.keys(),
+        )
+
         for k, v in dict_.items():
             self._dataset[k].append(v)
 
@@ -57,7 +61,7 @@ class DictDataset(torch.utils.data.Dataset):
 
     def keys(self):
         return self._dataset.keys()
-    
+
     def values(self):
         return self._dataset.values()
 
@@ -87,20 +91,19 @@ class Reward:
     def __call__(
         self,
         *,
-        queries:     list[str],
-        responses:   list[str],
+        queries: list[str],
+        responses: list[str],
         ref_answers: list[str],
     ) -> RewardOutput:
-        
         raise NotImplementedError()
+
 
 class Metric:
     def __call__(
         self,
         *,
-        queries:     list[str],
-        responses:   list[str],
+        queries: list[str],
+        responses: list[str],
         ref_answers: list[str],
     ) -> MetricOutput:
-        
         raise NotImplementedError()

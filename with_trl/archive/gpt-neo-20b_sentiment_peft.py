@@ -12,21 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass, field
 import os
+from dataclasses import dataclass, field
 from typing import Optional
+
 import rich
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_int8_training
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, pipeline
-
-from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, set_seed
+from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                          HfArgumentParser, pipeline)
+from trl import (AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer,
+                 set_seed)
 from trl.core import LengthSampler
 
-
-RANK       = int(os.environ["RANK"])
+RANK = int(os.environ["RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 
@@ -70,23 +71,23 @@ class ScriptArguments:
     # NOTE: gpt2 models use Conv1D instead of Linear layers which are not yet supported in 8 bit mode
     # models like gpt-neo* models are more suitable.
 
-    model_name: Optional[str]      = "edbeeching/gpt-neo-125M-imdb-lora-adapter-merged"
-    log_with: Optional[str]        = None
+    model_name: Optional[str] = "edbeeching/gpt-neo-125M-imdb-lora-adapter-merged"
+    log_with: Optional[str] = None
     learning_rate: Optional[float] = 1.41e-5
     mini_batch_size: Optional[int] = 16
-    batch_size: Optional[int]      = 32
-    gradient_accumulation_steps    = 1
+    batch_size: Optional[int] = 32
+    gradient_accumulation_steps = 1
 
 
 # Below is an example function to build the dataset. In our case, we use the IMDB dataset
 # from the `datasets` library. One should customize this function to train the model on
 # its own dataset.
 def build_dataset(
-    config, 
+    config,
     *,
-    input_min_text_length = 2, 
-    input_max_text_length = 8,
-    dataset_name          = "imdb", 
+    input_min_text_length=2,
+    input_max_text_length=8,
+    dataset_name="imdb",
 ):
     """
 
@@ -122,7 +123,6 @@ def build_dataset(
     return ds
 
 
-
 def collator(data):
     return dict((key, [d[key] for d in data]) for key in data[0])
 
@@ -132,7 +132,7 @@ def print_trainable_parameters(model):
     Prints the number of trainable parameters in the model.
     """
     trainable_params = 0
-    all_param        = 0
+    all_param = 0
 
     for _, param in model.named_parameters():
         all_param += param.numel()
@@ -148,24 +148,24 @@ def print_trainable_parameters(model):
 
 
 def main():
-    parser      = HfArgumentParser(ScriptArguments)
+    parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
 
     config = PPOConfig(
-        gradient_accumulation_steps = script_args.gradient_accumulation_steps,
-        mini_batch_size             = script_args.mini_batch_size,
-        learning_rate               = script_args.learning_rate,
-        batch_size                  = script_args.batch_size,
-        model_name                  = script_args.model_name,
-        log_with                    = script_args.log_with,
+        gradient_accumulation_steps=script_args.gradient_accumulation_steps,
+        mini_batch_size=script_args.mini_batch_size,
+        learning_rate=script_args.learning_rate,
+        batch_size=script_args.batch_size,
+        model_name=script_args.model_name,
+        log_with=script_args.log_with,
     )
 
     # We then define the arguments to pass to the sentiment analysis pipeline.
     # We set `return_all_scores` to True to get the sentiment score for each token.
     sent_kwargs = dict(
-        return_all_scores = True, 
-        function_to_apply = "none", 
-        batch_size        = config.mini_batch_size,
+        return_all_scores=True,
+        function_to_apply="none",
+        batch_size=config.mini_batch_size,
     )
 
     # We retrieve the dataloader by calling the `build_dataset` function.
@@ -176,14 +176,11 @@ def main():
 
     # Now let's build the model, the reference model, and the tokenizer.
     dmap_keys = ["transformer", "lm_head"]
-    dmap      = {
-        k: LOCAL_RANK 
-        for k in dmap_keys
-    }
+    dmap = {k: LOCAL_RANK for k in dmap_keys}
     print("pretrained_model = AutoModelForCausalLM.from_pretrained ...")
     pretrained_model = AutoModelForCausalLM.from_pretrained(
-        config.model_name, 
-        load_in_8bit=True, 
+        config.model_name,
+        load_in_8bit=True,
         device_map=dmap,
     )
 
@@ -195,18 +192,16 @@ def main():
     `get_peft_model` utility function from `peft`.
     """
 
-
     print("pretrained_model = prepare_model_for_int8_training ...")
     pretrained_model = prepare_model_for_int8_training(
-        pretrained_model, 
-        output_embedding_layer_name="embed_out"
+        pretrained_model, output_embedding_layer_name="embed_out"
     )
-    
+
     target_modules = None
     if "gpt-neox" in script_args.model_name:
         # workaround to use 8bit training on this model
         # hacky workaround due to issues with "EleutherAI/gpt-neox-20b"
-        target_modules = ["query_key_value", "xxx"]  
+        target_modules = ["query_key_value", "xxx"]
 
         for name, param in pretrained_model.named_parameters():
             # freeze base model's layers
@@ -225,15 +220,19 @@ def main():
         bias="none",
         task_type="CAUSAL_LM",
     )
-    
+
     print("pretrained_model = get_peft_model(pretrained_model, lora_config)")
     pretrained_model = get_peft_model(pretrained_model, lora_config)
 
     print("AutoModelForCausalLMWithValueHead.from_pretrained")
     model = AutoModelForCausalLMWithValueHead.from_pretrained(pretrained_model)
 
-    model.gradient_checkpointing_disable = model.pretrained_model.gradient_checkpointing_disable
-    model.gradient_checkpointing_enable  = model.pretrained_model.gradient_checkpointing_enable
+    model.gradient_checkpointing_disable = (
+        model.pretrained_model.gradient_checkpointing_disable
+    )
+    model.gradient_checkpointing_enable = (
+        model.pretrained_model.gradient_checkpointing_enable
+    )
 
     print_trainable_parameters(model)
 
@@ -242,19 +241,18 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), 
-        lr=config.learning_rate
+        filter(lambda p: p.requires_grad, model.parameters()), lr=config.learning_rate
     )
 
     # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
     ppo_trainer = PPOTrainer(
-        config, 
-        model, 
-        data_collator = collator, 
-        ref_model     = None,
-        tokenizer     = tokenizer,
-        optimizer     = optimizer,
-        dataset       = dataset,
+        config,
+        model,
+        data_collator=collator,
+        ref_model=None,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        dataset=dataset,
     )
 
     # We then build the sentiment analysis pipeline, passing the model name and the
@@ -266,8 +264,8 @@ def main():
 
     print("pipeline(...)")
     sentiment_pipe = pipeline(
-        "sentiment-analysis", 
-        model="lvwerra/distilbert-imdb", 
+        "sentiment-analysis",
+        model="lvwerra/distilbert-imdb",
         device=device,
     )
 
@@ -277,18 +275,17 @@ def main():
     generation_kwargs = {
         "pad_token_id": tokenizer.eos_token_id,
         "eos_token_id": -1,
-        "min_length":   -1,
-        "do_sample":    True,
-        "top_k":        0.0,
-        "top_p":        1.0,
+        "min_length": -1,
+        "do_sample": True,
+        "top_k": 0.0,
+        "top_p": 1.0,
     }
     output_min_length = 4
     output_max_length = 16
     output_length_sampler = LengthSampler(
-        output_min_length, 
+        output_min_length,
         output_max_length,
     )
-
 
     for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader), desc="Epoch"):
         query_tensors = batch["input_ids"]
@@ -302,12 +299,9 @@ def main():
             gen_len = output_length_sampler()
             generation_kwargs["max_new_tokens"] = gen_len
             response = ppo_trainer.generate(query, **generation_kwargs)
-            response_tensors.append(response.squeeze()[- gen_len:])
+            response_tensors.append(response.squeeze()[-gen_len:])
 
-        batch["response"] = [
-            tokenizer.decode(r.squeeze()) 
-            for r in response_tensors
-        ]
+        batch["response"] = [tokenizer.decode(r.squeeze()) for r in response_tensors]
 
         # Compute sentiment score
         texts = [q + r for q, r in zip(batch["query"], batch["response"])]
@@ -320,17 +314,16 @@ def main():
 
         rich.print(f"[blue bold]Epoch {epoch}:[/] [white bold]ppo_trainer.step")
         stats = ppo_trainer.step(
-            responses = response_tensors, 
-            queries   = query_tensors, 
-            scores    = rewards,
+            responses=response_tensors,
+            queries=query_tensors,
+            scores=rewards,
         )
 
         ppo_trainer.log_stats(
-            rewards = rewards,
-            stats   = stats, 
-            batch   = batch, 
+            rewards=rewards,
+            stats=stats,
+            batch=batch,
         )
-
 
 
 if __name__ == "__main__":
