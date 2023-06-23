@@ -1,27 +1,18 @@
-from dataclasses import dataclass, field
 import itertools
 import random
+from dataclasses import dataclass, field
 from typing import Optional
 
 import fire
-import torch
-from datasets import load_dataset
 import numpy as np
 import peft
-from tqdm import tqdm
+import torch
 import transformers
-from transformers import (
-    AutoTokenizer, 
-    HfArgumentParser, 
-    pipeline,
-)
-
-from trl import (
-    AutoModelForSeq2SeqLMWithValueHead, 
-    PPOConfig, 
-    PPOTrainer,
-    set_seed,
-)
+from datasets import load_dataset
+from tqdm import tqdm
+from transformers import AutoTokenizer, HfArgumentParser, pipeline
+from trl import (AutoModelForSeq2SeqLMWithValueHead, PPOConfig, PPOTrainer,
+                 set_seed)
 from trl.core import LengthSampler
 
 set_seed(0)
