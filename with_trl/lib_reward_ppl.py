@@ -20,7 +20,7 @@ import transformers
 import lib_base_classes
 import lib_bisect_tokens
 import lib_data
-import lib_metric
+import lib_utils
 
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
@@ -97,6 +97,7 @@ class ScratchpadRewardFn(lib_base_classes.Reward):
         metric_fn: typing.Callable,
     ):
         super().__init__()
+        raise NotImplemented("Fix the extractor stuff")
 
         # ----------------------------------------------------------------
         # Set Attributes
@@ -105,9 +106,9 @@ class ScratchpadRewardFn(lib_base_classes.Reward):
         self._show_answer_replacement = False
         self._reward_tokenizer = tokenizer
         self._ref_inference_fn = ref_inference_fn
-        self._no_answer_rate = lib_data.MovingAverage(10000)
+        self._no_answer_rate = lib_utils.MovingAverage(10000)
         self._inputs_device = inputs_device
-        self._conv_to_num = lib_data.ConvToNum()
+        self._extractor = extractor
         self._tokenizer = tokenizer
         self._metric = metric_fn
 
@@ -169,7 +170,7 @@ class ScratchpadRewardFn(lib_base_classes.Reward):
             ):
                 scratchpads.append(
                     self.replace_answer(
-                        original_generation=self._conv_to_num(output),
+                        original_generation=self._extractor(output),
                         ref_answer=ref_answer,
                     )[0]
                 )

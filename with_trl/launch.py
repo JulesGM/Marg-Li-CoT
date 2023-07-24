@@ -2,10 +2,9 @@
 import os
 import shlex
 import subprocess
-
-import fire
 from pathlib import Path
 
+import fire
 
 BIN_PATH = "/home/mila/g/gagnonju/.main/bin/python"
 MODULE = "/home/mila/g/gagnonju/.main/bin/accelerate"

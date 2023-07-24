@@ -152,7 +152,7 @@ def main(
         steps=num_steps,
     )
     config = trl.PPOConfig(**ppo_trainer_config_dict)
-    dataset, gpt2_tokenizer = lib_sentiment_specific.prep_dataset(
+    dataset, gpt2_tokenizer = lib_sentiment_specific.prep_dataset_rl(
         config.model_name, txt_in_len
     )
     generation_kwargs = {

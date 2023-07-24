@@ -1,3 +1,4 @@
+import logging
 import typing
 
 import datasets
@@ -5,6 +6,8 @@ import torch
 import transformers
 
 import lib_base_classes
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SentimentRewardFn(lib_base_classes.Reward):
@@ -118,8 +121,12 @@ def _compute_reward(
     return _pos_logit_to_reward(logits, task_list)
 
 
-def prep_dataset(tokenizer, txt_in_len, split):
-    assert tokenizer.pad_token == tokenizer.eos_token
+def prep_dataset_rl(
+    any_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
+    txt_in_len: int, 
+    split: str,
+):
+    assert any_tokenizer.pad_token == any_tokenizer.eos_token
 
     dataset = typing.cast(datasets.Dataset, datasets.load_dataset("imdb", split=split))
     dataset = dataset.rename_columns({"text": "review", "label": "sentiment"})
@@ -128,17 +135,64 @@ def prep_dataset(tokenizer, txt_in_len, split):
 
     dataset = dataset.map(
         lambda x: {
-            "input_ids": tokenizer.encode(" " + x["review"], return_tensors="pt")[
+            "input_ids": any_tokenizer.encode(" " + x["review"], return_tensors="pt")[
                 0, :txt_in_len
             ]
         },
         batched=False,
     )
     dataset = dataset.map(
-        lambda x: {"query": tokenizer.decode(x["input_ids"])},
+        lambda x: {"query": any_tokenizer.decode(x["input_ids"])},
         batched=False,
     )
     dataset = dataset[:20480]
     dataset = datasets.Dataset.from_dict(dataset)
     dataset.set_format("pytorch")
+    return dataset
+
+
+def prep_dataset_sft(
+        tokenizer, split, 
+        maxlen_tok=None, 
+        maxlen_char=None, 
+        minlen_char=None,
+        minlen_tok=None,
+    ):
+    LOGGER.warning("Not tested.")
+
+    assert tokenizer.pad_token == tokenizer.eos_token
+    dataset = typing.cast(
+        datasets.Dataset, datasets.load_dataset("imdb", split=split))
+    
+    if minlen_char:
+        dataset = dataset.filter(lambda x: len(x["text"]) > minlen_char, batched=False)
+    
+    if maxlen_char:
+        dataset = dataset.map(lambda x: {"review": x["text"][:maxlen_char]}, batched=False)
+
+    if maxlen_tok:
+        dataset = dataset.map(
+            lambda x: {"input_ids": tokenizer(x["text"])[:, :maxlen_tok]},
+            batched=True,
+        )
+
+    if minlen_tok:
+        
+        def filter_fn(x):
+            assert x.ndim == 1, x.shape
+            return len(x["input_ids"]) > minlen_tok
+        
+        dataset = dataset.filter(
+            filter_fn, 
+            batched=False
+        )
+
+    dataset = dataset.map(
+        lambda x: {"text": tokenizer.batch_decode(x["input_ids"])},
+        batched=True,
+    )
+
+    dataset = datasets.Dataset.from_dict(dataset)  # type: ignore
+    dataset.set_format("pytorch")
+    
     return dataset

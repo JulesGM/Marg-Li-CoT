@@ -5,6 +5,7 @@ import typing
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
+import accelerate
 import more_itertools
 import numpy as np
 import peft
@@ -21,6 +22,8 @@ import trl.models
 import wandb
 from beartype import beartype
 
+import lib_base_classes
+import lib_data
 import lib_utils
 
 RANK = int(os.environ.get("RANK", "0"))
@@ -31,58 +34,6 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 def rich_escape(value):
     return rich.markup.escape(str(value))
 
-
-@beartype
-class BatchedUnrollReturn:
-    def __init__(self, response_tensors, tokenizer):
-        self._response_tensors = response_tensors
-        self._tokenizer: transformers.PreTrainedTokenizerBase = tokenizer  # type: ignore
-        self._response_text = self.tokenizer.batch_decode(self.response_tensors)
-
-    @property
-    def response_tensors(self):
-        return self._response_tensors
-
-    @property
-    def tokenizer(self):
-        return self._tokenizer
-
-    @property
-    def response_text(self):
-        return self._response_text
-
-    @response_text.setter
-    def response_text(self, value):
-        raise RuntimeError("Cannot set response_text")
-
-    @response_tensors.setter
-    def response_tensors(self, value):
-        raise RuntimeError("Cannot set response_tensors")
-
-    @tokenizer.setter
-    def tokenizer(self, value):
-        raise RuntimeError("Cannot set tokenizer")
-
-    @beartype
-    @dataclass
-    class IndivualReturn:
-        response_tensor: torch.Tensor
-        response_text: str
-
-    def __len__(self):
-        assert len(self.response_tensors) == len(self.response_text), (
-            f"{len(self.response_tensors) = } " f"{len(self.response_text)    = } "
-        )
-        return len(self.response_tensors)
-
-    def __iter__(self):
-        response_text = self.response_text
-
-        for i in range(len(self)):
-            yield self.IndivualReturn(
-                response_tensor=self.response_tensors[i],
-                response_text=response_text[i],
-            )
 
 
 def get_rank() -> int:
@@ -132,12 +83,12 @@ def keep_good_one_generation(
     *,
     num_return_seq: int,
     other_rewards: Optional[torch.Tensor],
-    generations: BatchedUnrollReturn,
+    generations: lib_base_classes.BatchedUnrollReturn,
     ref_answers: Union[list[list[str]], torch.Tensor],
-    extract_fn: typing.Callable,
     batch_size: int,
-    tokenizer: Optional[transformers.PreTrainedTokenizerBase],  # type: ignore
-) -> BatchedUnrollReturn:
+    prediction_tokenizer: Optional[transformers.PreTrainedTokenizerBase],  # type: ignore
+    answer_extractor,
+) -> lib_base_classes.BatchedUnrollReturn:
     """
 
     Return the index of the generation with the:
@@ -145,7 +96,9 @@ def keep_good_one_generation(
         - Max reward of the generations with bad  answers otherwise
 
     """
-    assert isinstance(generations, BatchedUnrollReturn), type(generations)
+    assert isinstance(generations, lib_base_classes.BatchedUnrollReturn
+        ), type(generations)
+
 
     array_response_text = np.array(
         generations.response_text,
@@ -164,9 +117,12 @@ def keep_good_one_generation(
 
     selections = []
     for b_idx in range(batch_size):
-        ref_comparable = extract_fn(ref_answers[b_idx])
-        generated_answers = [extract_fn(gen) for gen in array_response_text[b_idx]]
-        goods = [ref_comparable == gen for gen in generated_answers]
+        ref_comparable = answer_extractor(ref_answers[b_idx])
+        assert ref_comparable is not None, ref_answers[b_idx]
+
+        generated_answers = [answer_extractor(gen) for gen in array_response_text[b_idx]]
+
+        goods = [gen == ref_comparable for gen in generated_answers]
         # goods_str = " ".join([f"[green]{g}[/]" if g else str(g) for g in goods])
         ratio = np.mean(np.array(goods, dtype=np.float32))
 
@@ -217,13 +173,15 @@ def keep_good_one_generation(
     output_generations_text = []
     output_generations_tensors = []
     for idx in range(batch_size):
-        output_generations_text.append(array_response_text[idx][selections[idx]])
+        output_generations_text.append(
+            array_response_text[idx][selections[idx]]
+        )
         output_generations_tensors.append(
-            torch.tensor(response_tensors[idx][selections[idx]]).to(device)
+            response_tensors[idx][selections[idx]].detach().clone().to(device)
         )
 
-    return BatchedUnrollReturn(
-        tokenizer=tokenizer,
+    return lib_base_classes.BatchedUnrollReturn(
+        any_tokenizer=prediction_tokenizer,
         response_tensors=output_generations_tensors,
     )
 
@@ -275,24 +233,6 @@ def print_table(
         )
 
     rich.print(table)
-
-
-def _build_tokenizer(
-    model_config, model_name: str
-) -> transformers.PreTrainedTokenizerBase:  # type: ignore
-    optional_kwargs = {}
-    if not model_config.is_encoder_decoder:
-        optional_kwargs["padding_side"] = "left"
-
-    tok = transformers.AutoTokenizer.from_pretrained(  # type: ignore
-        model_name,
-        **optional_kwargs,
-    )
-
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    return tok
 
 
 def check_all_start_with_token_id(tensors, token_id: int):
@@ -436,6 +376,7 @@ def init_model(
         trl.models.AutoModelForSeq2SeqLMWithValueHead,
     ],
     transformers.PreTrainedTokenizerBase,  # type: ignore
+    transformers.PreTrainedTokenizerBase,  # type: ignore
 ]:
     """
 
@@ -473,7 +414,9 @@ def init_model(
             bf16=precision == lib_utils.ValidPrecisions.bfloat16,
             fp16=precision == lib_utils.ValidPrecisions.float16,
             trust_remote_code=True,
+            use_auth_token=True,
         )
+        
     else:
         assert False, "This is not supported anymore."
         pretrained_model = _load_then_peft_ize_model(
@@ -488,13 +431,19 @@ def init_model(
         trust_remote_code=True,
     )
 
-    tokenizer = _build_tokenizer(
-        model_config=config,
-        model_name=model_name,
-    )
+    forward_tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore
+        model_name)
+    prediction_tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore
+        model_name)
+
     if not config.is_encoder_decoder:
         trl_cls = trl.models.AutoModelForCausalLMWithValueHead
-        tokenizer.pad_token = tokenizer.eos_token
+        for tokenizer in (forward_tokenizer, prediction_tokenizer):
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+        
+        prediction_tokenizer.padding_side = "left"
+        forward_tokenizer.padding_side = "right"
 
     else:
         assert not (
@@ -536,25 +485,26 @@ def init_model(
 
     assert output > 0
 
-    return model, tokenizer
+    return model, forward_tokenizer, prediction_tokenizer
 
 
 def batched_unroll(
     *,
     generation_kwargs: dict[str, typing.Any],
     query_tensors: list[torch.Tensor],
-    ppo_trainer: trl.PPOTrainer,
-    tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-) -> BatchedUnrollReturn:
+    accelerated_model,
+    accelerator: accelerate.Accelerator,
+    prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
+) -> lib_base_classes.BatchedUnrollReturn:
     model: transformers.PreTrainedModel = typing.cast(  # type: ignore
         transformers.PreTrainedModel,  # type: ignore
-        ppo_trainer.accelerator.unwrap_model(ppo_trainer.model),
+        accelerator.unwrap_model(accelerated_model),
     )
 
     if not model.config.is_encoder_decoder:
-        assert tokenizer.padding_side == "left", tokenizer.padding_side
+        assert prediction_tokenizer.padding_side == "left", prediction_tokenizer.padding_side
 
-    tokenized = tokenizer.pad(
+    tokenized = prediction_tokenizer.pad(
         dict(
             input_ids=typing.cast(
                 transformers.tokenization_utils.EncodedInput,
@@ -577,19 +527,19 @@ def batched_unroll(
         ).shape[1]
         responses = responses[:, seq_len:]
 
-    return BatchedUnrollReturn(
+    return lib_base_classes.BatchedUnrollReturn(
         response_tensors=list(responses),
-        tokenizer=tokenizer,
+        any_tokenizer=prediction_tokenizer,
     )
 
 
-def unpad(responses, tokenizer):
+def unpad(responses, pad_token_id, eos_token_id):
     # Remove the padding
     final_responses = []
     for response in responses:
         init_len = len(response)
         # Remove the padding:
-        response = response[response != tokenizer.pad_token_id]
+        response = response[response != pad_token_id]
         modified = init_len != len(response)
 
         # If we have modified the len, then we are guaranteed that the
@@ -597,10 +547,10 @@ def unpad(responses, tokenizer):
         # We might have cut it off if pad_token_id == eos_token_Id,
         # so we need to add it if it's not there.
         if modified and (
-            not response.shape[0] or response[-1] != tokenizer.eos_token_id
+            not response.shape[0] or response[-1] != eos_token_id
         ):
             response = torch.cat(
-                [response, torch.tensor([tokenizer.eos_token_id]).to(response.device)]
+                [response, torch.tensor([eos_token_id]).to(response.device)]
             )
         final_responses.append(response)
     return final_responses

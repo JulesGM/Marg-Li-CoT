@@ -27,6 +27,9 @@ import rich.markup
 import rich.status
 import rich.table
 import torch
+import torch.backends
+import torch.backends.cuda
+import torch.backends.cudnn
 import torch.utils
 import torch.utils.data
 import torch.utils.data.sampler
@@ -40,23 +43,12 @@ from tqdm import tqdm
 import lib_base_classes
 import lib_data
 import lib_eval
-import lib_metric
-import lib_reward_exact_match
-import lib_reward_ppl
-import lib_sentiment_specific
 import lib_trl_utils
 import lib_utils
-
-
-def rich_escape(value):
-    return rich.markup.escape(str(value))
-
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "0"))
 RANK = int(os.environ.get("RANK", "0"))
-
-
 LOGGER = logging.getLogger(__name__)
 
 datasets.logging.set_verbosity_warning()
@@ -71,7 +63,11 @@ torch.manual_seed(2)
 torch.cuda.manual_seed_all(3)
 trl.set_seed(4)
 
-torch.use_deterministic_algorithms(True)
+
+DETERMINISTIC = False
+torch.backends.cuda.matmul.allow_tf32 = not DETERMINISTIC
+torch.backends.cudnn.allow_tf32 = not DETERMINISTIC
+torch.use_deterministic_algorithms(DETERMINISTIC)
 
 DEFAULT_LOG_STATS_VERBOSE = True
 DEFAULT_REWARD_VERBOSE = False
@@ -88,22 +84,29 @@ DEFAULT_GEN_KWARGS = dict(
     synced_gpus=True,
 )
 
-DEFAULT_TASK_NAME: str = lib_utils.Task.GSM8K
-DEFAULT_EVAL_EVERY: int = 0
+DEFAULT_TASK_NAME: str = lib_utils.Task.MAIN
+DEFAULT_EVAL_EVERY: int = 16
 
-if DEFAULT_TASK_NAME == lib_utils.Task.GSM8K:
-    DEFAULT_WANDB_PROJECT: str = "gsm8k"
-    DEFAULT_REWARD_TYPE = lib_utils.GSM8KRewardChoices.EXACT_MATCH
+if DEFAULT_TASK_NAME == lib_utils.Task.MAIN:
+    DEFAULT_WANDB_PROJECT: str = "commonsense"
+    DEFAULT_REWARD_TYPE = lib_utils.RewardChoices.EXACT_MATCH
+    DEFAULT_DATASET_NAME = lib_data.DatasetChoices.COMMONSENSEQA_MC
 
     # -------------------------------------------------------
     # DEFAULT_GEN_KWARGS["temperature"] = 1
     DEFAULT_GEN_KWARGS["do_sample"] = False
     # -------------------------------------------------------
     #########################################################
-    DEFAULT_GEN_KWARGS["num_beams"] = 20
-    DEFAULT_GEN_KWARGS["num_return_sequences"] = 20
+    DEFAULT_GEN_KWARGS["num_beams"] = 26
+    DEFAULT_GEN_KWARGS["num_return_sequences"] = 26
 
-    DEFAULT_MODEL_NAME: str = "ausboss/llama-30b-supercot"
+    DEFAULT_MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+    # DEFAULT_MODEL_NAME: str = "ausboss/llama-30b-supercot"
+    DEFAULT_CAUSAL_QUESTION_PREFIX: str = (
+        "[INST]Answer the following question, include the associated letter in your response:\n"
+    )
+    DEFAULT_CAUSAL_QUESTION_SUFFIX: str = "[/INST]"
+
     DEFAULT_PEFT_QLORA_MODE = True
     DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16
 
@@ -114,7 +117,7 @@ if DEFAULT_TASK_NAME == lib_utils.Task.GSM8K:
 
     DEFAULT_GEN_KWARGS["max_new_tokens"] = 200
     DEFAULT_MINI_BATCH_SIZE: int = 1
-    DEFAULT_BATCH_SIZE: int = 1
+    DEFAULT_BATCH_SIZE: int = 5
     DEFAULT_GRADIENT_ACCUMULATION_STEPS: int = 16
 
     assert DEFAULT_EVAL_EVERY == 0 or DEFAULT_EVAL_EVERY >= (
@@ -125,8 +128,6 @@ if DEFAULT_TASK_NAME == lib_utils.Task.GSM8K:
         f"({DEFAULT_GRADIENT_ACCUMULATION_STEPS})"
     )
 
-    DEFAULT_CAUSAL_QUESTION_PREFIX: str = "### Instructions: "
-    DEFAULT_CAUSAL_QUESTION_SUFFIX: str = "\nBe concise.\n### Response:\n"
     DEFAULT_INFERENCE_BATCH_SIZE: int = 4
     DEFAULT_INFERENCE_GEN_KWARGS = DEFAULT_GEN_KWARGS.copy()
     DEFAULT_INFERENCE_GEN_KWARGS["num_beams"] = 4
@@ -156,6 +157,7 @@ elif DEFAULT_TASK_NAME == lib_utils.Task.SENTIMENT:
     DEFAULT_CAUSAL_QUESTION_PREFIX: str = ""
     DEFAULT_CAUSAL_QUESTION_SUFFIX: str = ""
 
+    DEFAULT_DATASET_NAME = lib_data.DatasetChoices.SENTIMENT
     DEFAULT_INFERENCE_BATCH_SIZE: int = 96
     DEFAULT_INFERENCE_GEN_KWARGS = DEFAULT_GEN_KWARGS.copy()
 
@@ -195,7 +197,7 @@ def main(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     wandb_project: str = DEFAULT_WANDB_PROJECT,
     just_metrics: bool = False,
-    reward_type: Union[None, str, lib_utils.GSM8KRewardChoices] = DEFAULT_REWARD_TYPE,
+    reward_type: Union[None, str, lib_utils.RewardChoices] = DEFAULT_REWARD_TYPE,
     model_name: str = DEFAULT_MODEL_NAME,
     batch_size: int = DEFAULT_BATCH_SIZE,
     eval_every: int = DEFAULT_EVAL_EVERY,
@@ -203,6 +205,7 @@ def main(
     task_name: lib_utils.Task = lib_utils.Task(DEFAULT_TASK_NAME),
     use_peft: bool = DEFAULT_USE_PEFT,
     name: Optional[str] = None,
+    dataset_name = DEFAULT_DATASET_NAME,
     peft_qlora_mode: bool = DEFAULT_PEFT_QLORA_MODE,
 ):
     precision = lib_utils.ValidPrecisions(precision)  # type: ignore
@@ -221,6 +224,7 @@ def main(
         logging.getLogger("datasets").setLevel(logging.ERROR)
 
     task_name = lib_utils.Task(task_name)
+    dataset_name = lib_data.DatasetChoices(dataset_name)
 
     ###########################################################################
     # Find the type of model we are using
@@ -228,6 +232,7 @@ def main(
     config = transformers.AutoConfig.from_pretrained(  # type: ignore
         model_name, trust_remote_code=True
     )
+
 
     if config.is_encoder_decoder:
         assert causal_question_prefix == "", (
@@ -259,10 +264,11 @@ def main(
     else:
         peft_config_dict = None
 
+
     ppo_config_dict = dict(
         gradient_accumulation_steps=gradient_accumulation_steps,
         accelerator_kwargs=dict(
-            kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]
+            kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)]
         ),  # type: ignore
         mini_batch_size=mini_batch_size,
         learning_rate=learning_rate,
@@ -272,11 +278,11 @@ def main(
     )
 
     config = trl.PPOConfig(
-        **ppo_config_dict,
+        **ppo_config_dict,  # type: ignore
     )
 
-    if task_name == lib_utils.Task.GSM8K:
-        reward_type = lib_utils.GSM8KRewardChoices(reward_type)
+    if task_name == lib_utils.Task.MAIN:
+        reward_type = lib_utils.RewardChoices(reward_type)
 
     if RANK == 0:
         wandb.init(
@@ -297,32 +303,36 @@ def main(
     with lib_utils.maybe_context_manager(
         lambda: rich.status.Status(
             f"[bold green]Loading model: "
-            f"[white]{rich_escape(config.model_name)} [green]...",
+            f"[white]{rich.markup.escape(str(config.model_name))} [green]...",
             spinner="weather",
         ),
         disable=True,  # RANK != 0,
     ):
-        model, tokenizer = lib_trl_utils.init_model(
+        model, forward_tokenizer, prediction_tokenizer = lib_trl_utils.init_model(
             peft_config_dict=peft_config_dict,
             model_name=config.model_name,
             precision=precision,
             use_peft=use_peft,
             peft_qlora_mode=peft_qlora_mode,
         )
+        eos_token_id = forward_tokenizer.eos_token_id
+        assert eos_token_id == prediction_tokenizer.eos_token_id
+        pad_token_id = forward_tokenizer.pad_token_id
+        assert pad_token_id == prediction_tokenizer.pad_token_id
 
-    dataset = lib_data.prep_dataset(
+    dataset = lib_data.prep_dataset_rl(
         input_max_length=input_max_length,
-        task_name=task_name,
-        tokenizer=tokenizer,
+        dataset_name=dataset_name,
+        any_tokenizer=forward_tokenizer,
         split="train",
         question_prefix=causal_question_prefix,
         question_suffix=causal_question_suffix,
     )
 
-    eval_dataset = lib_data.prep_dataset(
+    eval_dataset = lib_data.prep_dataset_rl(
         input_max_length=input_max_length,
-        task_name=task_name,
-        tokenizer=tokenizer,
+        dataset_name=dataset_name,
+        any_tokenizer=forward_tokenizer,
         split="test",
         question_prefix=causal_question_prefix,
         question_suffix=causal_question_suffix,
@@ -334,21 +344,17 @@ def main(
     if not model.config.is_encoder_decoder:
         if peft_config_dict:
             assert peft_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
-        generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
+        generation_kwargs["pad_token_id"] = eos_token_id
 
     ###########################################################################
     # Prep Training
     ###########################################################################
     ppo_trainer = trl.PPOTrainer(
-        data_collator=lib_utils.collator,
+        data_collator=(
+            lib_utils.collator if task_name == lib_utils.Task.SENTIMENT 
+            else lib_data.data_item_collator),
         ref_model=None,
-        tokenizer=typing.cast(
-            typing.Union[
-                transformers.PreTrainedTokenizer,  # type: ignore
-                transformers.PreTrainedTokenizerFast,
-            ],  # type: ignore
-            tokenizer,
-        ),
+        tokenizer=forward_tokenizer,
         dataset=dataset,
         config=config,
         model=model,
@@ -358,18 +364,19 @@ def main(
         ppo_trainer=ppo_trainer,
         reward_type=reward_type,
         task_name=task_name,
-        tokenizer=tokenizer,
+        extractor=dataset.get_extractor(),
         use_peft=use_peft,
     )
 
     train_eval = lib_eval.EvalLoop(
         inference_gen_kwargs=inference_gen_kwargs,
-        batch_size=inference_batch_size,
+        prediction_tokenizer=prediction_tokenizer,
+        accelerated_model=ppo_trainer.model,
         eval_subset_size=eval_subset_size,
         metric_accuracy=metric_accuracy,
-        ppo_trainer=ppo_trainer,
+        accelerator=ppo_trainer.accelerator,
+        batch_size=inference_batch_size,
         reward_fn=reward_fn,
-        tokenizer=tokenizer,
         task_name=task_name,
         dataset=dataset,
         split="train",
@@ -377,12 +384,13 @@ def main(
 
     eval_eval = lib_eval.EvalLoop(
         inference_gen_kwargs=inference_gen_kwargs,
-        batch_size=inference_batch_size,
+        prediction_tokenizer=prediction_tokenizer,
+        accelerated_model=ppo_trainer.model,
         eval_subset_size=eval_subset_size,
         metric_accuracy=metric_accuracy,
-        ppo_trainer=ppo_trainer,
+        accelerator=ppo_trainer.accelerator,
+        batch_size=inference_batch_size,
         reward_fn=reward_fn,
-        tokenizer=tokenizer,
         task_name=task_name,
         dataset=eval_dataset,
         split="eval",
@@ -396,9 +404,6 @@ def main(
     ###########################################################################
     # Training Loop
     ###########################################################################
-    def answer_extractor(sample):
-        return metric_accuracy._make_comparable(metric_accuracy._extract_answer(sample))
-
     for epoch in itertools.count():
         for batch_idx, batch in enumerate(
             lib_utils.progress(
@@ -423,21 +428,22 @@ def main(
                 rich.print("[red bold]DONE WITH EVAL")
 
             raw_gen_outputs = lib_trl_utils.batched_unroll(
+                accelerated_model=ppo_trainer.model,
                 generation_kwargs=generation_kwargs,
-                query_tensors=batch["input_ids"],
-                ppo_trainer=ppo_trainer,
-                tokenizer=tokenizer,
+                query_tensors=batch.tok_ref_query,
+                accelerator=ppo_trainer.accelerator,
+                prediction_tokenizer=prediction_tokenizer,
             )
 
-            if task_name == lib_utils.Task.GSM8K:
+            if task_name == lib_utils.Task.MAIN:
                 outputs = lib_trl_utils.keep_good_one_generation(
                     num_return_seq=generation_kwargs["num_return_sequences"],
                     other_rewards=None,
                     generations=raw_gen_outputs,
-                    ref_answers=batch["ref_answer"],
-                    extract_fn=answer_extractor,
+                    ref_answers=batch.detok_ref_answer,
                     batch_size=batch_size,
-                    tokenizer=tokenizer,
+                    prediction_tokenizer=prediction_tokenizer,
+                    answer_extractor=dataset.get_extractor()
                 )
             else:
                 assert task_name == lib_utils.Task.SENTIMENT, task_name
@@ -451,22 +457,14 @@ def main(
                     batch_size,
                 )
 
-            outputs = lib_trl_utils.BatchedUnrollReturn(
+            outputs = lib_base_classes.BatchedUnrollReturn(
                 response_tensors=lib_trl_utils.unpad(
                     responses=outputs.response_tensors,
-                    tokenizer=tokenizer,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=pad_token_id,
                 ),
-                tokenizer=tokenizer,
+                any_tokenizer=prediction_tokenizer,
             )
-
-            # We need a "ref_answer" iff we are doing GSM8K.
-            # We shouldn't have a "ref_answer" iff we are doing sentiment.
-            assert ("ref_answer" in batch) is (
-                task_name == lib_utils.Task.GSM8K
-            ), task_name
-            assert (not ("ref_answer" in batch)) is (
-                task_name == lib_utils.Task.SENTIMENT
-            ), task_name
 
             reward_output = reward_fn(
                 batch=batch,
@@ -497,31 +495,30 @@ def main(
             # - For all models, the answers should have one or fewer eos token in them
             ###########################################################################
             if ppo_trainer.is_encoder_decoder:
-                assert isinstance(tokenizer.pad_token_id, int), type(
-                    tokenizer.pad_token_id
-                )
+
+                assert isinstance(pad_token_id, int), type(pad_token_id)
                 lib_trl_utils.check_all_start_with_token_id(
-                    outputs.response_tensors, tokenizer.pad_token_id
-                )
+                    outputs.response_tensors, pad_token_id)
 
             lib_trl_utils.check_max_qty_of_token_id(
                 list_of_sequences=outputs.response_tensors,
                 max_qty=1,
-                token_id=tokenizer.eos_token_id,
+                token_id=eos_token_id,
             )
 
             # There should be no pad_token_ids, but the pad
             # token id might be the eos token id, so we can't
             # just blindly check for the pad token id
-            if tokenizer.pad_token_id != tokenizer.eos_token_id:
+            if pad_token_id != eos_token_id:
                 lib_trl_utils.check_qty_of_token_id(
                     list_of_sequences=outputs.response_tensors,
                     qty=0,
-                    token_id=tokenizer.pad_token_id,
+                    token_id=pad_token_id,
                 )
 
+
             stats = ppo_trainer.step(
-                queries=batch["input_ids"],
+                queries=batch.tok_ref_query,
                 responses=typing.cast(list[torch.LongTensor], outputs.response_tensors),
                 scores=reward_output.values,
             )
@@ -529,13 +526,15 @@ def main(
             # Log stats
             assert isinstance(reward_output.values, list), type(reward_output.values)
             assert isinstance(stats, dict), type(stats)
-            assert isinstance(batch, dict), type(batch)
 
-            batch["response"] = outputs.response_tensors
+            batch_stats = dict(
+                response = prediction_tokenizer.batch_decode(outputs.response_tensors),
+                query    = batch.detok_ref_query,
+            )
 
             ppo_trainer.log_stats(
                 rewards=[x.to(torch.float32) for x in reward_output.values],
-                batch=batch,
+                batch=batch_stats,
                 stats=stats,
             )
 
@@ -543,7 +542,7 @@ def main(
                 extra_columns=reward_output.logging_columns,
                 log_header=f"(b{batch_idx}e{epoch}) ",
                 responses=outputs.response_text,
-                queries=batch["query"],
+                queries=batch.detok_ref_query,
                 rewards=reward_output.values,
                 name=str(name),
                 qty=5,
