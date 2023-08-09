@@ -12,6 +12,7 @@ import numpy as np
 
 import lib_base_classes
 import libs_extraction
+import lib_utils
 
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
@@ -63,10 +64,10 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
         self,
         generated_texts: list[lib_base_classes.BatchedUnrollReturn],
         reference_answer_texts: list[str],
-    ) -> tuple[list[float], lib_base_classes.DictDataset]:
+    ) -> tuple[list[float], lib_utils.DictDataset]:
         """For each answer, extract the output number, then compare."""
 
-        parsed = lib_base_classes.DictDataset(["ref", "gen", "ref_text"])
+        parsed = lib_utils.DictDataset(["ref", "gen", "ref_text"])
         em_values = []
 
         for ith_sample, (raw_gen, raw_ref) in enumerate(
@@ -88,6 +89,7 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
             assert raw_gen is not None, raw_gen
             extracted_gen = self._extractor(raw_gen)
 
+
             parsed.append(
                 dict(
                     gen=extracted_gen,
@@ -95,19 +97,18 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
                     ref_text=raw_ref[0],
                 )
             )
-
+            
             # -----------------------------------------------------------------
             # Compare
             # -----------------------------------------------------------------
             if extracted_gen is not None:
-                em_values.append(float(self._extractor.compare(extracted_gen, extracted_ref)))
+                em_values.append(float(self._extractor.compare(
+                    extracted_gen, extracted_ref)))
             else:
                 LOGGER.debug(
                     f"[bold yellow]gen is None:[/] " +
-                    f"{raw_gen = } {extracted_gen = }"
-                )
+                    f"{raw_gen = } {extracted_gen = }")
                 em_values.append(0.0)
-
         return em_values, parsed
 
     def __call__(
@@ -116,10 +117,10 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
         batch: lib_base_classes.DataListContainer,
         responses: list[lib_base_classes.BatchedUnrollReturn],
     ) -> lib_base_classes.MetricOutput:
+        
         #######################################################################
         # Make checks
         #######################################################################
-
         generated_texts = responses
         reference_answer_texts = batch.detok_ref_answer
 
@@ -165,6 +166,8 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
             moving_averages=None,
             values=em_values,
             name="exact_match",
+            extracted_gen=[x["gen"] for x in parsed],
+            extracted_ref=[x["ref"] for x in parsed],
         )
 
 
@@ -181,7 +184,7 @@ class ScratchpadNumericalSubStepAccuracy(lib_base_classes.Metric):
         ref_scratchpads = batch.detok_ref_scratchpad
         ref_substeps = batch.obj_ref_equations
 
-        outputs = lib_base_classes.DictDataset(
+        outputs = lib_utils.DictDataset(
             ["gen_ms", "ref_ms", "intermediate_results", "gen_numbers", "metric"]
         )
 

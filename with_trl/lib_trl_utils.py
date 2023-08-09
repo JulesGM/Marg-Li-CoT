@@ -6,12 +6,15 @@ from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import accelerate
+import datasets
 import more_itertools
 import numpy as np
 import peft
 import peft_qlora
 import rich
+import rich.layout
 import rich.markup
+import rich.panel
 import rich.table
 import torch
 import transformers
@@ -33,7 +36,6 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
 def rich_escape(value):
     return rich.markup.escape(str(value))
-
 
 
 def get_rank() -> int:
@@ -106,8 +108,15 @@ def keep_good_one_generation(
     ).reshape((batch_size, num_return_seq))
 
     device = generations.response_tensors[0].device
-    response_tensors = torch.cat(
-        generations.response_tensors,
+    
+    response_tensors = prediction_tokenizer.pad(
+            dict(input_ids=generations.response_tensors), 
+            return_tensors="pt", 
+            padding=True,
+    )["input_ids"].reshape(batch_size, num_return_seq, -1)
+
+    raw_response_tensors = torch.cat(
+        generations.raw_response_tensors,
         dim=0,
     ).reshape(batch_size, num_return_seq, -1)
 
@@ -126,9 +135,12 @@ def keep_good_one_generation(
         # goods_str = " ".join([f"[green]{g}[/]" if g else str(g) for g in goods])
         ratio = np.mean(np.array(goods, dtype=np.float32))
 
-        table = rich.table.Table("Name", "Value", show_lines=True)
+        table = rich.table.Table("Name", "Value", title="keep_good_one_generation", show_lines=True)
         # table.add_row("[bold white on red]Ref Answer",        f"{ref_answers[b_idx]}")
-        table.add_row("[bold white on red]Ref Comparable", rich_escape(ref_comparable))
+        table.add_row(
+            "[bold white on red]Ref Comparable", 
+            rich_escape(ref_comparable),
+        )
         table.add_row(
             "[bold white on red]Generated answers",
             rich_escape(collections.Counter(x for x in generated_answers)),
@@ -138,9 +150,9 @@ def keep_good_one_generation(
             rich_escape(collections.Counter(len(x) for x in response_tensors[b_idx])),
         )
         table.add_row(
-            "[bold white on red]</s> present",
+            f"[bold white on red]{prediction_tokenizer.eos_token} present",
             rich_escape(
-                collections.Counter("</s>" in x for x in array_response_text[b_idx])
+                collections.Counter(prediction_tokenizer.eos_token in x for x in array_response_text[b_idx])
             ),
         )
         table.add_row(
@@ -170,24 +182,26 @@ def keep_good_one_generation(
 
     assert selections.shape == (batch_size,), f"{selections.shape = } {batch_size = }"
 
-    output_generations_text = []
     output_generations_tensors = []
+    output_raw_generation_tensors = []
     for idx in range(batch_size):
-        output_generations_text.append(
-            array_response_text[idx][selections[idx]]
-        )
         output_generations_tensors.append(
             response_tensors[idx][selections[idx]].detach().clone().to(device)
+        )
+        output_raw_generation_tensors.append(
+            raw_response_tensors[idx][selections[idx]].detach().clone().to(device)
         )
 
     return lib_base_classes.BatchedUnrollReturn(
         any_tokenizer=prediction_tokenizer,
         response_tensors=output_generations_tensors,
+        raw_response_tensors=output_raw_generation_tensors,
     )
 
 
 def print_table(
     *,
+    generation_kwargs,
     extra_columns: Optional[dict[str, list]] = None,
     log_header: str,
     responses: list[str],
@@ -225,14 +239,24 @@ def print_table(
         qty,
     ):
         # Escape brackets for rich
+        rindex = query.rfind("Q:")
+        if rindex == -1:
+            rindex = -300
+            
         table.add_row(
-            f"[black on white]{rich_escape(query)}",
+            f"[black on white]{rich_escape(query[rindex:])}",
             f"[black on white]{rich_escape(response)}",
             f"{reward:0.3}",
             *map(rich_escape, extra),
         )
 
-    rich.print(table)
+    if RANK == 0:
+        kwargs_table = rich.table.Table("Key", "Value", title="Gen Kwargs")
+        for k, v in generation_kwargs.items():
+            kwargs_table.add_row(rich.markup.escape(str(k)), rich.markup.escape(str(v)))
+        
+        rich.print(kwargs_table)
+        rich.print(table)
 
 
 def check_all_start_with_token_id(tensors, token_id: int):
@@ -291,12 +315,14 @@ def print_trainable_parameters(
     return trainable_params
 
 
-def _load_then_peft_ize_model(
+def load_then_peft_ize_model(
     *,
     precision,
     peft_config_dict,
     model_name,
     use_peft,
+    forward_tokenizer,
+    prediction_tokenizer,
 ):
     lora_config = peft.LoraConfig(**peft_config_dict)
     config = transformers.AutoConfig.from_pretrained(model_name)  # type: ignore
@@ -322,16 +348,16 @@ def _load_then_peft_ize_model(
     # -> Precision specific
     ###########################################################################
     if precision in (
-        lib_utils.ValidPrecisions.int4,
-        lib_utils.ValidPrecisions.int8,
+        lib_utils.ValidPrecisions._4bit,
+        lib_utils.ValidPrecisions._8bit,
     ):
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
             device_map={"": torch.device(int(get_local_rank()))},
-            load_in_4bit=precision == lib_utils.ValidPrecisions.int4,
-            load_in_8bit=precision == lib_utils.ValidPrecisions.int8,
+            load_in_4bit=precision == lib_utils.ValidPrecisions._4bit,
+            load_in_8bit=precision == lib_utils.ValidPrecisions._8bit,
         )
-
+        
         # Make sure that there is only one device
         # & Make sure that it is a cuda device
         devices = set()
@@ -349,18 +375,56 @@ def _load_then_peft_ize_model(
             torch_dtype=precision.value,
         )
 
+    if not config.is_encoder_decoder:
+        # Fix pretrained model to handle the new pad token
+        assert len(forward_tokenizer) == len(prediction_tokenizer), (
+            f"{len(forward_tokenizer) = }\n" 
+            f"{len(prediction_tokenizer) = }"
+        )
+        assert forward_tokenizer.pad_token_id == prediction_tokenizer.pad_token_id, (
+            f"{forward_tokenizer.pad_token_id = }\n"
+            f"{prediction_tokenizer.pad_token_id = }"
+        )
+        assert forward_tokenizer.pad_token == prediction_tokenizer.pad_token, (
+            f"{forward_tokenizer.pad_token = }\n"
+            f"{prediction_tokenizer.pad_token = }"
+        )
+        pretrained_model.resize_token_embeddings(len(forward_tokenizer))
+        pretrained_model.config.pad_token_id = forward_tokenizer.pad_token_id
+
     # Peft-ize the model
     if use_peft:
-        if precision == lib_utils.ValidPrecisions.int8:
-            pretrained_model = peft.prepare_model_for_int8_training(
+        if precision == lib_utils.ValidPrecisions._4bit or precision == lib_utils.ValidPrecisions._8bit:
+            pretrained_model = peft.prepare_model_for_kbit_training(
                 pretrained_model,
             )
+            
         pretrained_model = peft.get_peft_model(
             pretrained_model,
             lora_config,
         )
 
     return pretrained_model
+
+def load_tokenizers(model_name, config):
+    forward_tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore
+        model_name)
+    prediction_tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore
+        model_name)
+    
+    if not config.is_encoder_decoder:
+        for tokenizer in (forward_tokenizer, prediction_tokenizer):
+            if tokenizer.pad_token is None:
+                tokenizer.add_special_tokens({"pad_token": "<pad>"})
+        
+        prediction_tokenizer.padding_side = "left"
+        forward_tokenizer.padding_side = "right"
+
+
+    return dict(
+        forward_tokenizer=forward_tokenizer, 
+        prediction_tokenizer=prediction_tokenizer,
+    )
 
 
 def init_model(
@@ -401,8 +465,35 @@ def init_model(
     if precision is None:
         precision = lib_utils.ValidPrecisions.float32
     precision = lib_utils.ValidPrecisions(precision)
+    config = transformers.AutoConfig.from_pretrained(  # type: ignore
+        model_name,
+        trust_remote_code=True,
+    )
+
+
+    ###########################################################################
+    # Tokenizer stuff
+    ###########################################################################
+    tmp_tokenizers = load_tokenizers(model_name, config)
+    forward_tokenizer = tmp_tokenizers["forward_tokenizer"]
+    prediction_tokenizer = tmp_tokenizers["prediction_tokenizer"]
+    del tmp_tokenizers
+
+    ###########################################################################
+    # HF Raw Model Stuff
+    ###########################################################################
+    if not config.is_encoder_decoder:
+        trl_cls = trl.models.AutoModelForCausalLMWithValueHead
+    else:
+        assert False
+        assert not (
+            (config.model_type == "t5")
+            and (precision == lib_utils.ValidPrecisions.float16)
+        ), "fp16 doesn't work with t5"
+        trl_cls = trl.models.AutoModelForSeq2SeqLMWithValueHead
 
     if peft_qlora_mode:
+        assert False
         assert precision in (
             lib_utils.ValidPrecisions.bfloat16,
             lib_utils.ValidPrecisions.float16,
@@ -418,41 +509,18 @@ def init_model(
         )
         
     else:
-        assert False, "This is not supported anymore."
-        pretrained_model = _load_then_peft_ize_model(
+        pretrained_model = load_then_peft_ize_model(
             peft_config_dict=peft_config_dict,
             model_name=model_name,
             precision=precision,
             use_peft=use_peft,
+            forward_tokenizer=forward_tokenizer,
+            prediction_tokenizer=prediction_tokenizer,
         )
 
-    config = transformers.AutoConfig.from_pretrained(  # type: ignore
-        model_name,
-        trust_remote_code=True,
-    )
-
-    forward_tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore
-        model_name)
-    prediction_tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore
-        model_name)
-
-    if not config.is_encoder_decoder:
-        trl_cls = trl.models.AutoModelForCausalLMWithValueHead
-        for tokenizer in (forward_tokenizer, prediction_tokenizer):
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-        
-        prediction_tokenizer.padding_side = "left"
-        forward_tokenizer.padding_side = "right"
-
-    else:
-        assert not (
-            (config.model_type == "t5")
-            and (precision == lib_utils.ValidPrecisions.float16)
-        ), "fp16 doesn't work with t5"
-        trl_cls = trl.models.AutoModelForSeq2SeqLMWithValueHead
-
-    # Initialize the trl model
+    ###########################################################################
+    # TRL Model
+    ###########################################################################
     if precision in (
         lib_utils.ValidPrecisions.float16,
         lib_utils.ValidPrecisions.bfloat16,
@@ -471,15 +539,13 @@ def init_model(
             pretrained_model,
         )
 
-    model.gradient_checkpointing_disable = typing.cast(
-        transformers.PreTrainedModel,  # type: ignore
-        model.pretrained_model,
-    ).gradient_checkpointing_disable
+    model.gradient_checkpointing_disable = (
+        model.pretrained_model.gradient_checkpointing_disable
+    )
 
-    model.gradient_checkpointing_enable = typing.cast(
-        transformers.PreTrainedModel,  # type: ignore
-        model.pretrained_model,
-    ).gradient_checkpointing_enable
+    model.gradient_checkpointing_enable = (
+        model.pretrained_model.gradient_checkpointing_enable
+    )
 
     output = print_trainable_parameters(model, True)
 
@@ -495,6 +561,10 @@ def batched_unroll(
     accelerated_model,
     accelerator: accelerate.Accelerator,
     prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
+    task_name,
+    dataset_name,
+    use_few_shots,
+    dataset_obj,
 ) -> lib_base_classes.BatchedUnrollReturn:
     model: transformers.PreTrainedModel = typing.cast(  # type: ignore
         transformers.PreTrainedModel,  # type: ignore
@@ -502,7 +572,8 @@ def batched_unroll(
     )
 
     if not model.config.is_encoder_decoder:
-        assert prediction_tokenizer.padding_side == "left", prediction_tokenizer.padding_side
+        assert prediction_tokenizer.padding_side == "left", (
+            prediction_tokenizer.padding_side)
 
     tokenized = prediction_tokenizer.pad(
         dict(
@@ -527,8 +598,16 @@ def batched_unroll(
         ).shape[1]
         responses = responses[:, seq_len:]
 
+    raw_responses = responses
+    if task_name == lib_utils.Task.MAIN:
+        if dataset_name == lib_data.DatasetChoices.COMMONSENSEQA_MC and use_few_shots:
+            responses = dataset_obj.post_process_gen_fewshots(raw_gen_outputs=responses, any_tokenizer=prediction_tokenizer)
+        elif use_few_shots:
+            assert not hasattr(dataset_obj, "post_process_gen_fewshots"), type(dataset_obj).mro()
+
     return lib_base_classes.BatchedUnrollReturn(
         response_tensors=list(responses),
+        raw_response_tensors=list(raw_responses),
         any_tokenizer=prediction_tokenizer,
     )
 

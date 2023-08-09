@@ -1,3 +1,4 @@
+import more_itertools
 import pathlib
 import typing
 from typing import Any, Optional, Union
@@ -5,22 +6,17 @@ from typing import Any, Optional, Union
 import torch
 import torch.utils.data
 
+import wget
+import xml
 
 class ASDiv(torch.utils.data.Dataset):
-    def __init__(self, *, tokenizer, cache_path, quiet=False, url=None):
+    def __init__(self, *, any_tokenizer, cache_path, quiet=False, url=None):
         self._ds = self._populate_ds(
             cache_path=cache_path,
             quiet=quiet,
             url=url,
         )
-        self._tokenizer = tokenizer
-
-        # Check that the keys are correct.
-        for inner_item in self._ds:
-            new_keys = {"question", "answer"}
-            assert not any(k in inner_item for k in new_keys), new_keys - (
-                new_keys & set(inner_item)
-            )
+        self._tokenizer = any_tokenizer
 
         super().__init__()
 
@@ -58,9 +54,27 @@ class ASDiv(torch.utils.data.Dataset):
         if not quiet:
             print("Parsing complete.")
 
-        return data
+
+        # Invert
+        data_keys = data[0].keys()
+        assert [x.keys() == data_keys for x in data]
+
+        inverted_data = {}
+        for key in data_keys:
+            inverted_data[key.lower()] = [x[key] for x in data]
+            
+        inverted_data["question"] = [
+            f"{body} {question}" 
+            for body, question in 
+            more_itertools.zip_equal(inverted_data["body"], inverted_data["question"])
+        ]
+        
+        return inverted_data
+    
 
     def _preprocess_question(self, question: str) -> str:
+        # Tok Detok.
+
         tokenized = self._tokenizer(
             question,
             add_special_tokens=False,
@@ -81,23 +95,9 @@ class ASDiv(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self._ds)
 
-    def _get_indiv_item(self, idx: int):
+    def __getitem__(self, *args, **kwargs):
         return dict(
-            question=self._preprocess_question(self._ds[idx]["question"]),
-            answer=self._ds[idx]["answer"],
+            question=self._ds["question"].__getitem__(*args, **kwargs),
+            answer=self._ds["answer"].__getitem__(*args, **kwargs),
         )
-
-    def __getitem__(self, idx_or_slice: typing.Union[int, slice]):
-        if isinstance(idx_or_slice, int):
-            return self._get_indiv_item(idx_or_slice)
-
-        elif isinstance(idx_or_slice, slice):
-            return [
-                self._get_indiv_item(i)
-                for i in range(
-                    idx_or_slice.start,
-                    idx_or_slice.stop,
-                    idx_or_slice.step,
-                )
-            ]
 

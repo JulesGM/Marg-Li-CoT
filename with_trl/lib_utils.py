@@ -1,6 +1,8 @@
 import contextlib
 import enum
 import os
+import typing
+from typing import Any, Optional, Union
 
 import numpy as np
 import rich
@@ -53,8 +55,8 @@ class Task(str, enum.Enum):
 
 
 class ValidPrecisions(enum.Enum):
-    int4 = "int4"
-    int8 = "int8"
+    _4bit = "int4"
+    _8bit = "int8"
     bfloat16 = torch.bfloat16
     float16 = torch.float16
     float32 = torch.float32
@@ -187,3 +189,61 @@ def maybe_context_manager(caller, disable):
     else:
         with caller():
             yield
+
+class DictDataset(torch.utils.data.Dataset):
+    # Object Pandas without the fluff
+
+    def __init__(self, keys):
+        self._dataset = {k: [] for k in keys}
+
+    def __getitem__(self, key: typing.Union[str, int]):
+        if isinstance(key, int):
+            return {k: v[key] for k, v in self._dataset.items()}
+        elif isinstance(key, str):
+            return self._dataset[key]
+        else:
+            raise TypeError(type(key))
+
+    def __len__(self) -> int:
+        one_len = len(next(iter(self._dataset.values())))
+        return one_len
+
+    def check_lens(self):
+        lengths = []
+        for v in self._dataset.values():
+            assert v is not self
+            lengths.append(len(v))
+
+        assert all(lengths[0] == l for l in lengths[1:]), lengths
+        return tuple(lengths)
+
+    def append(self, dict_) -> None:
+        assert dict_.keys() == self._dataset.keys(), (
+            dict_.keys(),
+            self._dataset.keys(),
+        )
+
+        for k, v in dict_.items():
+            self._dataset[k].append(v)
+
+    def __iter__(self):
+        len_ = len(self)
+
+        # We make a copy of the dataset to avoid
+        # the case when the dataset is modified
+        per_item_copy = [self[i] for i in range(len_)]
+        assert len(per_item_copy) == len_, (len(per_item_copy), len_)
+
+        return iter(per_item_copy)
+
+    def items(self):
+        return self._dataset.items()
+
+    def keys(self):
+        return self._dataset.keys()
+
+    def values(self):
+        return self._dataset.values()
+
+    def get_dict(self):
+        return self._dataset

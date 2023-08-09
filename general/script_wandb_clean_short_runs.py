@@ -10,8 +10,11 @@ from typing import *
 from beartype import beartype
 import fire
 import pretty_traceback  # type: ignore
+import rich.markup
+import rich.panel
 import rich.status
 import rich.table
+
 
 with rich.status.Status("Importing wandb...", spinner="monkey"):
     import wandb
@@ -20,7 +23,7 @@ with rich.status.Status("Importing wandb...", spinner="monkey"):
 pretty_traceback.install()
 NUM_MINUTES_TO_KEEP = 5
 NORMALIZED_LEN      = 2
-PROJECT_NAME        = "gsm8k"
+PROJECT_NAME        = None
 FILL_CHAR           = " "
 USERNAME            = "julesgm"
 
@@ -104,13 +107,14 @@ def prepare_duration(runtime):
     return hours, minutes, seconds, time_str
 
 
-def build_table(*, rows, qty_unchanged, qty_deleted):
+def build_table(*, project_name, rows, qty_unchanged, qty_deleted):
     table = rich.table.Table(
         "Name", 
         "Id",  
         "Runtime", 
         "Action", 
         "Date",
+        title=f"For project `{project_name}`:"
     )
     for row in rows:
         table.add_row(*row)
@@ -169,16 +173,31 @@ def build_info(*, min_minutes, runs):
         qty_deleted + qty_unchanged)
     
     return qty_unchanged, qty_deleted, rows
+
+
+
+def fetch_projects(username):
+    return wandb.Api().projects(username)
         
 
 @beartype
 def main(
     *,
     print_defaults: bool = False,
-    project_name:   str  = PROJECT_NAME,
+    project:   str  = PROJECT_NAME,
     min_minutes:    int  = NUM_MINUTES_TO_KEEP,
     username:       str  = USERNAME,
 ):
+
+    if project is None:
+        projects = fetch_projects(username)
+        rich.print(rich.panel.Panel("You need to pick a project name with [green bold]--project[/] when running the script."))
+        table = rich.table.Table("Project Names")
+        for project in projects:
+            table.add_row("[bold bright_cyan]" + rich.markup.escape(str(project.name)))
+        rich.print(table)
+        return
+    
 
     if print_defaults:
         rich.print("[bold white]Defaults:[/]")
@@ -192,7 +211,7 @@ def main(
 
     # Get all runs
     runs = fetch_runs(
-        project_name = project_name,
+        project_name = project,
         min_minutes  = min_minutes,
         username     = username,
     )
@@ -204,6 +223,7 @@ def main(
         )
             
         table = build_table(
+            project_name  = project,
             qty_unchanged = qty_unchanged,
             qty_deleted   = qty_deleted,
             rows          = rows,

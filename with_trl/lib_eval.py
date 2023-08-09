@@ -15,6 +15,7 @@ import trl
 import wandb
 
 import lib_base_classes
+import lib_data
 import lib_metric
 import lib_reward_exact_match
 import lib_reward_ppl
@@ -22,107 +23,11 @@ import lib_sentiment_specific
 import lib_trl_utils
 import lib_utils
 
+
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", 0))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 
-
-def evaluate_or_test(
-    *,
-    generation_kwargs: dict[str, typing.Any],
-    logging_header: str,
-    accelerator: accelerate.Accelerator,
-    accelerated_model,
-    dataloader,
-    reward_fn: typing.Callable[[list[str], list[str]], torch.Tensor],
-    prediction_tokenizer: transformers.PreTrainedTokenizerBase,
-    task_type: lib_utils.Task,
-    set_name: str,
-    metric,
-):
-    assert isinstance(
-        dataloader.sampler,
-        torch.utils.data.sampler.SequentialSampler,
-    )
-
-    rewards = []
-    metrics = []
-
-    for batch_idx, batch in enumerate(
-        lib_utils.progress(
-            description=logging_header,
-            total=len(dataloader),
-            seq=dataloader,
-        )
-    ):
-        if RANK == 0:
-            rich.print(
-                f"Rank:   {RANK}/{WORLD_SIZE} - "
-                + f"Split:  [bold white on blue]{set_name}[/] - "
-                + f"Batch:  {batch_idx}/{len(dataloader)} - "
-                + (f"Metric: {np.mean([x.item() for x in metrics]):0.2%} - ")
-                if metrics
-                else ""
-            )
-
-        ############################################################
-        # Keys of batch:
-        #   - "query"
-        #   - "input_ids"
-        #   - "ref_answer"
-        #   - "ref_scratchpad"
-        ############################################################
-        assert batch
-
-        output = lib_trl_utils.batched_unroll(
-            prediction_tokenizer=prediction_tokenizer,
-            generation_kwargs=generation_kwargs,
-            accelerated_model=accelerated_model,
-            accelerator=accelerator,
-            query_tensors=batch.tok_ref_query,
-        )
-
-
-        local_batch_rewards: lib_base_classes.RewardOutput = reward_fn(
-            responses=output.response_text,
-            batch=batch,
-        )
-        local_batch_metrics: lib_base_classes.MetricOutput = metric(
-            responses=output.response_text,
-            batch=batch,
-        )
-
-        gathered_batch_rewards = accelerator.gather_for_metrics(
-            tensor=torch.tensor(local_batch_rewards.values).to(
-                accelerator.device
-            ),
-        )
-
-        gathered_batch_metrics = accelerator.gather_for_metrics(
-            tensor=torch.tensor(local_batch_metrics.values).to(
-                accelerator.device
-            ),
-        )
-
-        rewards.extend(gathered_batch_rewards)
-        metrics.extend(gathered_batch_metrics)
-
-    reward = torch.stack(rewards, dim=0)
-    metric = torch.stack(metrics, dim=0)
-
-    LOGGER.info(
-        f"[bold red on white]\[{set_name}]EM Accuracy:[/] - {metric.mean().item():0.1%}"
-    )
-
-    if RANK == 0:
-        wandb.log(
-            {
-                f"inference_loop_fn/set_{set_name}/reward_mean": reward.mean().item(),
-                f"inference_loop_fn/set_{set_name}/reward_std": reward.std().item(),
-                f"inference_loop_fn/set_{set_name}/metric_mean": metric.mean().item(),
-                f"inference_loop_fn/set_{set_name}/metric_std": metric.std().item(),
-            }
-        )
 
 
 def make_eval_dataloader(
@@ -200,17 +105,21 @@ def make_metric_and_reward_fn(
 class EvalLoop:
     def __init__(
         self,
+        *,
         inference_gen_kwargs: typing.Dict[str, typing.Any],
+        prediction_tokenizer: transformers.PreTrainedTokenizerBase,
+        forward_tokenizer: transformers.PreTrainedTokenizerBase,
+        accelerated_model,
         eval_subset_size: int,
         metric_accuracy: typing.Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         accelerator: accelerate.Accelerator,
-        accelerated_model,
-        reward_fn,
-        prediction_tokenizer: transformers.PreTrainedTokenizerBase,
-        task_name: lib_utils.Task,
         batch_size: int,
+        reward_fn,
+        task_name: lib_utils.Task,
         dataset: torch.utils.data.Dataset,
         split: str,
+        use_few_shots: bool,
+        dataset_type: lib_data.DatasetChoices,
     ):
         dataloader = make_eval_dataloader(
             accelerator=accelerator,
@@ -220,26 +129,151 @@ class EvalLoop:
             subset_size=eval_subset_size,
         )
 
+        self._dataset_type = dataset_type
+        self._use_few_shots = use_few_shots
         self._inference_gen_kwargs = inference_gen_kwargs
+        self._prediction_tokenizer = prediction_tokenizer
+        self._forward_tokenizer = forward_tokenizer
+        self._accelerated_model = accelerated_model
         self._metric_accuracy = metric_accuracy
         self._set_dataloader = dataloader
         self._accelerator = accelerator
-        self._accelerated_model = accelerated_model
+        self._wandb_table_keys = (
+            "call_idx", 
+            "query_end", 
+            "raw_gen", 
+            "cleaned_gen", 
+            "ref", 
+            "extracted_answer",
+            "extracted_ref",
+        )
+        self._wandb_table = wandb.Table(columns=list(self._wandb_table_keys))
         self._reward_fn = reward_fn
-        self._prediction_tokenizer = prediction_tokenizer
         self._task_name = task_name
         self._split = split
+        self._call_idx = 0
+
+        # Unwrap dataset
+        seen = set([id(dataloader)])
+        maybe_dataset = dataloader.dataset
+        while hasattr(maybe_dataset, "dataset"):
+            seen.add(id(maybe_dataset))
+            assert id(maybe_dataset.dataset) not in seen # Prevent infinite loops
+            maybe_dataset = maybe_dataset.dataset
+        self._raw_dataset = maybe_dataset
+
+        assert use_few_shots is maybe_dataset.use_few_shots, (
+            use_few_shots, maybe_dataset.use_few_shots)
 
     def __call__(self):
-        evaluate_or_test(
-            prediction_tokenizer=self._prediction_tokenizer,
-            accelerated_model=self._accelerated_model,
-            generation_kwargs=self._inference_gen_kwargs,
-            logging_header=f"Doing Evaluation of set: {self._split}",
-            accelerator=self._accelerator,
-            dataloader=self._set_dataloader,
-            reward_fn=self._reward_fn,
-            task_type=self._task_name,
-            set_name=self._split,
-            metric=self._metric_accuracy,
+        assert isinstance(
+            self._set_dataloader.sampler,
+            torch.utils.data.sampler.SequentialSampler,
         )
+        
+        rewards = []
+        metrics = []
+        table_information = lib_utils.DictDataset(self._wandb_table_keys)
+
+        for batch_idx, batch in enumerate(
+            lib_utils.progress(
+                description=f"Doing Evaluation of set: {self._split}",
+                total=len(self._set_dataloader),
+                seq=self._set_dataloader,
+            )
+        ):
+            if RANK == 0:
+                rich.print(
+                    f"Rank:   {RANK}/{WORLD_SIZE} - "
+                    + f"Split:  [bold white on blue]{self._split}[/] - "
+                    + f"Batch:  {batch_idx}/{len(self._set_dataloader)} - "
+                    + (f"Metric: {np.mean([x.item() for x in metrics]):0.2%} - {metrics = }")
+                    if metrics
+                    else ""
+                )
+
+            ############################################################
+            # Keys of batch:
+            #   - "query"
+            #   - "input_ids"
+            #   - "ref_answer"
+            #   - "ref_scratchpad"
+            ############################################################
+            assert batch
+
+            output = lib_trl_utils.batched_unroll(
+                prediction_tokenizer=self._prediction_tokenizer,
+                generation_kwargs=self._inference_gen_kwargs,
+                accelerated_model=self._accelerated_model,
+                accelerator=self._accelerator,
+                query_tensors=batch.tok_ref_query,
+                use_few_shots=self._use_few_shots,
+                dataset_name=self._dataset_type,
+                task_name=self._task_name,
+                dataset_obj=self._raw_dataset
+            )
+
+            local_batch_rewards: lib_base_classes.RewardOutput = self._reward_fn(
+                responses=output.response_text,
+                batch=batch,
+            )
+            local_batch_metrics: lib_base_classes.MetricOutput = self._metric_accuracy(
+                responses=output.response_text,
+                batch=batch,
+            )
+
+            assert local_batch_rewards.extracted_gen == local_batch_metrics.extracted_gen, (
+                local_batch_rewards.extracted_gen, local_batch_metrics.extracted_gen
+            )
+            assert local_batch_rewards.extracted_ref == local_batch_metrics.extracted_ref, (
+                local_batch_rewards.extracted_ref, local_batch_metrics.extracted_ref
+            )
+
+            gathered_batch_rewards = self._accelerator.gather_for_metrics(
+                tensor=torch.tensor(local_batch_rewards.values).to(
+                    self._accelerator.device
+                ),
+            )
+
+            gathered_batch_metrics = self._accelerator.gather_for_metrics(
+                tensor=torch.tensor(local_batch_metrics.values).to(
+                    self._accelerator.device
+                ),
+            )            
+
+            for idx_in_batch in range(len(batch.detok_ref_query)):
+                rindex = batch.detok_ref_query[idx_in_batch].rindex("Q:")
+                table_information.append(dict(
+                    call_idx=str(self._call_idx),
+                    query_end=str(batch.detok_ref_query[idx_in_batch][rindex:]),
+                    raw_gen=str(output.raw_response_text[idx_in_batch]),
+                    cleaned_gen=str(output.response_text[idx_in_batch]),
+                    ref=str(batch.detok_ref_answer[idx_in_batch]),
+                    extracted_answer=str(local_batch_metrics.extracted_gen[idx_in_batch]),
+                    extracted_ref=str(local_batch_metrics.extracted_ref[idx_in_batch]),
+                ))
+
+            rewards.extend(gathered_batch_rewards)
+            metrics.extend(gathered_batch_metrics)
+
+        reward = torch.stack(rewards, dim=0)
+        metric = torch.stack(metrics, dim=0)
+
+        LOGGER.info(
+            f"[bold red on white]\[{self._split}]EM Accuracy:[/] - {metric.mean().item():0.1%}"
+        )
+
+        self._call_idx += 1
+        if RANK == 0:
+            self._wandb_table.add_data(*table_information.values())
+            
+            wandb.log(
+                {
+                    f"inference_loop_fn/set_{self._split}/reward_mean": reward.mean().item(),
+                    f"inference_loop_fn/set_{self._split}/reward_std": reward.std().item(),
+                    f"inference_loop_fn/set_{self._split}/metric_mean": metric.mean().item(),
+                    f"inference_loop_fn/set_{self._split}/metric_std": metric.std().item(),
+                    f"set_{self._split}/table": self._wandb_table,
+                }
+            )
+

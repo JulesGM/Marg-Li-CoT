@@ -6,7 +6,10 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
 os.environ["DATASETS_VERBOSITY"] = "warning"
 os.environ["WANDB_SILENT"] = "true"
 os.environ["NCCL_DEBUG"] = "WARN"
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+DETERMINISTIC = False
+if DETERMINISTIC:
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import enum
 import itertools
@@ -26,6 +29,7 @@ import rich.logging
 import rich.markup
 import rich.status
 import rich.table
+import rich.traceback 
 import torch
 import torch.backends
 import torch.backends.cuda
@@ -46,6 +50,8 @@ import lib_eval
 import lib_trl_utils
 import lib_utils
 
+rich.traceback.install()
+
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "0"))
 RANK = int(os.environ.get("RANK", "0"))
@@ -63,8 +69,6 @@ torch.manual_seed(2)
 torch.cuda.manual_seed_all(3)
 trl.set_seed(4)
 
-
-DETERMINISTIC = False
 torch.backends.cuda.matmul.allow_tf32 = not DETERMINISTIC
 torch.backends.cudnn.allow_tf32 = not DETERMINISTIC
 torch.use_deterministic_algorithms(DETERMINISTIC)
@@ -74,18 +78,20 @@ DEFAULT_REWARD_VERBOSE = False
 
 ##############################################################################
 ##############################################################################
-
+DEFAULT_USE_FEW_SHOTS = True
 DEFAULT_GEN_KWARGS = dict(
-    repetition_penalty=5.0,
+    repetition_penalty=1,
     min_new_tokens=5,
-    top_k=0.0,
-    top_p=1.0,
     early_stopping=True,
     synced_gpus=True,
+    temperature=1.,
+    do_sample=True,
+    top_k=0.0,
+    top_p=1.0,
 )
 
 DEFAULT_TASK_NAME: str = lib_utils.Task.MAIN
-DEFAULT_EVAL_EVERY: int = 16
+DEFAULT_EVAL_EVERY: int = 32
 
 if DEFAULT_TASK_NAME == lib_utils.Task.MAIN:
     DEFAULT_WANDB_PROJECT: str = "commonsense"
@@ -93,32 +99,28 @@ if DEFAULT_TASK_NAME == lib_utils.Task.MAIN:
     DEFAULT_DATASET_NAME = lib_data.DatasetChoices.COMMONSENSEQA_MC
 
     # -------------------------------------------------------
-    # DEFAULT_GEN_KWARGS["temperature"] = 1
-    DEFAULT_GEN_KWARGS["do_sample"] = False
-    # -------------------------------------------------------
     #########################################################
-    DEFAULT_GEN_KWARGS["num_beams"] = 26
-    DEFAULT_GEN_KWARGS["num_return_sequences"] = 26
+    # DEFAULT_GEN_KWARGS["num_beams"] = 0
+    DEFAULT_GEN_KWARGS["num_return_sequences"] = 16
 
-    DEFAULT_MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
-    # DEFAULT_MODEL_NAME: str = "ausboss/llama-30b-supercot"
-    DEFAULT_CAUSAL_QUESTION_PREFIX: str = (
-        "[INST]Answer the following question, include the associated letter in your response:\n"
-    )
-    DEFAULT_CAUSAL_QUESTION_SUFFIX: str = "[/INST]"
+    DEFAULT_MODEL_NAME = "EleutherAI/gpt-j-6B" # "meta-llama/Llama-2-7b-chat-hf"
+    # DEFAULT_MODEL_NAME: str = "EleutherAI/pythia-410m"
+    DEFAULT_BATCH_SIZE: int = 1
+    DEFAULT_INFERENCE_BATCH_SIZE: int = 2
 
-    DEFAULT_PEFT_QLORA_MODE = True
+    DEFAULT_GRADIENT_ACCUMULATION_STEPS: int = 8
+
+    DEFAULT_CAUSAL_QUESTION_PREFIX: str = ""
+    DEFAULT_CAUSAL_QUESTION_SUFFIX: str = ""
+
+    DEFAULT_PEFT_QLORA_MODE = False
     DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16
 
-    # DEFAULT_MODEL_NAME: str = "tiiuae/falcon-40b-instruct"
-    # DEFAULT_GEN_KWARGS["beam_search_sub_batch_size"] = 32
     #########################################################
     # -------------------------------------------------------
 
     DEFAULT_GEN_KWARGS["max_new_tokens"] = 200
     DEFAULT_MINI_BATCH_SIZE: int = 1
-    DEFAULT_BATCH_SIZE: int = 5
-    DEFAULT_GRADIENT_ACCUMULATION_STEPS: int = 16
 
     assert DEFAULT_EVAL_EVERY == 0 or DEFAULT_EVAL_EVERY >= (
         DEFAULT_GRADIENT_ACCUMULATION_STEPS // WORLD_SIZE
@@ -128,12 +130,10 @@ if DEFAULT_TASK_NAME == lib_utils.Task.MAIN:
         f"({DEFAULT_GRADIENT_ACCUMULATION_STEPS})"
     )
 
-    DEFAULT_INFERENCE_BATCH_SIZE: int = 4
     DEFAULT_INFERENCE_GEN_KWARGS = DEFAULT_GEN_KWARGS.copy()
     DEFAULT_INFERENCE_GEN_KWARGS["num_beams"] = 4
     DEFAULT_INFERENCE_GEN_KWARGS["do_sample"] = False
     DEFAULT_INFERENCE_GEN_KWARGS["num_return_sequences"] = 1
-
     # We could use a custom batch size too.
 
 
@@ -175,10 +175,10 @@ DEFAULT_LEARNING_RATE: float = 1.41e-5
 
 DEFAULT_PEFT_CONFIG = dict(
     inference_mode=False,
-    lora_dropout=0.0,
+    lora_dropout=0.,
     lora_alpha=16,
-    bias="none",
     r=16,
+    bias="none",
 )
 
 
@@ -194,8 +194,10 @@ def main(
     mini_batch_size: int = DEFAULT_MINI_BATCH_SIZE,
     causal_question_prefix: str = DEFAULT_CAUSAL_QUESTION_PREFIX,
     causal_question_suffix: str = DEFAULT_CAUSAL_QUESTION_SUFFIX,
+    peft_qlora_mode: bool = DEFAULT_PEFT_QLORA_MODE,
     learning_rate: float = DEFAULT_LEARNING_RATE,
     wandb_project: str = DEFAULT_WANDB_PROJECT,
+    dataset_name: str = DEFAULT_DATASET_NAME,
     just_metrics: bool = False,
     reward_type: Union[None, str, lib_utils.RewardChoices] = DEFAULT_REWARD_TYPE,
     model_name: str = DEFAULT_MODEL_NAME,
@@ -205,8 +207,7 @@ def main(
     task_name: lib_utils.Task = lib_utils.Task(DEFAULT_TASK_NAME),
     use_peft: bool = DEFAULT_USE_PEFT,
     name: Optional[str] = None,
-    dataset_name = DEFAULT_DATASET_NAME,
-    peft_qlora_mode: bool = DEFAULT_PEFT_QLORA_MODE,
+    use_few_shots: int = DEFAULT_USE_FEW_SHOTS,
 ):
     precision = lib_utils.ValidPrecisions(precision)  # type: ignore
     args = locals().copy()
@@ -232,7 +233,6 @@ def main(
     config = transformers.AutoConfig.from_pretrained(  # type: ignore
         model_name, trust_remote_code=True
     )
-
 
     if config.is_encoder_decoder:
         assert causal_question_prefix == "", (
@@ -263,7 +263,6 @@ def main(
         ]
     else:
         peft_config_dict = None
-
 
     ppo_config_dict = dict(
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -327,15 +326,17 @@ def main(
         split="train",
         question_prefix=causal_question_prefix,
         question_suffix=causal_question_suffix,
+        use_few_shots=use_few_shots,
     )
 
     eval_dataset = lib_data.prep_dataset_rl(
         input_max_length=input_max_length,
         dataset_name=dataset_name,
         any_tokenizer=forward_tokenizer,
-        split="test",
+        split="validation",
         question_prefix=causal_question_prefix,
         question_suffix=causal_question_suffix,
+        use_few_shots=use_few_shots,
     )
 
     ###########################################################################
@@ -371,9 +372,12 @@ def main(
     train_eval = lib_eval.EvalLoop(
         inference_gen_kwargs=inference_gen_kwargs,
         prediction_tokenizer=prediction_tokenizer,
+        forward_tokenizer=forward_tokenizer,
         accelerated_model=ppo_trainer.model,
         eval_subset_size=eval_subset_size,
         metric_accuracy=metric_accuracy,
+        use_few_shots=use_few_shots,
+        dataset_type=dataset_name,
         accelerator=ppo_trainer.accelerator,
         batch_size=inference_batch_size,
         reward_fn=reward_fn,
@@ -385,9 +389,12 @@ def main(
     eval_eval = lib_eval.EvalLoop(
         inference_gen_kwargs=inference_gen_kwargs,
         prediction_tokenizer=prediction_tokenizer,
+        forward_tokenizer=forward_tokenizer,
         accelerated_model=ppo_trainer.model,
         eval_subset_size=eval_subset_size,
         metric_accuracy=metric_accuracy,
+        use_few_shots=use_few_shots,
+        dataset_type=dataset_name,
         accelerator=ppo_trainer.accelerator,
         batch_size=inference_batch_size,
         reward_fn=reward_fn,
@@ -427,13 +434,19 @@ def main(
                 eval_eval()
                 rich.print("[red bold]DONE WITH EVAL")
 
+            print(f"{RANK} lib_trl_utils.batched_unroll >>>")
             raw_gen_outputs = lib_trl_utils.batched_unroll(
                 accelerated_model=ppo_trainer.model,
                 generation_kwargs=generation_kwargs,
                 query_tensors=batch.tok_ref_query,
                 accelerator=ppo_trainer.accelerator,
                 prediction_tokenizer=prediction_tokenizer,
+                dataset_name=dataset_name, 
+                use_few_shots=use_few_shots,
+                dataset_obj=dataset,
+                task_name=task_name, 
             )
+            print(f"{RANK} lib_trl_utils.batched_unroll <<<")
 
             if task_name == lib_utils.Task.MAIN:
                 outputs = lib_trl_utils.keep_good_one_generation(
@@ -460,6 +473,11 @@ def main(
             outputs = lib_base_classes.BatchedUnrollReturn(
                 response_tensors=lib_trl_utils.unpad(
                     responses=outputs.response_tensors,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=pad_token_id,
+                ),
+                raw_response_tensors=lib_trl_utils.unpad(
+                    outputs.raw_response_tensors,
                     eos_token_id=eos_token_id,
                     pad_token_id=pad_token_id,
                 ),
@@ -495,7 +513,6 @@ def main(
             # - For all models, the answers should have one or fewer eos token in them
             ###########################################################################
             if ppo_trainer.is_encoder_decoder:
-
                 assert isinstance(pad_token_id, int), type(pad_token_id)
                 lib_trl_utils.check_all_start_with_token_id(
                     outputs.response_tensors, pad_token_id)
@@ -517,11 +534,13 @@ def main(
                 )
 
 
+            print(f"{RANK} ppo_trainer.step >>>")
             stats = ppo_trainer.step(
                 queries=batch.tok_ref_query,
-                responses=typing.cast(list[torch.LongTensor], outputs.response_tensors),
+                responses=outputs.response_tensors,
                 scores=reward_output.values,
             )
+            print(f"{RANK} ppo_trainer.step done <<<")
 
             # Log stats
             assert isinstance(reward_output.values, list), type(reward_output.values)
@@ -540,12 +559,13 @@ def main(
 
             lib_trl_utils.print_table(
                 extra_columns=reward_output.logging_columns,
-                log_header=f"(b{batch_idx}e{epoch}) ",
+                log_header=f"(e{epoch}-b{batch_idx}) ",
                 responses=outputs.response_text,
                 queries=batch.detok_ref_query,
                 rewards=reward_output.values,
                 name=str(name),
                 qty=5,
+                generation_kwargs=generation_kwargs,
             )
 
 

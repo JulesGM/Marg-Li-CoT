@@ -82,8 +82,10 @@ def prep_dataset_rl(
     dataset_name: str,
     any_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
     split: str,
+    use_few_shots: int,
 ) -> libs_data.lib_base.Dataset:
     if dataset_name == DatasetChoices.GSM8K:
+        assert not use_few_shots, "n_few_shots must be 0 for GSM8K"
         assert isinstance(LOCAL_RANK, int), type(LOCAL_RANK)
         dataset = libs_data.lib_gsm8k.GSM8K(
             tok_max_query_length=input_max_length,
@@ -104,6 +106,7 @@ def prep_dataset_rl(
             split=split,
             question_prefix=question_prefix,
             question_suffix=question_suffix,
+            use_few_shots=use_few_shots,
         )
 
     elif dataset_name == DatasetChoices.ASDIV:
