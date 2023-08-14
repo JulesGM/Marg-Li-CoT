@@ -26,8 +26,10 @@ import sys
 from typing import Any, Optional, Union
 
 import accelerate
+import h5py
 import fire
-import more_itertools
+import more_itertools as mit
+import numpy as np
 import peft
 import rich
 import rich.markup
@@ -44,256 +46,242 @@ sys.path.append(str(SCRIPT_DIR.parent))
 import lib_trl_utils
 import lib_utils
 from approach_answer import lib_data_commonsense_qa
+from approach_answer import lib_approach_utils
+from approach_answer import lib_wandb_logger
+from approach_answer import lib_output_writer
 
 rich.traceback.install()
 
-LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
-if LOCAL_RANK == 0:
-    print("Done with imports")
+LOGGER = logging.getLogger(__name__)
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+RANK = int(os.environ.get("RANK", 0))
+if RANK == 0:
+    print("Done with imports")
 
 ###############################################################################
 # Defaut Hyperparameter Values, can be changed with CLI
 ###############################################################################
-DEFAULT_BATCH_SIZE = 4
-DEFAULT_MODEL_NAME = "EleutherAI/pythia-410m"
-DEFAULT_OUTPUT_PATH = "/network/scratch/g/gagnonju/scratchpad_gen_outputs/output_ds"
+DEFAULT_DO_DISTILLATION = False
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_PRECISION = lib_utils.ValidPrecisions._4bit
+DEFAULT_MODEL_NAME = "stabilityai/StableBeluga2"; 
+DEFAULT_BATCH_SIZE = 4; 
+# DEFAULT_MODEL_NAME = "EleutherAI/pythia-410m"; DEFAULT_BATCH_SIZE = 64; DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16
+# DEFAULT_MODEL_NAME = "EleutherAI/gpt-j-6B"; DEFAULT_BATCH_SIZE = 8; DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16
+DEFAULT_OUTPUT_PATH = "/network/scratch/g/gagnonju/scratchpad_gen_outputs/"
 DEFAULT_USE_PEFT = True
-DEFAULT_PEFT_CONFIG = dict(
-    inference_mode=False,
-    lora_dropout=0.,
-    lora_alpha=16,
-    bias="none",
-    r=16,
-    task_type=peft.TaskType.CAUSAL_LM,
-)
+
 DEFAULT_GENERATE_KWARGS = dict(
     max_new_tokens=200,
     min_new_tokens=4,
-    num_beams=4,
     do_sample=False,
-    synced_gpus=True,
+    synced_gpus=os.environ.get("ACCELERATE_DEEPSPEED_ZERO_STAGE", "") == "3",
 )
+
 DEFAULT_WANDB_PROJECT = "fed-answer-gen"
 DEFAULT_WANDB_ENTITY = "julesgm"
 ###############################################################################
 
 
-def data_collator(batch, prediction_tokenizer):
+def data_collator(batch, prediction_tokenizer, device):
     assert prediction_tokenizer.padding_side == "left", prediction_tokenizer.padding_side
-    input_text = [x["ref_fs_scratchpad_gen_query"] for x in batch]
     
     return dict(
-        inputs=prediction_tokenizer(input_text, return_tensors="pt", padding=True).to(LOCAL_RANK), 
+        inputs=prediction_tokenizer.pad(
+                dict(input_ids=[x["ref_fs_scratchpad_gen_query_tok"] for x in batch]),
+                return_tensors="pt",
+            ).to(device),
         other_info=batch,
     )
 
-def convert_args_for_wandb(args):
-    ok_collection_types = (dict, list, tuple)
-    ok_indiv_types = (int, float, str, bool)
-    ok_types_all = ok_collection_types + ok_indiv_types
 
-    if isinstance(args, dict):
-        for k, v in args.items():
-            if not isinstance(v, ok_types_all):
-                args[k] = str(v)
-            elif isinstance(v, ok_collection_types):
-                args[k] = convert_args_for_wandb(v)
-            else:
-                # Logically this should only happen if in ok_indiv_types, the check is unnecessary
-                assert isinstance(v, ok_indiv_types), f"Unexpected type {type(v).mro()} for {k}: {v}"
-
-    elif isinstance(args, (list, tuple)):
-        is_tuple = isinstance(args, tuple)
-        args = list(args)
-        for i, v in enumerate(args):
-            if not isinstance(v, ok_types_all):
-                args[i] = str(v)
-            elif isinstance(v, ok_collection_types):
-                args[i] = convert_args_for_wandb(v)
-            else:
-                # Logically this should only happen if in ok_indiv_types, the check is unnecessary
-                assert isinstance(v, ok_indiv_types), f"Unexpected type {type(v).mro()} for {i}: {v}"
-
-        if is_tuple:
-            args = tuple(args)
-
-    else:
-        raise ValueError(f"Unexpected type {type(args).mro()} for {args}")
-
-    return args
-            
-
-class OutputSampleWriter:
-    def __init__(
-        self, 
+def gathered_batch_gen(
         *, 
-        output_path: str, 
-        prediction_tokenizer: transformers.PreTrainedTokenizerBase,
-        split: str,
+        accelerator: accelerate.Accelerator, 
+        model: transformers.PreTrainedModel,
+        batch: dict[str, torch.Tensor],
+        generate_kwargs: dict[str, Any],
+        forward_tokenizer: transformers.PreTrainedTokenizerBase,
+        do_distillation: bool,
     ):
-        assert split in ("train", "validation", "test")
-        
-        self._output_path = pathlib.Path(output_path)
-        self._output_file = (self._output_path / f"samples.{split}.jsonl").open("w")
-        self._prediction_tokenizer = prediction_tokenizer
-        self._split = split
 
-    def close(self):
-        self._output_file.close()
+    line_return_id = mit.last(forward_tokenizer.encode("\n"))
+    output = accelerator.unwrap_model(model).generate(
+        **batch["inputs"],
+        **generate_kwargs,
 
-    def __call__(
-        self, 
-        *, 
-        batch,
-        raw_output_sample_ids,
-        clean_output_sample_ids,
-    ) -> Any:
-        
-        clean_batch_gen_txt = self._prediction_tokenizer.batch_decode(
-            clean_output_sample_ids, 
-            skip_special_tokens=True
-        )
-        raw_batch_gen_txt = self._prediction_tokenizer.batch_decode(
-            raw_output_sample_ids, 
-            skip_special_tokens=True
-        )
-        # This format matches the few-shot examples
+        use_cache=True,
+        output_scores=True,
+        early_stopping=True,
+        return_dict_in_generate=True,
+        eos_token_id=line_return_id,
+    )
 
-        for sample, clean_gen_txt, raw_gen_txt in more_itertools.zip_equal(
-            batch,
-            clean_batch_gen_txt,
-            raw_batch_gen_txt,
-        ):
-            json_txt = json.dumps(dict(
-                **sample,
-                clean_gen_scratchpad_txt=clean_gen_txt,
-                raw_gen_scratchpad_txt=raw_gen_txt,
-            ))
+    scores = output.scores
+    output_tokens = output.sequences
+    del output
 
-            self._output_file.write(json_txt.strip() + "\n")
-
-
-class WandbLoggingState:
-    def __init__(self, any_tokenizer, split, also_print):
-        self._any_tokenizer = any_tokenizer
-        self._table = wandb.Table(columns=["batch_idx", "ref_inputs", "clean_output", "raw_output"])
-        self._table_just_clean_gen = wandb.Table(columns=["clean_output"])
-        self._split = split
-        self._also_print = also_print
-        
-
-    def log(
-            self,
-            *,
-            batch_idx,
-            batch,
-            raw_output_tokens,
-            clean_output_tokens,
-        ):
-        
-        raw_output_text = self._any_tokenizer.batch_decode(raw_output_tokens, skip_special_tokens=False)
-        clean_output_text = self._any_tokenizer.batch_decode(clean_output_tokens, skip_special_tokens=True)
-        
-        if self._also_print:
-            self._rich_table = rich.table.Table("batch_idx", "ref_inputs", "clean_output", show_lines=True)
-
-        for clean_text, raw_text, sample in more_itertools.zip_equal(clean_output_text, raw_output_text, batch):
-            end_prompt = sample["ref_fs_scratchpad_gen_query_detok"][sample["ref_fs_scratchpad_gen_query_detok"].rfind("Q:"):]
-
-            self._table.add_data(
-                batch_idx,
-                end_prompt,
-                clean_text,
-                raw_output_text
-            )
-            self._table_just_clean_gen.add_data(clean_text)
-
-            if self._also_print:
-                self._rich_table.add_row(
-                    str(batch_idx),
-                    rich.markup.escape(end_prompt),
-                    rich.markup.escape(clean_text),
-                    # rich.markup.escape(raw_text),
-                )
-
-        rich.print(self._rich_table)
-        wandb.log({f"{self._split}/batch": self._table})
-        wandb.log({f"{self._split}/just_clean_gen": self._table_just_clean_gen})
-
-    __call__ = log
-
-
-def gathered_batch_gen(*, accelerator, model, batch, generate_kwargs, prediction_tokenizer):
-    output_tokens = accelerator.unwrap_model(model).generate(
-                **batch["inputs"], **generate_kwargs,)
     before_shape = output_tokens.shape
     output_tokens = output_tokens[:, batch["inputs"]["input_ids"].shape[1]:].contiguous()
+    scores = torch.stack(scores, dim=1).contiguous()
+    assert output_tokens.shape == scores.shape[:2], (output_tokens.shape, scores.shape[:2])
     assert output_tokens.shape[1], (output_tokens.shape, before_shape)
+
+    ###########################################################################
+    # Extract the tokens and the logits up to the first line return.
+    ###########################################################################
     
-    # Clean the output
-    clean_text = [
-        x.strip().split("\n", 1)[0] 
-        for x in 
-        prediction_tokenizer.batch_decode(output_tokens, skip_special_tokens=True)
-    ]
-    clean_output_tokens = prediction_tokenizer(clean_text, return_tensors="pt", padding=True)["input_ids"].to(LOCAL_RANK).contiguous()
+    attempt_clean_tokens = []
+    
+    if do_distillation:
+        attempt_clean_logits = []
+    
+    for batch_id, ids in enumerate(output_tokens):
+        """
+        text = forwards_tokenizer.decode(ids)
+        first_lr_str = text.find("\n")
+        if first_lr_str == -1:
+            first_lr = None
+        else:
+            ids = forwards_tokenizer.encode(text)
+            assert all(x == y for x, y in mit.zip_equal(ids, output_tokens[batch_id])
+            first_lr = ids.char_to_token(first_lr_str)
+        """
 
-    return accelerator.gather(clean_output_tokens).detach().cpu(), accelerator.gather(output_tokens).detach().cpu()
+        try:
+            first_lr = ids.tolist().index(line_return_id)
+        except ValueError as e:
+            # If we don't find a line return, just use the whole thing
+            if "is not in list" in str(e):
+                first_lr = None
+            else:
+                raise
 
+        assert ids.ndim == 1, ids.shape
+        attempt_clean_tokens.append(ids[:first_lr])
 
-def write_args_to_file(args, output_path):
-    with open(output_path / "config.json", "w") as f:
-        json.dump(dict(args=args, wandb_url=wandb.run.get_url(),), f, indent=4)
+        if do_distillation:
+            attempt_clean_logits.append(scores[batch_id, :first_lr].detach())
 
+    ###########################################################################
+    # Gather the clean tokens
+    ###########################################################################
+    # The tokens need to be stored in a tensor that is of the same shape
+    # on all the processes first.
+    ###########################################################################
+    local_padded_clean_tokens = forward_tokenizer.pad(
+        dict(input_ids=attempt_clean_tokens),
+        return_tensors="pt",
+    )["input_ids"].to(accelerator.device)
 
-def print_dict_as_table(d, **table_kwargs):
-    table = rich.table.Table("Key", "Value", **table_kwargs)
-    for k, v in d.items():
-        table.add_row(rich.markup.escape(str(k)), rich.markup.escape(str(v)))
-    rich.print(table)
+    global_padded_tokens = accelerator.pad_across_processes(
+        local_padded_clean_tokens,
+        pad_index=forward_tokenizer.pad_token_id,
+        pad_first=False,
+        dim=1,
+    )
+    gathered_attempt_clean_tokens = accelerator.gather(global_padded_tokens).cpu()
+    del local_padded_clean_tokens, global_padded_tokens
+
+    ###########################################################################
+    # Gather the raw tokens
+    ###########################################################################
+    # Similar, but the local sizes already match.
+    ###########################################################################
+    global_padded_raw_ids = accelerator.pad_across_processes(
+        output_tokens,
+        pad_index=forward_tokenizer.pad_token_id,
+        pad_first=False,
+        dim=1,
+    )
+    gathered_raw_output_tokens = accelerator.gather(global_padded_raw_ids).cpu()
+    del global_padded_raw_ids
+
+    ###########################################################################
+    # Gather logits
+    ###########################################################################
+    # Logits are a bit more complicated. They need to be padded in 2D.
+    # We don't pad locally to save on transfer qties.
+    ###########################################################################
+    if do_distillation:
+        clean_logits = lib_approach_utils.pad_logits_across_processes(
+            accelerator=accelerator,
+            logits=clean_logits, 
+            fill_value=float("nan"), 
+        ).to(accelerator.device)
+        gathered_attempt_clean_logits = accelerator.gather(
+            attempt_clean_logits
+        ).cpu()
+
+    return dict(
+        clean_output_tokens=gathered_attempt_clean_tokens,
+        clean_logits=gathered_attempt_clean_logits if do_distillation else None,
+        raw_output_tokens=gathered_raw_output_tokens,
+) 
 
 
 def main(
     run_name: str="gen-scratchpad",
     generate_kwargs: dict=DEFAULT_GENERATE_KWARGS,
     model_name: str = DEFAULT_MODEL_NAME,
-    use_peft: bool=DEFAULT_USE_PEFT,
-    precision: lib_utils.ValidPrecisions=lib_utils.ValidPrecisions.bfloat16,
-    output_path: str=DEFAULT_OUTPUT_PATH,
-    peft_config_dict=DEFAULT_PEFT_CONFIG,
+    output_path: str = DEFAULT_OUTPUT_PATH,
     wandb_project: str = DEFAULT_WANDB_PROJECT,
     wandb_entity: str = DEFAULT_WANDB_ENTITY,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    do_distillation: bool = DEFAULT_DO_DISTILLATION,
+    precision: int = DEFAULT_PRECISION,
 ):
-    args = convert_args_for_wandb(locals().copy())
-    print_dict_as_table(args, title="[blue bold]Script Args:")
     
+    args = lib_approach_utils.convert_args_for_wandb(locals().copy())
+    accelerator = accelerate.Accelerator()
+    if accelerator.is_main_process:
+        lib_approach_utils.print_dict_as_table(args, title="[blue bold]Script Args:")
+    DatasetCls = lib_data_commonsense_qa.CommonSenseScratchpadGenMC
+
     ###########################################################################
     # Setup the directories for logging / data saving
     ###########################################################################
-    precision = lib_utils.ValidPrecisions(precision)
     output_path = pathlib.Path(output_path) 
+    output_path /= run_name.replace(" ", "-"
+        ).replace("\n", "-"
+        ).replace("\t", "-"
+        ).replace("/", "-"
+    )
     assert output_path.parent.exists(), f"Parent directory of {output_path} does not exist."
-    output_path.mkdir(exist_ok=False)
+    if accelerator.is_main_process:
+        output_path.mkdir(exist_ok=False)
+        # We don't need to wait because only RANK 0 
+        # writes in the directory
 
     ###########################################################################
     # Setup wandb & save the script config
     ###########################################################################
-    wandb.init(
-        project=wandb_project,
-        entity=wandb_entity,
-        config=args,
-        name=run_name,
+    config_dict = dict(
+        args=args, 
+        few_shots_str=DatasetCls.FEW_SHOTS_STR,
+        dataset_class_name=DatasetCls.__name__,
     )
-    write_args_to_file(args, output_path)
+    if accelerator.is_main_process:
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            config=config_dict,
+            name=run_name,
+        )            
+        lib_approach_utils.write_args_to_file(
+            config_dict=config_dict,
+            output_path=output_path,
+        )
 
     ###########################################################################
     # Load the tokenizers, the model, and the peft model, then distribute it.
     ###########################################################################
     config = transformers.AutoConfig.from_pretrained(  # type: ignore
         model_name,
-        trust_remote_code=True,
     )
 
     tmp_tokenizers = lib_trl_utils.load_tokenizers(
@@ -305,18 +293,24 @@ def main(
     prediction_tokenizer = tmp_tokenizers["prediction_tokenizer"]
     del tmp_tokenizers
 
+    if accelerator.is_main_process:
+        rich.print("Loading the model...")
+
     pretrained_model = lib_trl_utils.load_then_peft_ize_model(
-        peft_config_dict=peft_config_dict,
-        model_name=model_name,
         precision=precision,
-        use_peft=use_peft,
+        use_peft=False,
+        peft_config_dict=None,
+        model_name=model_name,
         forward_tokenizer=forward_tokenizer,
         prediction_tokenizer=prediction_tokenizer,
     )
-    
-    accelerator = accelerate.Accelerator()
     model = accelerator.prepare_model(pretrained_model)
+    model = model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
 
+    if accelerator.is_main_process:
+        rich.print("Model loaded.")
 
     ###########################################################################
     # Setup the per split 
@@ -332,8 +326,7 @@ def main(
         wandb_logging_states = {}
 
     for split in ["train", "validation"]:
-
-        datasets[split] = lib_data_commonsense_qa.CommonSenseScratchpadGenMC(
+        datasets[split] = DatasetCls(
             any_tokenizer=prediction_tokenizer,
             split=split,
         )
@@ -344,22 +337,33 @@ def main(
                 shuffle=False, 
                 batch_size=batch_size, 
                 collate_fn=lambda samples: data_collator(
-                    samples, prediction_tokenizer=prediction_tokenizer,
+                    samples, 
+                    prediction_tokenizer=prediction_tokenizer,
+                    device=accelerator.device,
                 ),
             )
         )
 
         if accelerator.is_main_process:
-            output_writers[split] = OutputSampleWriter(
+            output_writers[split] = lib_output_writer.OutputSampleWriter(
+                do_distillation=do_distillation,
+                forward_tokenizer=forward_tokenizer,
                 output_path=output_path, 
                 split=split, 
                 prediction_tokenizer=prediction_tokenizer,
+                dataset_split_size=len(datasets[split]),
+                max_gen_len=generate_kwargs["max_new_tokens"],
+                few_shots_str=DatasetCls.FEW_SHOTS_STR,
             )
-            wandb_logging_states[split] = WandbLoggingState(
+            wandb_logging_states[split] = lib_wandb_logger.WandbLoggingState(
                 any_tokenizer=prediction_tokenizer, 
                 split=split,
                 also_print=True,
             )
+        # Lots of stuff happening in OutputSampleWriter.__init__ so we don't
+        # want to let the other processes get too far ahead, where the
+        # timeouts on the gathers may trigger
+        accelerator.wait_for_everyone()
 
     ###########################################################################
     # Main action, generation loop.
@@ -373,30 +377,47 @@ def main(
             desc=f"GENERATING FOR {split}", 
             disable=not accelerator.is_main_process
         )):
-            
-            clean_gathered_output_tokens, raw_gathered_output_tokens = gathered_batch_gen(
+            returned_dict = gathered_batch_gen(
                 generate_kwargs=generate_kwargs,
                 accelerator=accelerator, 
                 model=model, 
                 batch=batch,
-                prediction_tokenizer=prediction_tokenizer,
+                forward_tokenizer=forward_tokenizer,
+                do_distillation=do_distillation,
             )
+            clean_gathered_output_tokens = returned_dict["clean_output_tokens"]
+            raw_gathered_output_tokens   = returned_dict["raw_output_tokens"]
+            clean_gathered_logits        = returned_dict["clean_logits"]
 
+            gathered_batch = lib_output_writer.OutputSampleWriter.gather_batch_for_writing(
+                batch["other_info"])
+            
             if accelerator.is_main_process:
+
                 output_writers[split](
-                    batch=batch["other_info"],
-                    raw_output_sample_ids=raw_gathered_output_tokens.detach().cpu().numpy(),
-                    clean_output_sample_ids=clean_gathered_output_tokens.detach().cpu().numpy(),
+                    gathered_batch=gathered_batch,
+                    clean_gathered_output_sample_ids=clean_gathered_output_tokens,
+                    clean_gathered_logits=clean_gathered_logits,
                 )
+
+                # We only log local samples
                 wandb_logging_states[split](
                     batch_idx=batch_idx,
                     batch=batch["other_info"], 
-                    raw_output_tokens=raw_gathered_output_tokens,
-                    clean_output_tokens=clean_gathered_output_tokens,
+                    # Will always take the first set
+                    raw_output_tokens=raw_gathered_output_tokens[
+                        batch_size * accelerator.local_process_index:
+                        batch_size * (accelerator.local_process_index + 1)
+                    ],
+                    clean_output_tokens=clean_gathered_output_tokens[
+                        batch_size * accelerator.local_process_index:
+                        batch_size * (accelerator.local_process_index + 1)
+                    ],
                 )
 
         if accelerator.is_main_process:
             output_writers[split].close()
+
 
 if __name__ == "__main__":
     fire.Fire(main)

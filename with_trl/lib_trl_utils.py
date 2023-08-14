@@ -1,4 +1,5 @@
 import collections
+import contextlib
 import itertools
 import os
 import typing
@@ -317,21 +318,24 @@ def print_trainable_parameters(
 
 def load_then_peft_ize_model(
     *,
-    precision,
+    precision: lib_utils.ValidPrecisions,
     peft_config_dict,
-    model_name,
-    use_peft,
-    forward_tokenizer,
-    prediction_tokenizer,
+    model_name: str,
+    use_peft: bool,
+    forward_tokenizer: transformers.PreTrainedTokenizer,
+    prediction_tokenizer: transformers.PreTrainedTokenizer,
 ):
-    lora_config = peft.LoraConfig(**peft_config_dict)
+    if use_peft:
+        lora_config = peft.LoraConfig(**peft_config_dict)
+
     config = transformers.AutoConfig.from_pretrained(model_name)  # type: ignore
 
     ###########################################################################
     # Model Class Specific Options
     ###########################################################################
     if not config.is_encoder_decoder:
-        assert lora_config.task_type == peft.TaskType.CAUSAL_LM
+        if use_peft:
+            assert lora_config.task_type == peft.TaskType.CAUSAL_LM
         transformers_cls = transformers.AutoModelForCausalLM  # type: ignore
 
     else:
@@ -340,7 +344,8 @@ def load_then_peft_ize_model(
             and (precision == lib_utils.ValidPrecisions.float16)
         ), "fp16 doesn't work with t5"
 
-        assert lora_config.task_type == peft.TaskType.SEQ_2_SEQ_LM
+        if use_peft:
+            assert lora_config.task_type == peft.TaskType.SEQ_2_SEQ_LM
         transformers_cls = transformers.AutoModelForSeq2SeqLM  # type: ignore
 
     ###########################################################################
@@ -351,11 +356,23 @@ def load_then_peft_ize_model(
         lib_utils.ValidPrecisions._4bit,
         lib_utils.ValidPrecisions._8bit,
     ):
+        
+        quantization_config = transformers.BitsAndBytesConfig(
+                load_in_4bit=precision == lib_utils.ValidPrecisions._4bit,
+                load_in_8bit=precision == lib_utils.ValidPrecisions._8bit,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+        
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
-            device_map={"": torch.device(int(get_local_rank()))},
+            device_map={"": torch.device(int(LOCAL_RANK))},
             load_in_4bit=precision == lib_utils.ValidPrecisions._4bit,
             load_in_8bit=precision == lib_utils.ValidPrecisions._8bit,
+            quantization_config=quantization_config,
         )
         
         # Make sure that there is only one device
@@ -370,6 +387,7 @@ def load_then_peft_ize_model(
 
     else:
         assert isinstance(precision.value, torch.dtype), f"{type(precision.value) = }"
+            
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
             torch_dtype=precision.value,

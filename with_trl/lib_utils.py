@@ -4,6 +4,7 @@ import os
 import typing
 from typing import Any, Optional, Union
 
+import accelerate
 import numpy as np
 import rich
 import rich.table
@@ -247,3 +248,4 @@ class DictDataset(torch.utils.data.Dataset):
 
     def get_dict(self):
         return self._dataset
+    
