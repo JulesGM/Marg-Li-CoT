@@ -324,11 +324,16 @@ def load_then_peft_ize_model(
     use_peft: bool,
     forward_tokenizer: transformers.PreTrainedTokenizer,
     prediction_tokenizer: transformers.PreTrainedTokenizer,
+    just_device_map: bool,
 ):
     if use_peft:
         lora_config = peft.LoraConfig(**peft_config_dict)
 
     config = transformers.AutoConfig.from_pretrained(model_name)  # type: ignore
+    if just_device_map:
+        assert not use_peft, "not written with that in mind"
+        assert precision == lib_utils.ValidPrecisions.bfloat16, precision
+
 
     ###########################################################################
     # Model Class Specific Options
@@ -386,13 +391,18 @@ def load_then_peft_ize_model(
         assert len(devices) == 1, devices
 
     else:
-        assert isinstance(precision.value, torch.dtype), f"{type(precision.value) = }"
-            
+        assert isinstance(precision.value, torch.dtype), (
+            f"{type(precision.value) = }")
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
             torch_dtype=precision.value,
+            device_map="auto" if just_device_map else None,
         )
+        assert all(x.device.type == "cuda" for x in pretrained_model.parameters())
 
+    ###########################################################################
+    # Fix tokenizers for causal models
+    ###########################################################################
     if not config.is_encoder_decoder:
         # Fix pretrained model to handle the new pad token
         assert len(forward_tokenizer) == len(prediction_tokenizer), (
@@ -410,9 +420,13 @@ def load_then_peft_ize_model(
         pretrained_model.resize_token_embeddings(len(forward_tokenizer))
         pretrained_model.config.pad_token_id = forward_tokenizer.pad_token_id
 
+    ###########################################################################
     # Peft-ize the model
+    ###########################################################################
     if use_peft:
-        if precision == lib_utils.ValidPrecisions._4bit or precision == lib_utils.ValidPrecisions._8bit:
+        if (precision == lib_utils.ValidPrecisions._4bit or 
+            precision == lib_utils.ValidPrecisions._8bit
+        ):
             pretrained_model = peft.prepare_model_for_kbit_training(
                 pretrained_model,
             )

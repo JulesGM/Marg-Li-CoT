@@ -51,6 +51,7 @@ import lib_trl_utils
 import lib_utils
 
 rich.traceback.install()
+datasets.disable_caching()
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "0"))

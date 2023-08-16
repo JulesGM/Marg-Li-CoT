@@ -8,7 +8,8 @@ from libs_sft import lib_constants
 
 class EncoderDecoderCollator:
     def __init__(self, output_type, tokenizer):
-    
+        assert False
+
         self._output_type = output_type
         self._tokenizer = tokenizer
         self._data_collator_base = transformers.DataCollatorForSeq2Seq( # type: ignore
@@ -52,6 +53,8 @@ class CausalFullCollator:
     ):
 
         self._forward_tokenizer = forward_tokenizer
+        self._prediction_tokenizer = prediction_tokenizer
+
         self._output_type = output_type
         self._forward_inner_collator = (
             transformers.DataCollatorForLanguageModeling( # type: ignore
@@ -59,8 +62,6 @@ class CausalFullCollator:
                 mlm=False,
             ))
         
-        self._prediction_tokenizer = prediction_tokenizer
-
         assert self._prediction_tokenizer.padding_side == "left", (
             self._prediction_tokenizer.padding_side)
         assert self._forward_tokenizer.padding_side == "right", (
@@ -75,8 +76,8 @@ class CausalFullCollator:
         if self.output_type == lib_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER:
             forward_input_text = [
                 # self._forward_tokenizer.bos_token +
-                self._forward_tokenizer.decode(f.tok_ref_query, skip_special_tokens=True) + 
-                self._forward_tokenizer.decode(f.tok_ref_scratchpad, skip_special_tokens=True)
+                self._forward_tokenizer.decode(f.tok_ref_query, skip_special_tokens=True) + " " +
+                f["output"].strip()
                 for f in features
             ]
 
@@ -96,18 +97,15 @@ class CausalFullCollator:
             [self._forward_tokenizer.eos_token_id] 
             for forward_input_text in forward_input_text
         ]
-        del forward_input_text
 
+        del forward_input_text
         assert self._forward_tokenizer.pad_token_id != self._forward_tokenizer.eos_token_id, (
             "This is bad for training with the language modeling collator. It makes it so "
             "the eos token is masked for no reason, the model doesn't know when to stop."
         )
-        
-        forward_inputs = self._forward_inner_collator(forward_input_ids)
-        
 
         return dict(
-            forward=forward_inputs,
+            forward=self._forward_inner_collator(forward_input_ids),
             predict=lib_data.data_item_collator(features)
         )
 

@@ -1,22 +1,15 @@
 """ Datasets parsing and loading. """
 
-import collections
 import collections.abc
-import dataclasses
 import enum
 import logging
-import math
 import os
-import re
-import time
-import typing
-import xml
-import xml.etree
 from pathlib import Path
+import typing
 from typing import Any, Optional, Union
 
 import datasets
-import more_itertools
+import more_itertools as mit
 import numpy as np
 import rich
 import rich.box
@@ -25,12 +18,8 @@ import torch
 import torch.utils
 import torch.utils.data
 import transformers
-import wget
-from text2digits import text2digits
 
 import lib_base_classes
-import lib_sentiment_specific
-import lib_utils
 import libs_data
 import libs_extraction
 
@@ -127,53 +116,3 @@ def prep_dataset_rl(
 
     return dataset
 
-
-def prep_dataset_sft(
-    *,
-    max_total_length_tok: typing.Optional[int],
-    question_prefix: str,
-    question_suffix: str,
-    task_name: str,
-    any_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-    split: str,
-) -> libs_data.lib_base.Dataset:
-    assert split in ["train", "eval",], split
-    
-    if task_name == DatasetChoices.GSM8K:
-        assert isinstance(LOCAL_RANK, int), type(LOCAL_RANK)
-        
-        dataset = libs_data.lib_gsm8k.GSM8K(
-            tok_max_total_length=max_total_length_tok,
-            question_prefix=question_prefix,
-            question_suffix=question_suffix,
-            any_tokenizer=any_tokenizer,
-            device=torch.device(LOCAL_RANK),
-            ds=datasets.load_dataset(  # type: ignore
-                split="train" if split == "train" else "test",
-                path="gsm8k",
-                name="main",
-            ),
-        )
-
-    elif task_name == DatasetChoices.ASDIV:
-        raise NotImplemented("ASDiv not implemented for SFT")
-        assert split is None, "split must be None for ASDiv"
-        dataset = ASDiv(
-            tokenizer=tokenizer,
-            cache_path="/tmp/asdiv",
-        )
-
-    elif task_name == DatasetChoices.SENTIMENT:
-        
-        dataset = lib_sentiment_specific.prep_dataset_sft(
-            any_tokenizer, split, 
-            maxlen_tok=1024, 
-            minlen_tok=100,
-            maxlen_char=None, 
-            minlen_char=None,
-        )
-
-    else:
-        raise ValueError(f"Unknown task: {task_name}")
-    
-    return dataset

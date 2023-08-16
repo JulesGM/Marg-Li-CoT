@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import collections
+import concurrent.futures
 import itertools as it
 import pathlib
 import time
@@ -21,6 +22,20 @@ import lib_data_commonsense_qa
 MODEL = "gpt-3.5-turbo"
 DEFAULT_PATH_SECRET = "/home/mila/g/gagnonju/openai/openai.txt"
 
+def work(sample):
+    response = openai.ChatCompletion.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": sample["ref_fs_scratchpad_gen_query"]}],
+        temperature=0,
+        max_tokens=1300,
+        stop=["\n"],
+    )
+
+    output = mit.one(response.choices)["message"]["content"]
+    copy = sample.copy()
+    assert "output" not in copy
+    copy["output"] = output
+    return copy
 
 def inference(*, split, directory, n):
     directory = pathlib.Path(directory)
@@ -35,20 +50,13 @@ def inference(*, split, directory, n):
             text_only=True,
         )
 
-        for sample in tqdm(it.islice(data, n), total=n if isinstance(n, int) else len(data), desc=split):
-            response = openai.ChatCompletion.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": sample["ref_fs_scratchpad_gen_query"]}],
-                temperature=0,
-                max_tokens=1300,
-                stop=["\n"],
-            )
-
-            output = mit.one(response.choices)["message"]["content"]
-            copy = sample.copy()
-            assert "output" not in copy
-            copy["output"] = output
-            f.write(copy)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            arguments = list(it.islice(data, n))
+            imap = executor.map(work, arguments)
+            
+            for output in tqdm(imap, total=n if n is not None else len(data)):
+                f.write(output)
+    
 
 
 def main(

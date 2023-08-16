@@ -26,8 +26,9 @@ import sys
 from typing import Any, Optional, Union
 
 import accelerate
-import h5py
+import datasets
 import fire
+import h5py
 import more_itertools as mit
 import numpy as np
 import peft
@@ -49,7 +50,7 @@ from approach_answer import lib_data_commonsense_qa
 from approach_answer import lib_approach_utils
 from approach_answer import lib_wandb_logger
 from approach_answer import lib_output_writer
-
+datasets.disable_caching()
 rich.traceback.install()
 
 LOGGER = logging.getLogger(__name__)
@@ -66,10 +67,11 @@ if RANK == 0:
 # Defaut Hyperparameter Values, can be changed with CLI
 ###############################################################################
 DEFAULT_DO_DISTILLATION = False
-DEFAULT_BATCH_SIZE = 16
-DEFAULT_PRECISION = lib_utils.ValidPrecisions._4bit
-DEFAULT_MODEL_NAME = "stabilityai/StableBeluga2"; 
-DEFAULT_BATCH_SIZE = 4; 
+
+DEFAULT_JUST_DEVICE_MAP = True
+
+DEFAULT_MODEL_NAME = "stabilityai/StableBeluga2"; DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16; DEFAULT_BATCH_SIZE = 16
+
 # DEFAULT_MODEL_NAME = "EleutherAI/pythia-410m"; DEFAULT_BATCH_SIZE = 64; DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16
 # DEFAULT_MODEL_NAME = "EleutherAI/gpt-j-6B"; DEFAULT_BATCH_SIZE = 8; DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16
 DEFAULT_OUTPUT_PATH = "/network/scratch/g/gagnonju/scratchpad_gen_outputs/"
@@ -107,6 +109,7 @@ def gathered_batch_gen(
         generate_kwargs: dict[str, Any],
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
         do_distillation: bool,
+        just_device_map: bool,
     ):
 
     line_return_id = mit.last(forward_tokenizer.encode("\n"))
@@ -184,6 +187,7 @@ def gathered_batch_gen(
         pad_first=False,
         dim=1,
     )
+
     gathered_attempt_clean_tokens = accelerator.gather(global_padded_tokens).cpu()
     del local_padded_clean_tokens, global_padded_tokens
 
@@ -234,6 +238,7 @@ def main(
     batch_size: int = DEFAULT_BATCH_SIZE,
     do_distillation: bool = DEFAULT_DO_DISTILLATION,
     precision: int = DEFAULT_PRECISION,
+    just_device_map: bool = DEFAULT_JUST_DEVICE_MAP,
 ):
     
     args = lib_approach_utils.convert_args_for_wandb(locals().copy())
@@ -303,8 +308,14 @@ def main(
         model_name=model_name,
         forward_tokenizer=forward_tokenizer,
         prediction_tokenizer=prediction_tokenizer,
+        just_device_map=just_device_map,
     )
-    model = accelerator.prepare_model(pretrained_model)
+
+    if just_device_map:
+        model = pretrained_model
+    else:
+        model = accelerator.prepare_model(pretrained_model)
+
     model = model.eval()
     for param in model.parameters():
         param.requires_grad = False
@@ -384,6 +395,7 @@ def main(
                 batch=batch,
                 forward_tokenizer=forward_tokenizer,
                 do_distillation=do_distillation,
+                just_device_map=just_device_map,
             )
             clean_gathered_output_tokens = returned_dict["clean_output_tokens"]
             raw_gathered_output_tokens   = returned_dict["raw_output_tokens"]

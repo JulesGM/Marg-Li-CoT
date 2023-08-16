@@ -54,7 +54,12 @@ class WandbLoggingState:
                 )
 
         rich.print(self._rich_table)
-        wandb.log({f"{self._split}/batch": self._table})
-        wandb.log({f"{self._split}/just_clean_gen": self._table_just_clean_gen})
+        
+        try:
+            wandb.log({f"{self._split}/batch": self._table})
+            wandb.log({f"{self._split}/just_clean_gen": self._table_just_clean_gen})
+        except Exception as e:
+            rich.print(f"[red bold]{e}")
+            rich.print(f"Wandb logging failed. Continuing without logging.")
 
     __call__ = log

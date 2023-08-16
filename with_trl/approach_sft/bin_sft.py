@@ -1,7 +1,12 @@
+"""
+Supervised Trainer.
+
+"""
 import collections
 import enum
-import os
 import pathlib
+import os
+import sys
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
 os.environ["DATASETS_VERBOSITY"] = "warning"
@@ -33,15 +38,21 @@ import trl.trainer.utils
 import wandb
 from tqdm import tqdm
 
-import lib_base_classes
-import lib_data
-import lib_metric
-import lib_trl_utils
-import lib_utils
-import libs_sft.lib_collators as lib_collators
-import libs_sft.lib_constants as lib_constants
-import libs_sft.lib_tables as lib_tables
+SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
+sys.path.append(str(SCRIPT_DIR.parent))
 
+import lib_base_classes
+import lib_trl_utils
+import lib_metric
+import lib_utils
+import libs_extraction.lib_multiple_choice
+
+import approach_sft.lib_dataloaders as lib_dataloaders
+import approach_sft.lib_constants as lib_constants
+import approach_sft.lib_tables as lib_tables
+import approach_sft.lib_utils as stf_lib_utils
+
+datasets.disable_caching()
 logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("deepspeed").setLevel(logging.WARNING)
@@ -62,7 +73,11 @@ LOGGER = logging.getLogger(__name__)
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-neo-125M"
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-1.4b-deduped" #
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-12b-deduped"
-DEFAULT_MODEL_NAME_OR_PATH = "ausboss/llama-30b-supercot"
+
+DEFAULT_DATA_DIRECTORY = pathlib.Path(
+    "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/cond-on-answers"
+)
+DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B"
 DEFAULT_TRAIN_BATCH_SIZE = 8
 DEFAULT_EVAL_BATCH_SIZE = 1
 
@@ -73,11 +88,10 @@ DEFAULT_GEN_KWARGS = dict(
     early_stopping=True,
     max_new_tokens=200,
     min_new_tokens=4,
-    synced_gpus=True,
-    do_sample=False,
     
-    top_k=0.0,
-    top_p=1.0,
+    do_sample=False,
+
+    synced_gpus=os.getenv("ACCELERATE_DEEPSPEED_ZERO_STAGE", "") == "3",
 )
 
 ########################################################################
@@ -98,68 +112,15 @@ DEFAULT_WANDB_PROJECT_NAME = "sft"
 DEFAULT_NUM_EPOCHS = 1000
 DEFAULT_BATCH_TABLE_PRINT_QTY = 2
 DEFAULT_PREDICT_QTY_PRINT = 2
+DEFAULT_PEFT_CONFIG = dict(
+    inference_mode=False,
+    lora_dropout=0.,
+    lora_alpha=16,
+    r=16,
+    bias="none",
+)
+
 ########################################################################
-
-
-def get_is_encoder_decoder(
-    model_name_or_path: str
-) -> bool:
-    config = transformers.AutoConfig.from_pretrained(model_name_or_path)  # type: ignore
-    return config.is_encoder_decoder
-
-
-def get_dataloaders(
-    *,
-    max_total_length_tok: int,
-    is_encoder_decoder: bool,
-    task: lib_utils.Task,
-    output_type: lib_constants.OutputTypes,
-    lm_mode: lib_constants.LMModes,
-    forward_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-    prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-    train_batch_size: int,
-    eval_batch_size: int,
-):
-    datasets = {}
-    for split in ["train", "eval"]:
-        datasets[split] = lib_data.prep_dataset_sft(
-            max_total_length_tok=max_total_length_tok,
-            question_prefix="" if is_encoder_decoder else "### Question:\n",
-            question_suffix="" if is_encoder_decoder else "\n### Answer:\n",
-            task_name=task,
-            any_tokenizer=forward_tokenizer,
-            split=split,
-        )
-
-    if is_encoder_decoder:
-        assert forward_tokenizer is prediction_tokenizer or not prediction_tokenizer
-        data_collator = lib_collators.EncoderDecoderCollator(
-            output_type=output_type,
-            tokenizer=forward_tokenizer,
-        )
-    else:
-        assert forward_tokenizer is not prediction_tokenizer
-        if lm_mode == lib_constants.LMModes.CAUSAL_FULL:
-            data_collator = lib_collators.CausalFullCollator(
-                output_type=output_type,
-                forward_tokenizer=forward_tokenizer,
-                prediction_tokenizer=prediction_tokenizer,
-            )
-        else:
-            raise NotImplementedError(lm_mode)
-
-    dataloaders = {}
-
-    for k, v in datasets.items():
-        assert k in ["train", "eval"], k
-        dataloaders[k] = torch.utils.data.DataLoader(
-            v,
-            batch_size=train_batch_size if k == "train" else eval_batch_size,
-            collate_fn=data_collator,
-            shuffle=k == "train",
-        )
-
-    return dataloaders
 
 
 def predict(
@@ -232,7 +193,6 @@ def predict(
     return metric_outputs
 
 
-
 def iter_all_equal(iterable, key):
     iterator = iter(iterable)
     first = mi.first(iterator)
@@ -244,20 +204,23 @@ def main(
     *,
     n_batches_predict_train=DEFAULT_N_BATCHES_PREDICT_TRAIN,
     batch_table_print_qty=DEFAULT_BATCH_TABLE_PRINT_QTY,
-    max_total_length_tok=DEFAULT_MAX_TOTAL_LENGTH_TOK,
     wandb_project_name=DEFAULT_WANDB_PROJECT_NAME,
     model_name_or_path=DEFAULT_MODEL_NAME_OR_PATH,
     train_batch_size=DEFAULT_TRAIN_BATCH_SIZE,
     eval_batch_size=DEFAULT_EVAL_BATCH_SIZE,
     output_type=DEFAULT_OUTPUT_TYPE,
     num_epochs=DEFAULT_NUM_EPOCHS,
-    output_dir=DEFAULT_OUTPUT_DIR,
     precision=DEFAULT_BASE_PRECISION,
     lm_mode=DEFAULT_LM_MODE,
     task=DEFAULT_TASK,
     predict_qty_print=DEFAULT_PREDICT_QTY_PRINT,
     gen_kwargs=DEFAULT_GEN_KWARGS,
-    lora_dropout=DEFAULT_LORA_DROPOUT,
+    data_directory=DEFAULT_DATA_DIRECTORY,
+    peft_config_dict=DEFAULT_PEFT_CONFIG,
+
+    # max_total_length_tok=DEFAULT_MAX_TOTAL_LENGTH_TOK,
+    # output_dir=DEFAULT_OUTPUT_DIR,
+    # lora_dropout=DEFAULT_LORA_DROPOUT,
 ):
     args = locals().copy()
 
@@ -272,7 +235,8 @@ def main(
     lm_mode = lib_constants.LMModes(lm_mode)
     task = lib_utils.Task(task)
     precision = lib_utils.ValidPrecisions(precision)
-    is_encoder_decoder = get_is_encoder_decoder(model_name_or_path)
+    is_encoder_decoder = stf_lib_utils.get_is_encoder_decoder(
+        model_name_or_path)
 
     if is_encoder_decoder:
         assert (
@@ -291,8 +255,10 @@ def main(
         )
 
     metrics = dict(
-        exact_match=lib_metric.ScratchpadAnswerAccuracy(),
-        substeps=lib_metric.ScratchpadSubStepAccuracy(),
+        exact_match=lib_metric.ScratchpadAnswerAccuracy(
+            libs_extraction.lib_multiple_choice.MultipleChoiceRfindExtractor(
+            ["(A)", "(B)", "(C)", "(D)", "(E)"])
+        ),
     )
 
     ###########################################################################
@@ -301,13 +267,14 @@ def main(
     if RANK == 0:
         print(f"Loading model {model_name_or_path}")
 
-    model = peft_qlora.from_pretrained(
-        model_name_or_path,
-        hf_model_cls=transformers.AutoModelForCausalLM,  # type: ignore
-        bf16=precision == lib_utils.ValidPrecisions.bfloat16,
-        fp16=precision == lib_utils.ValidPrecisions.float16,
-        trust_remote_code=True,
-        lora_dropout=lora_dropout,
+    model = lib_trl_utils.load_then_peft_ize_model(
+        prediction_tokenizer=prediction_tokenizer,
+        forward_tokenizer=forward_tokenizer,
+        peft_config_dict=peft_config_dict,
+        model_name=model_name_or_path,
+        precision=precision,
+        just_device_map=False,
+        use_peft=True,
     )
 
     if RANK == 0:
@@ -329,27 +296,29 @@ def main(
     prediction_tokenizer = tokenizers["prediction_tokenizer"]
     del tokenizers
 
-    dataloaders = get_dataloaders(
-        max_total_length_tok=max_total_length_tok,
-        is_encoder_decoder=is_encoder_decoder,
+    assert not is_encoder_decoder
+    dataloaders = lib_dataloaders.get_dataloaders(
+        # max_total_length_tok=max_total_length_tok,
+        # is_encoder_decoder=is_encoder_decoder,
+        # task=task,
+        data_directory=data_directory,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         output_type=output_type,
         forward_tokenizer=forward_tokenizer,
         prediction_tokenizer=prediction_tokenizer,
         lm_mode=lm_mode,
-        task=task,
     )
 
     ###########################################################################
     # 🏎️ Accelerator business
     ###########################################################################
     accelerator = accelerate.Accelerator()
-    model, optimizer = accelerator.prepare(model, optimizer)
-    dataloaders = {
-        split: accelerator.prepare_data_loader(dataloader)
-        for split, dataloader in dataloaders.items()
-    }
+    model, optimizer, dataloaders = accelerator.prepare(model, optimizer, dataloaders)
+    # dataloaders = {
+    #     split: accelerator.prepare_data_loader(dataloader)
+    #     for split, dataloader in dataloaders.items()
+    # }
 
     ###########################################################################
     # Main Loop
