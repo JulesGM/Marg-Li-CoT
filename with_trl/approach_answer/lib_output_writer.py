@@ -31,7 +31,7 @@ class OutputSampleWriter:
         max_gen_len: int,
         few_shots_str,
     ):
-        assert split in ("train", "validation",)
+        assert split in ("train", "eval",)
         self._split = split
         self._output_path = pathlib.Path(output_path)
         self._prediction_tokenizer = prediction_tokenizer

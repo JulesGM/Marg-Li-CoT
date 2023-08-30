@@ -50,6 +50,7 @@ from approach_answer import lib_data_commonsense_qa
 from approach_answer import lib_approach_utils
 from approach_answer import lib_wandb_logger
 from approach_answer import lib_output_writer
+
 datasets.disable_caching()
 rich.traceback.install()
 
@@ -297,7 +298,7 @@ def main(
     forward_tokenizer = tmp_tokenizers["forward_tokenizer"]
     prediction_tokenizer = tmp_tokenizers["prediction_tokenizer"]
     del tmp_tokenizers
-
+    
     if accelerator.is_main_process:
         rich.print("Loading the model...")
 

@@ -26,6 +26,7 @@ import peft_qlora
 import rich
 import rich.markup
 import rich.table
+import rich.traceback
 import torch
 import torch.backends
 import torch.backends.cuda
@@ -47,11 +48,12 @@ import lib_metric
 import lib_utils
 import libs_extraction.lib_multiple_choice
 
-import approach_sft.lib_dataloaders as lib_dataloaders
-import approach_sft.lib_constants as lib_constants
-import approach_sft.lib_tables as lib_tables
-import approach_sft.lib_utils as stf_lib_utils
+import approach_sft.lib_sft_dataloaders as lib_sft_dataloaders
+import approach_sft.lib_sft_constants as lib_sft_constants
+import approach_sft.lib_sft_tables as lib_sft_tables
+import approach_sft.lib_sft_utils as lib_sft_utils
 
+rich.traceback.install()
 datasets.disable_caching()
 logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
@@ -74,14 +76,17 @@ LOGGER = logging.getLogger(__name__)
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-1.4b-deduped" #
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-12b-deduped"
 
+
+DEFAULT_DATA_MODE = lib_sft_constants.DataModes.OPENAI_GENERATION
 DEFAULT_DATA_DIRECTORY = pathlib.Path(
     "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/cond-on-answers"
 )
-DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B"
-DEFAULT_TRAIN_BATCH_SIZE = 8
-DEFAULT_EVAL_BATCH_SIZE = 1
+DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-410m"; DEFAULT_TRAIN_BATCH_SIZE = 64; DEFAULT_EVAL_BATCH_SIZE = 128
+# DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B"
+DEFAULT_USE_PEFT = True
 
-DEFAULT_OUTPUT_TYPE = lib_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER
+
+DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER
 DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
 DEFAULT_GEN_KWARGS = dict(
     repetition_penalty=3.0,
@@ -90,7 +95,6 @@ DEFAULT_GEN_KWARGS = dict(
     min_new_tokens=4,
     
     do_sample=False,
-
     synced_gpus=os.getenv("ACCELERATE_DEEPSPEED_ZERO_STAGE", "") == "3",
 )
 
@@ -102,13 +106,14 @@ DEFAULT_LORA_DROPOUT = 0.1
 ########################################################################
 # 🛑 Never change
 ########################################################################
-DEFAULT_LM_MODE = lib_constants.LMModes.CAUSAL_FULL
+DEFAULT_LM_MODE = lib_sft_constants.LMModes.CAUSAL_FULL
 DEFAULT_MAX_TOTAL_LENGTH_TOK = 300
 DEFAULT_BASE_PRECISION = lib_utils.ValidPrecisions.bfloat16
 DEFAULT_N_BATCHES_PREDICT_TRAIN = 10
-DEFAULT_TASK = lib_utils.Task.GSM8K
+
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "sft_output"
 DEFAULT_WANDB_PROJECT_NAME = "sft"
+DEFAULT_WANDB_ENTITY = "julesgm"
 DEFAULT_NUM_EPOCHS = 1000
 DEFAULT_BATCH_TABLE_PRINT_QTY = 2
 DEFAULT_PREDICT_QTY_PRINT = 2
@@ -118,6 +123,8 @@ DEFAULT_PEFT_CONFIG = dict(
     lora_alpha=16,
     r=16,
     bias="none",
+    task_type=peft.TaskType.CAUSAL_LM,
+
 )
 
 ########################################################################
@@ -138,11 +145,7 @@ def predict(
     ###########################################################################
     # Preprocess & Generate
     ###########################################################################
-    query = predict_tokenizer.pad(
-        dict(input_ids=batch.tok_ref_query),
-        return_tensors="pt",
-        padding=True,
-    )
+    query = batch["predict"]
 
     lib_utils.not_last_token(
         tensor=query.input_ids,
@@ -151,22 +154,26 @@ def predict(
 
     predictions = accelerator.unwrap_model(model).generate(
         **query.to(LOCAL_RANK), **gen_kwargs
-    )  # type: ignore
+    )[:, query["input_ids"].shape[1]:] # type: ignore
 
     ###########################################################################
     # Compute metrics
     ###########################################################################
-    predictions_batch_obj = lib_base_classes.BatchedUnrollReturn(
-        response_tensors=predictions,
-        any_tokenizer=predict_tokenizer,
-    )
-
+ 
     metric_outputs = {}
     local_metric_outputs = collections.defaultdict(list)
     for name, metric in metrics.items():
         local_metric_output = metric(
-            responses=predictions_batch_obj, # type: ignore
-            batch=batch,
+            responses=predict_tokenizer.batch_decode(predictions), # type: ignore
+            batch=lib_base_classes.DataListContainer(
+                tok_ref_query=None,
+                tok_ref_answer=None,
+                tok_ref_scratchpad=None,
+                detok_ref_query=None,
+                detok_ref_answer=batch["extra_info"]["ref_qa_answer"],
+                detok_ref_scratchpad=None,
+                obj_ref_equations=None,
+            ),
         )
 
         local_metric_outputs[name] = local_metric_output # type: ignore
@@ -178,14 +185,25 @@ def predict(
     # Print some outputs
     ###########################################################################
     if RANK == 0:
-        lib_tables.predict_table(
-            predictions_batch_obj=predictions_batch_obj,
+        lib_sft_tables.predict_table(
+            predictions_batch_obj=lib_base_classes.BatchedUnrollReturn(
+                response_tensors=predictions,
+                raw_response_tensors=None, 
+                any_tokenizer=predict_tokenizer,
+                ), # type: ignore
             local_metric_outputs=local_metric_outputs,
             predict_tokenizer=predict_tokenizer,
             tok_predict_query=query,
             predictions=predictions,
             qty_print=qty_print,
-            batch=batch,
+            batch=lib_base_classes.DataListContainer(
+                tok_ref_query=None,
+                tok_ref_answer=None,
+                tok_ref_scratchpad=None,
+                detok_ref_query=predict_tokenizer.batch_decode(query["input_ids"]),
+                detok_ref_answer=None,
+                detok_ref_scratchpad=None,
+            ),
             split=split,
             epoch=epoch,
         )
@@ -204,6 +222,7 @@ def main(
     *,
     n_batches_predict_train=DEFAULT_N_BATCHES_PREDICT_TRAIN,
     batch_table_print_qty=DEFAULT_BATCH_TABLE_PRINT_QTY,
+    wandb_entity=DEFAULT_WANDB_ENTITY,
     wandb_project_name=DEFAULT_WANDB_PROJECT_NAME,
     model_name_or_path=DEFAULT_MODEL_NAME_OR_PATH,
     train_batch_size=DEFAULT_TRAIN_BATCH_SIZE,
@@ -212,12 +231,12 @@ def main(
     num_epochs=DEFAULT_NUM_EPOCHS,
     precision=DEFAULT_BASE_PRECISION,
     lm_mode=DEFAULT_LM_MODE,
-    task=DEFAULT_TASK,
     predict_qty_print=DEFAULT_PREDICT_QTY_PRINT,
     gen_kwargs=DEFAULT_GEN_KWARGS,
     data_directory=DEFAULT_DATA_DIRECTORY,
     peft_config_dict=DEFAULT_PEFT_CONFIG,
-
+    use_peft=DEFAULT_USE_PEFT,
+    data_mode=DEFAULT_DATA_MODE,
     # max_total_length_tok=DEFAULT_MAX_TOTAL_LENGTH_TOK,
     # output_dir=DEFAULT_OUTPUT_DIR,
     # lora_dropout=DEFAULT_LORA_DROPOUT,
@@ -232,26 +251,28 @@ def main(
     ###########################################################################
     # 🔍 Checks.
     ###########################################################################
-    lm_mode = lib_constants.LMModes(lm_mode)
-    task = lib_utils.Task(task)
+    data_mode = lib_sft_constants.DataModes(data_mode)
+    lm_mode = lib_sft_constants.LMModes(lm_mode)
     precision = lib_utils.ValidPrecisions(precision)
-    is_encoder_decoder = stf_lib_utils.get_is_encoder_decoder(
+    is_encoder_decoder = lib_sft_utils.get_is_encoder_decoder(
         model_name_or_path)
 
-    if is_encoder_decoder:
-        assert (
-            lm_mode == lib_constants.LMModes.SEQ2SEQ
-        ), "Encoder-decoder models can only be trained in seq2seq mode."
-    else:
-        assert (
-            lm_mode != lib_constants.LMModes.SEQ2SEQ
-        ), "Causal models are not compatible with LMModes.SEQ2SEQ."
-
+    assert not is_encoder_decoder, "Encoder decoder not supported yet."
+    
     if RANK == 0:
+        if "SLURM_TMPDIR" not in os.environ:
+            job_id = os.environ["SLURM_JOB_ID"]
+            tmp_dir = pathlib.Path(f"/Tmp/slurm.{job_id}.0")
+            assert tmp_dir.exists(), f"{tmp_dir} does not exist."
+        else:
+            tmp_dir = pathlib.Path(os.environ["SLURM_TMPDIR"])
+
         wandb.init(
             name=run_name,
             project=wandb_project_name,
+            entity=wandb_entity,
             config=dict(args=args, gen_kwargs=gen_kwargs),
+            dir=tmp_dir / "wandb",
         )
 
     metrics = dict(
@@ -260,6 +281,18 @@ def main(
             ["(A)", "(B)", "(C)", "(D)", "(E)"])
         ),
     )
+    
+    ###########################################################################
+    # 🏗️ Load Tokenizer and Data.
+    ###########################################################################
+    tmp_tokenizers = lib_trl_utils.load_tokenizers(
+        model_name=model_name_or_path, 
+        config=transformers.AutoConfig.from_pretrained(model_name_or_path),
+    )
+
+    forward_tokenizer = tmp_tokenizers["forward_tokenizer"]
+    prediction_tokenizer = tmp_tokenizers["prediction_tokenizer"]
+    del tmp_tokenizers
 
     ###########################################################################
     # 🏗️ Load Model and Build Optimizer.
@@ -274,7 +307,7 @@ def main(
         model_name=model_name_or_path,
         precision=precision,
         just_device_map=False,
-        use_peft=True,
+        use_peft=use_peft,
     )
 
     if RANK == 0:
@@ -283,24 +316,10 @@ def main(
     optimizer = torch.optim.Adam(model.parameters())
     model.print_trainable_parameters()
 
-    ###########################################################################
-    # 🏗️ Load Tokenizer and Data.
-    ###########################################################################
-    tokenizers = lib_utils.make_tokenizers_sft(
-        model_name_or_path, 
-        model=model,
-        is_encoder_decoder=is_encoder_decoder
-    )
-
-    forward_tokenizer = tokenizers["forward_tokenizer"] 
-    prediction_tokenizer = tokenizers["prediction_tokenizer"]
-    del tokenizers
-
     assert not is_encoder_decoder
-    dataloaders = lib_dataloaders.get_dataloaders(
+    dataloaders = lib_sft_dataloaders.get_dataloaders(
         # max_total_length_tok=max_total_length_tok,
         # is_encoder_decoder=is_encoder_decoder,
-        # task=task,
         data_directory=data_directory,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
@@ -333,7 +352,7 @@ def main(
             # Predict on Training
             train_metrics_outputs = None
             if i < n_batches_predict_train:
-                lib_tables.batch_table(
+                lib_sft_tables.batch_table(
                     batch=batch["forward"],
                     forward_tokenizer=forward_tokenizer,
                     print_qty=batch_table_print_qty,
@@ -352,7 +371,7 @@ def main(
                     metrics=metrics, # type: ignore
                     split="train",
                     model=model,
-                    batch=batch["predict"],
+                    batch=batch,
                     epoch=epoch,
                     qty_print=predict_qty_print,
                 )
@@ -366,12 +385,10 @@ def main(
                 forward_tokenizer=forward_tokenizer,
                 tensor=batch["forward"]["input_ids"],
             )
-            lib_utils.not_first_token(
-                forward_tokenizer=forward_tokenizer,
-                tensor=batch["forward"]["labels"],
-            )
+
             loss = model(
-                **{k: v.to(LOCAL_RANK) for k, v in batch["forward"].items()}
+                **{k: v.to(LOCAL_RANK) for k, v in batch["forward"].items()},
+                labels=batch["forward"]["input_ids"],
             ).loss
 
             accelerator.backward(loss)
@@ -404,7 +421,7 @@ def main(
         ):
             model.eval()
             if i == 0:
-                lib_tables.batch_table(
+                lib_sft_tables.batch_table(
                     forward_tokenizer=forward_tokenizer,
                     num_batches=len(dataloaders["eval"]),
                     num_epochs=num_epochs,
@@ -425,7 +442,7 @@ def main(
                 qty_print=predict_qty_print,
                 metrics=metrics, # type: ignore
                 model=model,
-                batch=batch["predict"],
+                batch=batch,
                 split="eval",
                 epoch=epoch,
             )

@@ -1,28 +1,34 @@
 import collections
 import contextlib
+import copy
 import itertools
+import more_itertools as mit
 import os
 import typing
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Tuple, Union
 
 import accelerate
 import datasets
 import more_itertools
 import numpy as np
 import peft
-import peft_qlora
+# import peft_qlora
 import rich
 import rich.layout
 import rich.markup
 import rich.panel
 import rich.table
 import torch
+from torch.nn.parameter import Parameter
 import transformers
 import transformers.tokenization_utils
 import trl
 import trl.core
 import trl.models
+import trl_fork
+import trl_fork.core
+import trl_fork.models
 import wandb
 from beartype import beartype
 
@@ -126,6 +132,18 @@ def keep_good_one_generation(
     assert isinstance(ref_answers[0][0], str), type(ref_answers[0][0])
 
     selections = []
+
+    table = rich.table.Table(
+        "Ref Comparable", 
+        "Generated answers", 
+        "Lengths", 
+        "<eos>?",
+        "Ratio Good",
+        title="keep_good_one_generation", 
+        show_lines=True,
+    )
+    ratios_good = []
+
     for b_idx in range(batch_size):
         ref_comparable = answer_extractor(ref_answers[b_idx])
         assert ref_comparable is not None, ref_answers[b_idx]
@@ -136,31 +154,14 @@ def keep_good_one_generation(
         # goods_str = " ".join([f"[green]{g}[/]" if g else str(g) for g in goods])
         ratio = np.mean(np.array(goods, dtype=np.float32))
 
-        table = rich.table.Table("Name", "Value", title="keep_good_one_generation", show_lines=True)
         # table.add_row("[bold white on red]Ref Answer",        f"{ref_answers[b_idx]}")
         table.add_row(
-            "[bold white on red]Ref Comparable", 
             rich_escape(ref_comparable),
-        )
-        table.add_row(
-            "[bold white on red]Generated answers",
             rich_escape(collections.Counter(x for x in generated_answers)),
-        )
-        table.add_row(
-            "[bold white on red]Lengths",
             rich_escape(collections.Counter(len(x) for x in response_tensors[b_idx])),
-        )
-        table.add_row(
-            f"[bold white on red]{prediction_tokenizer.eos_token} present",
-            rich_escape(
-                collections.Counter(prediction_tokenizer.eos_token in x for x in array_response_text[b_idx])
-            ),
-        )
-        table.add_row(
-            "[bold white on red]Ratio",
+            rich_escape(collections.Counter(prediction_tokenizer.eos_token in x for x in array_response_text[b_idx])),
             f"[green]{ratio:0.2%}[/] or [green]{np.sum(goods)}[/]/[green]{len(goods)}[/]",
         )
-        rich.print(table)
 
         if any(goods):
             # Return the good with the max other reward
@@ -178,6 +179,11 @@ def keep_good_one_generation(
             else:
                 selection = torch.randint(0, num_return_seq, (1,))[0]
         selections.append(selection)
+        ratios_good.append(ratio)
+
+    table.caption = f"Ratio Average: {np.mean(ratios_good):0.2%}, At least one good ratio: {np.mean([ratio > 0 for ratio in ratios_good]):0.2%}"
+
+    rich.print(table)
 
     selections = torch.tensor(selections)
 
@@ -325,6 +331,7 @@ def load_then_peft_ize_model(
     forward_tokenizer: transformers.PreTrainedTokenizer,
     prediction_tokenizer: transformers.PreTrainedTokenizer,
     just_device_map: bool,
+    adapter_name: str,
 ):
     if use_peft:
         lora_config = peft.LoraConfig(**peft_config_dict)
@@ -340,7 +347,7 @@ def load_then_peft_ize_model(
     ###########################################################################
     if not config.is_encoder_decoder:
         if use_peft:
-            assert lora_config.task_type == peft.TaskType.CAUSAL_LM
+            assert lora_config.task_type == peft.TaskType.CAUSAL_LM, lora_config.task_type
         transformers_cls = transformers.AutoModelForCausalLM  # type: ignore
 
     else:
@@ -378,6 +385,7 @@ def load_then_peft_ize_model(
             load_in_4bit=precision == lib_utils.ValidPrecisions._4bit,
             load_in_8bit=precision == lib_utils.ValidPrecisions._8bit,
             quantization_config=quantization_config,
+            pad_token_id = forward_tokenizer.pad_token_id,
         )
         
         # Make sure that there is only one device
@@ -397,8 +405,9 @@ def load_then_peft_ize_model(
             model_name,
             torch_dtype=precision.value,
             device_map="auto" if just_device_map else None,
+            pad_token_id = forward_tokenizer.pad_token_id,
         )
-        assert all(x.device.type == "cuda" for x in pretrained_model.parameters())
+        assert not just_device_map or all(x.device.type == "cuda" for x in pretrained_model.parameters())
 
     ###########################################################################
     # Fix tokenizers for causal models
@@ -418,7 +427,6 @@ def load_then_peft_ize_model(
             f"{prediction_tokenizer.pad_token = }"
         )
         pretrained_model.resize_token_embeddings(len(forward_tokenizer))
-        pretrained_model.config.pad_token_id = forward_tokenizer.pad_token_id
 
     ###########################################################################
     # Peft-ize the model
@@ -434,6 +442,7 @@ def load_then_peft_ize_model(
         pretrained_model = peft.get_peft_model(
             pretrained_model,
             lora_config,
+            adapter_name=adapter_name,
         )
 
     return pretrained_model
@@ -459,12 +468,84 @@ def load_tokenizers(model_name, config):
     )
 
 
+class MultiAdapterWrapper(torch.nn.Module):
+    """
+    The idea is to switch adapters whenever we use the model.
+    """
+    def __init__(
+            self, 
+            *, 
+            trl_model_with_peft: trl.AutoModelForCausalLMWithValueHead,
+            adapter_name: str, 
+            peft_config: peft.PeftConfig,
+            add_adapter: bool,
+        ):
+        super().__init__()
+        
+        self._adapter_name = adapter_name
+        self._is_peft_model = True
+
+        self._peft_config: peft.PeftConfig = peft_config
+        self._peft_model: peft.PeftModel = self._trl_model.pretrained_model
+        self._trl_model = trl_model_with_peft
+
+        if add_adapter:
+            self._peft_model.add_adapter(adapter_name, peft_config)
+
+
+    def _activate(self):
+        self._peft_model.set_adapter(self._adapter_name)
+        return self
+
+    @contextlib.contextmanager
+    def disable_adapter(self):
+        with self._peft_model.disable_adapter() as ctx:
+            yield ctx
+
+    def forward(self, *args, **kwargs):
+        self._activate()
+        return self._trl_model(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        self._activate()
+        return self._trl_model.generate(*args, **kwargs)
+    
+    @property
+    def adapter_name(self):
+        return self._name
+
+    @property
+    def active_adapter(self):
+        return self._peft_model.active_adapter
+    
+    @property
+    def config(self):
+        return self._peft_model.config
+    
+    @property
+    def is_peft_model(self):
+        return self._is_peft_model
+
+    @property
+    def peft_config(self):
+        return self._peft_config
+
+    @property
+    def pretrained_model(self):
+        return self._trl_model.pretrained_model
+
+    @property
+    def v_head(self):
+        return self._trl_model.v_head
+
+
 def init_model(
     *,
     model_name: str,
     use_peft: bool,
     peft_config_dict: Optional[dict[str, typing.Any]],
     peft_qlora_mode: bool,
+    trl_library_mode,
     precision=None,
 ) -> tuple[
     typing.Union[
@@ -494,6 +575,8 @@ def init_model(
     It further doesn't work with "prepare_for_int8" training, but that's not the question right now.
 
     """
+
+
     if precision is None:
         precision = lib_utils.ValidPrecisions.float32
     precision = lib_utils.ValidPrecisions(precision)
@@ -501,7 +584,7 @@ def init_model(
         model_name,
         trust_remote_code=True,
     )
-
+    trl_library = lib_utils.TRL_LIBRARIES[trl_library_mode]
 
     ###########################################################################
     # Tokenizer stuff
@@ -514,15 +597,6 @@ def init_model(
     ###########################################################################
     # HF Raw Model Stuff
     ###########################################################################
-    if not config.is_encoder_decoder:
-        trl_cls = trl.models.AutoModelForCausalLMWithValueHead
-    else:
-        assert False
-        assert not (
-            (config.model_type == "t5")
-            and (precision == lib_utils.ValidPrecisions.float16)
-        ), "fp16 doesn't work with t5"
-        trl_cls = trl.models.AutoModelForSeq2SeqLMWithValueHead
 
     if peft_qlora_mode:
         assert False
@@ -548,11 +622,79 @@ def init_model(
             use_peft=use_peft,
             forward_tokenizer=forward_tokenizer,
             prediction_tokenizer=prediction_tokenizer,
+            just_device_map=False,
+            adapter_name="policy" if lib_utils.TrlLibraryMode.TRL_FORK else "default",
         )
 
     ###########################################################################
     # TRL Model
     ###########################################################################
+    # if not config.is_encoder_decoder:
+    #     if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
+    #         trl_cls = trl.models.AutoModelForCausalLMWithValueHead
+    #     elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
+    #         policy
+    # else:
+    #     assert False
+    #     assert not (
+    #         (config.model_type == "t5")
+    #         and (precision == lib_utils.ValidPrecisions.float16)
+    #     ), "fp16 doesn't work with t5"
+    #     trl_cls = trl.models.AutoModelForSeq2SeqLMWithValueHead
+
+    if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
+        model = trl.AutoModelForCausalLMWithValueHead.from_pretrained(
+            pretrained_model,)
+        model.gradient_checkpointing_disable = (
+            model.pretrained_model.gradient_checkpointing_disable)
+        model.gradient_checkpointing_enable = (
+            model.pretrained_model.gradient_checkpointing_enable)
+
+    elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
+        
+        trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES += (MultiAdapterWrapper,)
+        print(trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES)
+
+        peft_model: peft.PeftModel = pretrained_model
+        peft_config = peft.tuners.lora.LoraConfig(**peft_config_dict)
+
+        # trl_policy_model = trl_fork.AutoModelForCausalLMWithoutValueHead.from_pretrained(
+        #     peft_model)
+
+        trl_value_model = trl_fork.AutoModelForCausalLMWithValueHead.from_pretrained(
+            peft_model,
+        )
+        
+        # JULESGM: FIX trl_policy_model
+        for model in [
+        #    trl_policy_model, 
+            trl_value_model,
+        ]:
+            model.gradient_checkpointing_disable = (
+                model.pretrained_model.gradient_checkpointing_disable)
+
+            model.gradient_checkpointing_enable = (
+                model.pretrained_model.gradient_checkpointing_enable)
+
+        # policy_model = MultiAdapterWrapper(
+        #     trl_model_with_peft=trl_policy_model,
+        #     peft_config=peft_config,
+        #     adapter_name="policy",
+        #     add_adapter=False,
+        # )
+
+        # JULGM: FIX add_adapter=True, adapter_name="value"
+        # value_model = MultiAdapterWrapper(
+        #     trl_model_with_peft=trl_value_model,
+        #     peft_config=peft_config,
+        #     adapter_name="policy", # "value",
+        #     add_adapter=False,
+        # )
+        
+        value_model = trl_value_model
+        policy_model = trl_value_model
+        
+
     if precision in (
         lib_utils.ValidPrecisions.float16,
         lib_utils.ValidPrecisions.bfloat16,
@@ -560,31 +702,33 @@ def init_model(
         dtype = (
             torch.float16
             if precision == lib_utils.ValidPrecisions.float16
-            else torch.bfloat16
+            else torch.bfloat16)
+        
+        if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
+            model.v_head.to(dtype=dtype)
+        elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
+            value_model.v_head.to(dtype=dtype)
+    
+    if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
+        output = print_trainable_parameters(model, True)
+        assert output > 0
+        return dict(
+            model=model, 
+            forward_tokenizer=forward_tokenizer, 
+            prediction_tokenizer=prediction_tokenizer,
         )
-        model = trl_cls.from_pretrained(
-            pretrained_model,
+    
+    elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
+        output = print_trainable_parameters(policy_model, True)
+        assert output > 0
+        return dict(
+            policy_model=policy_model, 
+            value_model=value_model, 
+            forward_tokenizer=forward_tokenizer, 
+            prediction_tokenizer=prediction_tokenizer,
         )
-        model.v_head.to(dtype=dtype)
-    else:
-        model = trl_cls.from_pretrained(
-            pretrained_model,
-        )
-
-    model.gradient_checkpointing_disable = (
-        model.pretrained_model.gradient_checkpointing_disable
-    )
-
-    model.gradient_checkpointing_enable = (
-        model.pretrained_model.gradient_checkpointing_enable
-    )
-
-    output = print_trainable_parameters(model, True)
-
-    assert output > 0
-
-    return model, forward_tokenizer, prediction_tokenizer
-
+    
+    raise ValueError(f"{trl_library_mode = }")
 
 def batched_unroll(
     *,

@@ -71,13 +71,18 @@ class CommonSenseQAMC(libs_data.lib_base.FewShotMixin, libs_data.lib_base.Datase
             question_prefix = ""
         if question_suffix is None:
             question_suffix = ""
+
         self._question_prefix = question_prefix
         self._question_suffix = question_suffix
 
         self._extractor = libs_extraction.lib_multiple_choice.MultipleChoiceRfindExtractor(
             ["(A)", "(B)", "(C)", "(D)", "(E)"])
 
-        self._hf_ds = datasets.load_dataset("commonsense_qa", split=split)
+        self._hf_ds = datasets.load_dataset(
+            "commonsense_qa", 
+            split="validation" if split == "eval" else split,
+        )
+
         self._ds = self._hf_ds.map(
             lambda sample:
                 self._prep_hf_ds(
@@ -86,10 +91,11 @@ class CommonSenseQAMC(libs_data.lib_base.FewShotMixin, libs_data.lib_base.Datase
                     question_suffix=question_suffix,
                 )
         ).map(
-            lambda batch: _tok_detok(
-                batch=batch, 
-                any_tokenizer=any_tokenizer, 
-            ),
+            lambda batch: 
+                _tok_detok(
+                    batch=batch, 
+                    any_tokenizer=any_tokenizer, 
+                ),
             batched=True,
         )
 

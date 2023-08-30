@@ -67,7 +67,7 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
     ) -> tuple[list[float], lib_utils.DictDataset]:
         """For each answer, extract the output number, then compare."""
 
-        parsed = lib_utils.DictDataset(["ref", "gen", "ref_text"])
+        parsed = lib_utils.DictDataset(keys=["ref", "gen", "ref_text"])
         em_values = []
 
         for ith_sample, (raw_gen, raw_ref) in enumerate(
@@ -114,8 +114,8 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
     def __call__(
         self,
         *,
-        batch: lib_base_classes.DataListContainer,
         responses: list[lib_base_classes.BatchedUnrollReturn],
+        batch: lib_base_classes.DataListContainer,
     ) -> lib_base_classes.MetricOutput:
         
         #######################################################################

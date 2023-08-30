@@ -167,7 +167,7 @@ def main(
         with open(secret_path, "r") as fin:
             openai.api_key = fin.read().strip()
 
-    for split in ["train", "validation"]:
+    for split in ["train", "eval"]:
         rich.print(f"[bold blue on white]Running split [green]{split}")
         inference_on_split(split=split, directory=output_dir, test_run=test_run)
 

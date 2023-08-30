@@ -11,10 +11,23 @@ import rich.table
 import torch
 import transformers
 from tqdm import tqdm
+import trl
+import trl_fork
+
 
 RANK = int(os.environ.get("RANK", 0))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+
+class TrlLibraryMode(enum.Enum):
+    TRL = "trl"
+    TRL_FORK = "trl_fork"
+    
+TRL_LIBRARIES = {
+    TrlLibraryMode.TRL: trl,
+    TrlLibraryMode.TRL_FORK: trl_fork,
+}
+
 
 class MovingAverage:
     def __init__(self, window_size: int):
@@ -69,82 +82,6 @@ class ValidPrecisions(enum.Enum):
         return super().__eq__(value)
 
 
-def make_tokenizers_sft(model_name_or_path, model, is_encoder_decoder):
-    """
-    
-    In supervised conditional generation with a causal model, we need the pad token
-    to be different from the eos token, so that the model can learn to stop generating.
-
-    """
-    forward_tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path)  # type: ignore
-    prediction_tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path)  # type: ignore
-
-    ###########################################################################
-    # 🔍 Make there is no pad token, or that pad token is the same as the eos token.
-    ###########################################################################
-    tokenizers_dont_have_pad_token = (
-        forward_tokenizer.pad_token is None and 
-        prediction_tokenizer.pad_token is None)
-    model_doesnt_have_pad_token = model.config.pad_token_id is None
-
-    if not model_doesnt_have_pad_token:
-        # If the model is using the eos token as the pad token, it doesn't count. 
-        # We need a separate pad token.
-        if model.config.pad_token_id == model.config.eos_token_id:
-            model.config.pad_token_id = None
-            model_doesnt_have_pad_token = True
-
-    assert (
-        tokenizers_dont_have_pad_token 
-        ), (
-        forward_tokenizer.pad_token,
-        prediction_tokenizer.pad_token,
-        model.config.pad_token_id,
-    )
-
-    assert model.config.eos_token_id is not None, model.config.eos_token_id
-    for tokenizer in [forward_tokenizer, prediction_tokenizer]:
-        assert tokenizer.eos_token is not None
-        assert tokenizer.eos_token_id is not None
-
-    ###########################################################################
-    # 🔨 Create a new pad token & assign it to the tokenizers & to the model. 
-    ###########################################################################
-    if tokenizers_dont_have_pad_token:
-        for i, tokenizer in enumerate([forward_tokenizer, prediction_tokenizer]):
-            tokenizer.add_special_tokens(dict(pad_token="<|pad|>"))
-            if i == 0:
-                model.resize_token_embeddings(len(tokenizer))  # type: ignore
-                model.config.pad_token_id = tokenizer.pad_token_id  # type: ignore
-
-    ###########################################################################
-    # 🔍 Verify things are setup correctly
-    ###########################################################################
-    assert (
-        forward_tokenizer.pad_token is not None and
-        prediction_tokenizer.pad_token is not None and
-        model.config.pad_token_id is not None
-        ), (
-        forward_tokenizer.pad_token,
-        prediction_tokenizer.pad_token,
-        model.config.pad_token_id,
-    ) 
-
-    ###########################################################################
-    # 🔨 Fix the padding side for causal models.
-    ###########################################################################
-    if not is_encoder_decoder:
-        assert hasattr(prediction_tokenizer, "padding_side")
-        assert hasattr(forward_tokenizer, "padding_side")
-        prediction_tokenizer.padding_side = "left"
-        forward_tokenizer.padding_side = "right"
-    
-    return dict(
-        forward_tokenizer=forward_tokenizer,
-        prediction_tokenizer=prediction_tokenizer,
-    )
-
-
 def not_first_token(*, tensor, forward_tokenizer):
     assert len(tensor.shape) == 2
     assert not (tensor[:, 0] == forward_tokenizer.pad_token_id).any()
@@ -194,11 +131,20 @@ def maybe_context_manager(caller, disable):
 class DictDataset(torch.utils.data.Dataset):
     # Object Pandas without the fluff
 
-    def __init__(self, keys):
-        self._dataset = {k: [] for k in keys}
+    def __init__(self, data=None, keys=None):
+        assert data or keys
+        assert isinstance(data, dict) or data is None
+
+        if data and keys:
+            assert data.keys() == keys, (data.keys(), keys)
+
+        if data is None:
+            self._dataset = {k: [] for k in keys}
+        else:
+            self._dataset = data
 
     def __getitem__(self, key: typing.Union[str, int]):
-        if isinstance(key, int):
+        if isinstance(key, (int, slice)):
             return {k: v[key] for k, v in self._dataset.items()}
         elif isinstance(key, str):
             return self._dataset[key]
