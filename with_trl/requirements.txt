@@ -1,0 +1,6 @@
+fire
+more_itertools
+multiset
+numpy
+torch
+rich
