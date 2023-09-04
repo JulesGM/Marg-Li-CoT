@@ -23,18 +23,21 @@ sys.path.append(str(SCRIPT_DIR.parent))
 
 import lib_utils
 
+import approach_sft.lib_sft_constants as lib_sft_constants
+
 datasets.disable_caching()
 
 
 def openai_commonsense_qa_output(root_path):
+
     path = pathlib.Path(root_path)
     assert path.exists(), f"{path} does not exist"
     assert path.is_dir(), f"{path} is not a directory"
 
-    paths = dict(
-        train=path/"commonsenseqa.chatgpt.train.jsonl",
-        eval=path/"commonsenseqa.chatgpt.validation.jsonl",
-    )
+    paths = {
+        lib_sft_constants.CVSet.TRAIN: path/"commonsenseqa.chatgpt.train.jsonl",
+        lib_sft_constants.CVSet.VALIDATION: path/"commonsenseqa.chatgpt.validation.jsonl",
+    }
 
     for split, path in paths.items():
         assert path.exists(), f"{split}: {path} does not exist"
@@ -61,9 +64,6 @@ def openai_commonsense_qa_output(root_path):
 
 def main(
 ):
-    
-    import lib_base_classes
-    import approach_sft.lib_sft_constants as lib_sft_constants
     import approach_sft.lib_sft_collators as lib_sft_collators
     import lib_trl_utils
     import transformers

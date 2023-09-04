@@ -11,11 +11,16 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SentimentRewardFn(lib_base_classes.Reward):
-    def __init__(self, ppo_trainer):
+    def __init__(
+        self, 
+        *,
+        accelerator_device, 
+        accelerator_num_processes,
+    ):
         self._pipeline = _make_sentiment_pipeline(
             pipeline_model_name="lvwerra/distilbert-imdb",
-            accelerator_num_process=ppo_trainer.accelerator.num_processes,
-            accelerator_device=ppo_trainer.accelerator.device,
+            accelerator_num_process=accelerator_num_processes,
+            accelerator_device=accelerator_device,
         )
         self._reward_kwargs = {
             "function_to_apply": "none",

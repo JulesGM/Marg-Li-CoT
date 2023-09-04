@@ -15,6 +15,7 @@ import collections
 import enum
 import itertools
 import logging
+import pathlib
 import random
 import typing
 from typing import Any, Optional, Union
@@ -42,7 +43,7 @@ import transformers
 import trl
 import trl_fork
 import wandb
-from accelerate.utils import DistributedDataParallelKwargs
+import accelerate.utils
 from tqdm import tqdm
 
 import lib_base_classes
@@ -64,8 +65,6 @@ transformers.logging.set_verbosity_warning()  # type: ignore
 logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("deepspeed").setLevel(logging.WARNING)
-
-torch.autograd.set_detect_anomaly(True)
 
 np.random.seed(0)
 random.seed(1)
@@ -186,6 +185,11 @@ DEFAULT_PEFT_CONFIG = dict(
     r=16,
 )
 
+DEFAULT_INPUT_MAX_LENGTH = 115
+
+DEFAULT_WANDB_DIR = lib_utils.get_tmp_dir() / "bin_main.py"
+
+
 def main(
     *,
     gradient_accumulation_steps: int = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
@@ -193,7 +197,7 @@ def main(
     inference_batch_size: int = DEFAULT_INFERENCE_BATCH_SIZE,
     generation_kwargs: dict[str, Any] = DEFAULT_GEN_KWARGS,
     peft_config_dict: Optional[dict[str, Any]] = DEFAULT_PEFT_CONFIG,
-    input_max_length: int = 115,
+    input_max_length: int = DEFAULT_INPUT_MAX_LENGTH,
     eval_subset_size: int = DEFAULT_EVAL_QTY,
     mini_batch_size: int = DEFAULT_MINI_BATCH_SIZE,
     causal_question_prefix: str = DEFAULT_CAUSAL_QUESTION_PREFIX,
@@ -214,16 +218,25 @@ def main(
     use_few_shots: int = DEFAULT_USE_FEW_SHOTS,
     trl_library_mode: lib_utils.TrlLibraryMode = DEFAULT_TRL_LIBRARY_MODE,
     value_model_pretrain_amount: int = DEFAULT_VALUE_MODEL_PRETRAIN_AMOUNT,
+    wandb_dir: str = DEFAULT_WANDB_DIR,
 ):
     precision = lib_utils.ValidPrecisions(precision)  # type: ignore
     args = locals().copy()
     
+    # Display command line args
     if RANK == 0:
         table = rich.table.Table("Key", "Value", title="Command Line Arguments", show_lines=True)
         for key, value in sorted(args.items(), key=lambda x: x[0]):
             table.add_row("[bold]" + rich.markup.escape(str(key)), rich.markup.escape(str(value)))
         rich.print(table)
+    
+    # Check some command line args
+    task_name = lib_utils.Task(task_name)
+    dataset_name = lib_data.DatasetChoices(dataset_name)
+    trl_library_mode = lib_utils.TrlLibraryMode(trl_library_mode)
+    trl_library = lib_utils.TRL_LIBRARIES[trl_library_mode]
 
+    # Setup logging
     logging.basicConfig(
         level=logging.INFO,
         datefmt="%H:%M:%S",
@@ -236,11 +249,6 @@ def main(
         logging.getLogger("peft_lora").setLevel(logging.ERROR)
         logging.getLogger("datasets").setLevel(logging.ERROR)
 
-    task_name = lib_utils.Task(task_name)
-    dataset_name = lib_data.DatasetChoices(dataset_name)
-    trl_library_mode = lib_utils.TrlLibraryMode(trl_library_mode)
-    trl_library = lib_utils.TRL_LIBRARIES[trl_library_mode]
-
     ###########################################################################
     # Find the type of model we are using
     ###########################################################################
@@ -249,6 +257,7 @@ def main(
     )
     
     if hf_config.is_encoder_decoder:
+        assert False
         assert causal_question_prefix == "", (
             causal_question_prefix,
             causal_question_suffix,
@@ -282,7 +291,8 @@ def main(
         gradient_accumulation_steps=gradient_accumulation_steps,
         accelerator_kwargs=dict(
             kwargs_handlers=[
-                DistributedDataParallelKwargs(find_unused_parameters=False)
+                accelerate.utils.DistributedDataParallelKwargs(
+                    find_unused_parameters=False)
             ]
         ), 
         mini_batch_size=mini_batch_size,
@@ -292,7 +302,7 @@ def main(
         log_with="wandb",
     )
 
-    trl_config = trl_library.PPOConfig(
+    trl_config: trl.PPOConfig = trl_library.PPOConfig(
         **ppo_config_dict,
     )
 
@@ -311,6 +321,7 @@ def main(
                 ppo_config_args=ppo_config_dict,
                 script_args=args,
             ),
+            dir=wandb_dir,
         )
 
     assert isinstance(trl_config.model_name, str), type(trl_config.model_name)
@@ -381,7 +392,6 @@ def main(
     if not hf_config.is_encoder_decoder:
         if peft_config_dict:
             assert peft_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
-        generation_kwargs["pad_token_id"] = eos_token_id
 
     ###########################################################################
     # Prep Training
@@ -399,14 +409,19 @@ def main(
     )
 
     metric_accuracy, reward_fn = lib_eval.make_metric_and_reward_fn(
-        ppo_trainer=ppo_trainer,
+        accelerator_device=ppo_trainer.accelerator.device,
+        accelerator_num_processes=ppo_trainer.accelerator.num_processes,
         reward_type=reward_type,
         task_name=task_name,
         extractor=dataset.get_extractor(),
         use_peft=use_peft,
     )
 
-    policy_model = ppo_trainer.model if trl_library_mode == lib_utils.TrlLibraryMode.TRL else ppo_trainer.policy_model
+    policy_model = (
+        ppo_trainer.model 
+        if trl_library_mode == lib_utils.TrlLibraryMode.TRL 
+        else ppo_trainer.policy_model
+    )
 
     train_eval = lib_eval.EvalLoop(
         inference_gen_kwargs=inference_gen_kwargs,
@@ -456,31 +471,11 @@ def main(
 
     epoch_counts = collections.defaultdict(lambda: -1)
 
-    if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
-        needs_params = [
-            param for param in ppo_trainer.model.parameters() 
-            if param.requires_grad
-        ]
-    elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-        needs_params = [
-            param for param in ppo_trainer.policy_model.parameters() 
-            if param.requires_grad
-        ] + [
-            param for param in ppo_trainer.value_model.parameters() 
-            if param.requires_grad
-        ]
-    else:
-        raise ValueError(trl_library_mode)
-
     for epoch in itertools.count():
         if epoch < value_model_pretrain_amount:
             training_state = TrainingState.VALUE_MODEL_PRETRAINING
-            for x in needs_params:
-                x.requires_grad = False
         else:
             training_state = TrainingState.REGULAR_TRAINING
-            for x in needs_params:
-                x.requires_grad = True
 
         epoch_counts[training_state] += 1
 
@@ -510,54 +505,17 @@ def main(
                 eval_eval()
                 rich.print("[red bold]DONE WITH EVAL")
 
-            print(f"{RANK} lib_trl_utils.batched_unroll >>>")
-            raw_gen_outputs = lib_trl_utils.batched_unroll(
-                accelerated_model=policy_model,
-                generation_kwargs=generation_kwargs,
-                query_tensors=batch.tok_ref_query,
-                accelerator=ppo_trainer.accelerator,
-                prediction_tokenizer=prediction_tokenizer,
-                dataset_name=dataset_name, 
+            outputs = lib_trl_utils.generate(
+                batch=batch, 
+                batch_size=batch_size,
+                task_name=task_name,
                 use_few_shots=use_few_shots,
-                dataset_obj=dataset,
-                task_name=task_name, 
-            )
-            print(f"{RANK} lib_trl_utils.batched_unroll <<<")
-
-            if task_name == lib_utils.Task.MAIN:
-                outputs = lib_trl_utils.keep_good_one_generation(
-                    num_return_seq=generation_kwargs["num_return_sequences"],
-                    other_rewards=None,
-                    generations=raw_gen_outputs,
-                    ref_answers=batch.detok_ref_answer,
-                    batch_size=batch_size,
-                    prediction_tokenizer=prediction_tokenizer,
-                    answer_extractor=dataset.get_extractor()
-                )
-            else:
-                assert task_name == lib_utils.Task.SENTIMENT, task_name
-
-                assert (
-                    generation_kwargs["num_return_sequences"] == 1
-                ), generation_kwargs["num_return_sequences"]
-                outputs = raw_gen_outputs
-                assert len(outputs.response_tensors) == batch_size, (
-                    len(outputs.response_tensors),
-                    batch_size,
-                )
-
-            outputs = lib_base_classes.BatchedUnrollReturn(
-                response_tensors=lib_trl_utils.unpad(
-                    responses=outputs.response_tensors,
-                    eos_token_id=eos_token_id,
-                    pad_token_id=pad_token_id,
-                ),
-                raw_response_tensors=lib_trl_utils.unpad(
-                    outputs.raw_response_tensors,
-                    eos_token_id=eos_token_id,
-                    pad_token_id=pad_token_id,
-                ),
-                any_tokenizer=prediction_tokenizer,
+                dataset=dataset,
+                dataset_name=dataset_name,
+                policy_model=policy_model, 
+                generation_kwargs=generation_kwargs, 
+                accelerator=ppo_trainer.accelerator, 
+                prediction_tokenizer=prediction_tokenizer,
             )
 
             reward_output = reward_fn(
@@ -574,9 +532,9 @@ def main(
             # Print Rewards
             ###########################################################################
             lib_trl_utils.log_reward(
-                reward_output=reward_output,
                 metric_output=metric_output,
-                ppo_trainer=ppo_trainer,
+                reward_output=reward_output,
+                accelerator=ppo_trainer.accelerator,
                 batch_idx=batch_idx,
                 epoch=epoch,
             )
@@ -622,7 +580,6 @@ def main(
                 **step_kwargs,
             )
 
-            import ipdb; ipdb.set_trace()
             print(f"{RANK} ppo_trainer.step done <<<")
 
             # Log stats

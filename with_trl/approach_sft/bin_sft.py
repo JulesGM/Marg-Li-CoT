@@ -7,6 +7,7 @@ import enum
 import pathlib
 import os
 import sys
+from typing import Any, Optional, Union
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
 os.environ["DATASETS_VERBOSITY"] = "warning"
@@ -22,7 +23,6 @@ import fire
 import more_itertools as mi
 import numpy as np
 import peft
-import peft_qlora
 import rich
 import rich.markup
 import rich.table
@@ -77,25 +77,26 @@ LOGGER = logging.getLogger(__name__)
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-12b-deduped"
 
 
-DEFAULT_DATA_MODE = lib_sft_constants.DataModes.OPENAI_GENERATION
+
 DEFAULT_DATA_DIRECTORY = pathlib.Path(
     "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/cond-on-answers"
 )
-DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-410m"; DEFAULT_TRAIN_BATCH_SIZE = 64; DEFAULT_EVAL_BATCH_SIZE = 128
-# DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B"
+# DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-410m"; DEFAULT_TRAIN_BATCH_SIZE = 64; DEFAULT_EVAL_BATCH_SIZE = 128
+DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B"; DEFAULT_TRAIN_BATCH_SIZE = 8; DEFAULT_EVAL_BATCH_SIZE = 16
 DEFAULT_USE_PEFT = True
 
 
 DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER
 DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
 DEFAULT_GEN_KWARGS = dict(
-    repetition_penalty=3.0,
-    early_stopping=True,
     max_new_tokens=200,
     min_new_tokens=4,
     
     do_sample=False,
+    early_stopping=True,
+    repetition_penalty=1,
     synced_gpus=os.getenv("ACCELERATE_DEEPSPEED_ZERO_STAGE", "") == "3",
+    use_cache=True,
 )
 
 ########################################################################
@@ -109,12 +110,13 @@ DEFAULT_LORA_DROPOUT = 0.1
 DEFAULT_LM_MODE = lib_sft_constants.LMModes.CAUSAL_FULL
 DEFAULT_MAX_TOTAL_LENGTH_TOK = 300
 DEFAULT_BASE_PRECISION = lib_utils.ValidPrecisions.bfloat16
-DEFAULT_N_BATCHES_PREDICT_TRAIN = 10
+DEFAULT_N_BATCHES_PREDICT_TRAIN = 20
 
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "sft_output"
 DEFAULT_WANDB_PROJECT_NAME = "sft"
 DEFAULT_WANDB_ENTITY = "julesgm"
 DEFAULT_NUM_EPOCHS = 1000
+DEFAULT_QTY_EVAL_SMALL = 200
 DEFAULT_BATCH_TABLE_PRINT_QTY = 2
 DEFAULT_PREDICT_QTY_PRINT = 2
 DEFAULT_PEFT_CONFIG = dict(
@@ -126,21 +128,19 @@ DEFAULT_PEFT_CONFIG = dict(
     task_type=peft.TaskType.CAUSAL_LM,
 
 )
-
 ########################################################################
-
 
 def predict(
     *,
-    model: peft.PeftModel,
-    batch: lib_base_classes.DataListContainer,
-    gen_kwargs,
-    predict_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-    split: str,
-    epoch: int,
     accelerator: accelerate.Accelerator,
+    batch: lib_base_classes.DataListContainer,
+    epoch: int,
+    gen_kwargs,
     metrics: dict[str, lib_base_classes.Metric],
+    model: peft.PeftModel,
+    predict_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
     qty_print: int,
+    split: str,
 ) -> dict[str, list[float]]:
     ###########################################################################
     # Preprocess & Generate
@@ -177,7 +177,8 @@ def predict(
         )
 
         local_metric_outputs[name] = local_metric_output # type: ignore
-        pre_gather = np.fromiter((x for x in local_metric_output.values if x is not None), dtype=float).mean()
+        pre_gather = np.fromiter(
+            (x for x in local_metric_output.values if x is not None), dtype=float).mean()
         pre_gather = torch.tensor(pre_gather).to(LOCAL_RANK)  # type: ignore
         metric_outputs[name] = accelerator.gather(pre_gather).mean().item()  # type: ignore
 
@@ -217,26 +218,115 @@ def iter_all_equal(iterable, key):
     return all(key(x) == key(first) for x in iterator)
 
 
+def step(
+    *, 
+    accelerator: accelerate.Accelerator,
+    batch,
+    cv_set: lib_sft_constants.CVSet,
+    forward_tokenizer: transformers.PreTrainedTokenizerBase,
+    model: peft.peft_model.PeftModelForCausalLM,
+    optimizer: torch.optim.Optimizer,
+):
+    if cv_set:
+        optimizer.zero_grad()
+        model.train()
+
+    lib_utils.not_first_token(
+        forward_tokenizer=forward_tokenizer,
+        tensor=batch["forward"]["input_ids"],
+    )
+
+    loss = model(
+        **{k: v.to(LOCAL_RANK) for k, v in batch["forward"].items()},
+        labels=batch["forward"]["input_ids"],
+    ).loss
+
+    if cv_set == lib_sft_constants.CVSet.TRAIN:
+        accelerator.backward(loss)
+        optimizer.step()
+
+    # Training Logging Logging
+    loss_logging = accelerator.gather(loss.detach()).mean() # type: ignore
+
+    if RANK == 0:
+        wandb.log({f"{cv_set.value}/loss": loss_logging.item()})
+        
+
+    return loss_logging
+
+
+def evaluate(
+    *,
+    accelerator: accelerate.Accelerator,
+    batch,
+    batch_idx: int,
+    batch_table_print_qty: int,
+    cv_split: lib_sft_constants.CVSet,
+    dataloaders,
+    epoch_idx: int,
+    forward_tokenizer: transformers.PreTrainedTokenizerBase,
+    gen_kwargs,
+    max_num_epochs: int,
+    metrics: dict[str, lib_base_classes.Metric],
+    model: peft.peft_model.PeftModelForCausalLM,
+    predict_qty_print: int,
+    prediction_tokenizer: transformers.PreTrainedTokenizerBase,
+):
+    # Predict on Training
+    lib_sft_tables.batch_table(
+        batch=batch["forward"],
+        forward_tokenizer=forward_tokenizer,
+        print_qty=batch_table_print_qty,
+        epoch_idx=epoch_idx,
+        num_epochs=max_num_epochs,
+        batch_idx=batch_idx,
+        num_batches=len(dataloaders[cv_split]),
+        is_forward=True,
+    )
+
+    model.eval()
+    metrics_outputs = predict(
+        predict_tokenizer=prediction_tokenizer,
+        accelerator=accelerator,
+        gen_kwargs=gen_kwargs,
+        metrics=metrics, # type: ignore
+        split=cv_split,
+        model=model,
+        batch=batch,
+        epoch=epoch_idx,
+        qty_print=predict_qty_print,
+    )
+    
+    if RANK == 0:
+        wandb.log(
+            {
+                f"{cv_split}/metrics/{k}": np.mean(v)
+                for k, v in metrics_outputs.items()
+            }
+        )
+    
+
+
 def main(
     run_name,
     *,
-    n_batches_predict_train=DEFAULT_N_BATCHES_PREDICT_TRAIN,
     batch_table_print_qty=DEFAULT_BATCH_TABLE_PRINT_QTY,
+    data_directory=DEFAULT_DATA_DIRECTORY,
+    eval_batch_size=DEFAULT_EVAL_BATCH_SIZE,
+    gen_kwargs=DEFAULT_GEN_KWARGS,
+    lm_mode=DEFAULT_LM_MODE,
+    max_num_epochs=DEFAULT_NUM_EPOCHS,
+    model_name_or_path=DEFAULT_MODEL_NAME_OR_PATH,
+    n_batches_predict_train=DEFAULT_N_BATCHES_PREDICT_TRAIN,
+    output_type=DEFAULT_OUTPUT_TYPE,
+    peft_config_dict=DEFAULT_PEFT_CONFIG,
+    precision=DEFAULT_BASE_PRECISION,
+    predict_qty_print=DEFAULT_PREDICT_QTY_PRINT,
+    qty_eval_small=DEFAULT_QTY_EVAL_SMALL,
+    train_batch_size=DEFAULT_TRAIN_BATCH_SIZE,
+    use_peft=DEFAULT_USE_PEFT,
     wandb_entity=DEFAULT_WANDB_ENTITY,
     wandb_project_name=DEFAULT_WANDB_PROJECT_NAME,
-    model_name_or_path=DEFAULT_MODEL_NAME_OR_PATH,
-    train_batch_size=DEFAULT_TRAIN_BATCH_SIZE,
-    eval_batch_size=DEFAULT_EVAL_BATCH_SIZE,
-    output_type=DEFAULT_OUTPUT_TYPE,
-    num_epochs=DEFAULT_NUM_EPOCHS,
-    precision=DEFAULT_BASE_PRECISION,
-    lm_mode=DEFAULT_LM_MODE,
-    predict_qty_print=DEFAULT_PREDICT_QTY_PRINT,
-    gen_kwargs=DEFAULT_GEN_KWARGS,
-    data_directory=DEFAULT_DATA_DIRECTORY,
-    peft_config_dict=DEFAULT_PEFT_CONFIG,
-    use_peft=DEFAULT_USE_PEFT,
-    data_mode=DEFAULT_DATA_MODE,
     # max_total_length_tok=DEFAULT_MAX_TOTAL_LENGTH_TOK,
     # output_dir=DEFAULT_OUTPUT_DIR,
     # lora_dropout=DEFAULT_LORA_DROPOUT,
@@ -308,6 +398,7 @@ def main(
         precision=precision,
         just_device_map=False,
         use_peft=use_peft,
+        adapter_name="default",
     )
 
     if RANK == 0:
@@ -317,9 +408,7 @@ def main(
     model.print_trainable_parameters()
 
     assert not is_encoder_decoder
-    dataloaders = lib_sft_dataloaders.get_dataloaders(
-        # max_total_length_tok=max_total_length_tok,
-        # is_encoder_decoder=is_encoder_decoder,
+    dataloaders, small_eval_dataloader = lib_sft_dataloaders.get_dataloaders(
         data_directory=data_directory,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
@@ -327,168 +416,127 @@ def main(
         forward_tokenizer=forward_tokenizer,
         prediction_tokenizer=prediction_tokenizer,
         lm_mode=lm_mode,
+        qty_eval_small=qty_eval_small,
     )
 
     ###########################################################################
     # 🏎️ Accelerator business
     ###########################################################################
     accelerator = accelerate.Accelerator()
-    model, optimizer, dataloaders = accelerator.prepare(model, optimizer, dataloaders)
-    # dataloaders = {
-    #     split: accelerator.prepare_data_loader(dataloader)
-    #     for split, dataloader in dataloaders.items()
-    # }
+    model, optimizer, dataloaders, small_eval_dataloader = accelerator.prepare(
+        model, optimizer, dataloaders, small_eval_dataloader)
 
     ###########################################################################
     # Main Loop
     ###########################################################################
-    for epoch in tqdm(range(num_epochs), disable=RANK != 0, desc="Epochs"):
+    for epoch_idx in tqdm(range(max_num_epochs), disable=RANK != 0, desc="Epochs"):
         accelerator.unwrap_model(model).print_trainable_parameters()  # type: ignore
+        train_dataset_iterator = iter(dataloaders["train"])
 
-        # Train
-        for i, batch in enumerate(
-            tqdm(dataloaders["train"], disable=RANK != 0, desc="Train Batches")
-        ):
-            # Predict on Training
-            train_metrics_outputs = None
-            if i < n_batches_predict_train:
-                lib_sft_tables.batch_table(
-                    batch=batch["forward"],
-                    forward_tokenizer=forward_tokenizer,
-                    print_qty=batch_table_print_qty,
-                    epoch_idx=epoch,
-                    num_epochs=num_epochs,
-                    batch_idx=i,
-                    num_batches=len(dataloaders["train"]),
-                    is_forward=True,
+        at_least_one = True
+        while at_least_one:
+            at_least_one = False
+
+            # Train
+            for batch_idx, batch in enumerate(
+                tqdm(
+                    it.islice(train_dataset_iterator, n_batches_predict_train), 
+                    disable=RANK != 0, desc="Train Batches",
                 )
-
-                model.eval()
-                train_metrics_outputs = predict(
-                    predict_tokenizer=prediction_tokenizer,
+            ):
+                at_least_one = True
+                cv_split = lib_sft_constants.CVSet.TRAIN
+                    
+                step(
                     accelerator=accelerator,
-                    gen_kwargs=gen_kwargs,
-                    metrics=metrics, # type: ignore
-                    split="train",
-                    model=model,
                     batch=batch,
-                    epoch=epoch,
-                    qty_print=predict_qty_print,
+                    cv_set=cv_split,
+                    forward_tokenizer=forward_tokenizer,
+                    model=model,
+                    optimizer=optimizer,
                 )
 
-            ###################################################################
-            # Training Step
-            ###################################################################
-            optimizer.zero_grad()
-            model.train()
-            lib_utils.not_first_token(
-                forward_tokenizer=forward_tokenizer,
-                tensor=batch["forward"]["input_ids"],
-            )
-
-            loss = model(
-                **{k: v.to(LOCAL_RANK) for k, v in batch["forward"].items()},
-                labels=batch["forward"]["input_ids"],
-            ).loss
-
-            accelerator.backward(loss)
-            optimizer.step()
-
-            # Training Logging Logging
-            loss_logging = accelerator.gather(loss.detach()).mean() # type: ignore
-
-            if RANK == 0:
-                wandb.log({"train/loss": loss_logging})
-                if train_metrics_outputs:
-                    wandb.log(
-                        {
-                            f"train/metrics/{k}": np.mean(v)
-                            for k, v in train_metrics_outputs.items()
-                        }
+                if batch_idx % 10 == 0:
+                    evaluate(
+                        accelerator=accelerator,
+                        batch_idx=batch_idx,
+                        batch=batch,
+                        cv_split=cv_split,
+                        dataloaders=dataloaders,
+                        epoch_idx=epoch_idx,
+                        forward_tokenizer=forward_tokenizer,
+                        gen_kwargs=gen_kwargs,
+                        predict_qty_print=predict_qty_print,
+                        prediction_tokenizer=prediction_tokenizer,
+                        batch_table_print_qty=batch_table_print_qty,
+                        max_num_epochs=max_num_epochs,
+                        model=model,
+                        metrics=metrics,
                     )
 
-        #######################################################################
-        # Eval on the whole dataset.
-        # 1. Generate predictions to see the model's performance.
-        # 2. Compute the perplexity on the correct answer.
-        #######################################################################
-        eval_losses = []
-        eval_metrics_outputs = collections.defaultdict(
-            list
-        )  
-        for i, batch in enumerate(
-            tqdm(dataloaders["eval"], disable=RANK != 0, desc="Eval Batches")
-        ):
-            model.eval()
-            if i == 0:
-                lib_sft_tables.batch_table(
-                    forward_tokenizer=forward_tokenizer,
-                    num_batches=len(dataloaders["eval"]),
-                    num_epochs=num_epochs,
-                    is_forward=True,
-                    print_qty=batch_table_print_qty,
-                    batch_idx=i,
-                    epoch_idx=epoch,
-                    batch=batch["forward"],
-                )
+            for batch_idx, batch in enumerate(
+                tqdm(small_eval_dataloader, disable=RANK != 0, desc="Eval Batches")
+            ):
+                cv_split = lib_sft_constants.CVSet.VALIDATION
 
-            #######################################################################
-            # Predict & Stack metrics
-            #######################################################################
-            metrics_outputs_batch = predict(
-                predict_tokenizer=prediction_tokenizer,
+                with torch.no_grad():
+                    step(
+                        accelerator=accelerator,
+                        batch=batch,
+                        cv_set=cv_split,
+                        forward_tokenizer=forward_tokenizer,
+                        model=model,
+                        optimizer=optimizer,
+                    )
+                    
+                    evaluate(
+                        accelerator=accelerator,
+                        batch_idx=batch_idx,
+                        batch=batch,
+                        cv_split=cv_split,
+                        dataloaders=dataloaders,
+                        epoch_idx=epoch_idx,
+                        forward_tokenizer=forward_tokenizer,
+                        gen_kwargs=gen_kwargs,
+                        predict_qty_print=predict_qty_print,
+                        prediction_tokenizer=prediction_tokenizer,
+                        batch_table_print_qty=batch_table_print_qty,
+                        max_num_epochs=max_num_epochs,
+                        model=model,
+                        metrics=metrics,
+                    )
+
+    for batch in tqdm(
+        dataloaders[lib_sft_constants.CVSet.VALIDATION], 
+        disable=RANK != 0, 
+        desc="Test Batches"
+    ):
+        with torch.no_grad():
+            step(
                 accelerator=accelerator,
-                gen_kwargs=gen_kwargs,
-                qty_print=predict_qty_print,
-                metrics=metrics, # type: ignore
-                model=model,
                 batch=batch,
-                split="eval",
-                epoch=epoch,
-            )
-
-            for k, v in metrics_outputs_batch.items():
-                eval_metrics_outputs[k].append(v)  # type: ignore
-
-            assert iter_all_equal(eval_metrics_outputs.values(), lambda v: len(v)), {
-                k: len(v) for k, v in eval_metrics_outputs.items()
-            }
-
-            #######################################################################
-            # Eval Loss, Gather & Stack
-            #######################################################################
-            lib_utils.not_first_token(
-                tensor=batch["forward"]["input_ids"],
+                cv_set=cv_split,
                 forward_tokenizer=forward_tokenizer,
+                model=model,
+                optimizer=optimizer,
             )
-
-            lib_utils.not_first_token(
-                tensor=batch["forward"]["labels"],
+            
+            evaluate(
+                accelerator=accelerator,
+                batch_idx=batch_idx,
+                batch=batch,
+                cv_split=cv_split,
+                dataloaders=dataloaders,
+                epoch_idx=epoch_idx,
                 forward_tokenizer=forward_tokenizer,
+                gen_kwargs=gen_kwargs,
+                predict_qty_print=predict_qty_print,
+                prediction_tokenizer=prediction_tokenizer,
+                batch_table_print_qty=batch_table_print_qty,
+                max_num_epochs=max_num_epochs,
+                model=model,
+                metrics=metrics,
             )
-
-            model.eval()
-            with torch.no_grad():
-                loss = model(
-                    **{k: v.to(LOCAL_RANK) for k, v in batch["forward"].items()}
-                ).loss
-
-            # Eval Logging
-            loss_logging = accelerator.gather(loss.detach()).mean()  # type: ignore
-            eval_losses.append(loss_logging.item())
-
-        #######################################################################
-        # Log the Eval Metrics
-        #######################################################################
-        if RANK == 0:
-            wandb.log({"eval/loss": np.mean(eval_losses)})
-            wandb.log(
-                {
-                    f"eval/metrics/{k}": np.mean(v)  # type: ignore
-                    for k, v in eval_metrics_outputs.items()
-                }
-            )
-
 
 if __name__ == "__main__":
     fire.Fire(main)

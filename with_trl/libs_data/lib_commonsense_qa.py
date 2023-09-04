@@ -26,6 +26,8 @@ import libs_extraction.lib_multiple_choice
 import libs_data.lib_base
 import libs_data.data_commonsense_qa_few_shot
 
+datasets.disable_caching()
+
 RANK = int(os.getenv("RANK", 0))
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", 0))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))

@@ -39,6 +39,10 @@ SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 LOGGER = logging.getLogger(__name__)
 
 
+
+
+
+
 def get_dataloaders(
     *,
     output_type: lib_sft_constants.OutputTypes,
@@ -47,7 +51,9 @@ def get_dataloaders(
     prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
     train_batch_size: int,
     eval_batch_size: int,
+    qty_eval_small: int,
     data_directory: pathlib.Path,
+    data_mode: lib_sft_constants.DataModes,
 ):
     ###########################################################################
     # Datasets
@@ -63,6 +69,7 @@ def get_dataloaders(
             output_type=output_type,
             forward_tokenizer=forward_tokenizer,
             prediction_tokenizer=prediction_tokenizer,
+            data_mode=data_mode,
         )
     else:
         raise NotImplementedError(lm_mode)
@@ -72,12 +79,20 @@ def get_dataloaders(
     ###########################################################################
     dataloaders = {}
     for k, v in datasets.items():
-        assert k in ["train", "eval"], k
+        k = lib_sft_constants.CVSet(k)
+
         dataloaders[k] = torch.utils.data.DataLoader(
             v,
             batch_size=train_batch_size if k == "train" else eval_batch_size,
             collate_fn=data_collator,
-            shuffle=k == "train",
+            shuffle=k == lib_sft_constants.CVSet.TRAIN,
         )
 
-    return dataloaders
+    small_dataloader_eval = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(datasets[lib_sft_constants.CVSet.VALIDATION], range(qty_eval_small)),
+        batch_size=eval_batch_size,
+            collate_fn=data_collator,
+            shuffle=False,
+    )
+
+    return dataloaders, small_dataloader_eval

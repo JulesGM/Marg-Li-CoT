@@ -24,5 +24,9 @@ class OutputTypes(enum.Enum):
 
 class DataModes(enum.Enum):
     OPENAI_GENERATION = "openai_generation"
-    H5_GENERATION = "h5_generation"
+    ANSWER_ONLY = "answer_only"
 
+
+class CVSet(str, enum.Enum):
+    TRAIN = "train"
+    VALIDATION = "validation"

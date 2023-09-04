@@ -58,7 +58,8 @@ def make_eval_dataloader(
 
 def make_metric_and_reward_fn(
     *,
-    ppo_trainer: Union[trl.PPOTrainer, trl_fork.PPOConfig],
+    accelerator_device,
+    accelerator_num_processes,
     reward_type,
     task_name: lib_utils.Task,
     use_peft: bool,
@@ -95,7 +96,10 @@ def make_metric_and_reward_fn(
             )
 
     elif task_name == lib_utils.Task.SENTIMENT:
-        reward_fn = lib_sentiment_specific.SentimentRewardFn(ppo_trainer)
+        reward_fn = lib_sentiment_specific.SentimentRewardFn(
+            accelerator_device=accelerator_device,
+            accelerator_num_processes=accelerator_num_processes,
+        )
         metric_accuracy = reward_fn
 
     else:

@@ -1,6 +1,7 @@
 import contextlib
 import enum
 import os
+import pathlib
 import typing
 from typing import Any, Optional, Union
 
@@ -194,4 +195,14 @@ class DictDataset(torch.utils.data.Dataset):
 
     def get_dict(self):
         return self._dataset
-    
+
+
+def get_tmp_dir() -> pathlib.Path:
+    if "SLURM_TMPDIR" not in os.environ:
+        job_id = os.environ["SLURM_JOB_ID"]
+        tmp_dir = pathlib.Path(f"/Tmp/slurm.{job_id}.0")
+        assert tmp_dir.exists(), f"{tmp_dir} does not exist."
+    else:
+        tmp_dir = pathlib.Path(os.environ["SLURM_TMPDIR"])
+
+    return tmp_dir

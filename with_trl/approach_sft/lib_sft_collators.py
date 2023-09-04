@@ -54,7 +54,6 @@ class CausalFullCollator:
 
         self._forward_tokenizer = forward_tokenizer
         self._prediction_tokenizer = prediction_tokenizer
-
         self._output_type = output_type
          
         assert self._prediction_tokenizer.padding_side == "left", (

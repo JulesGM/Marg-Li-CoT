@@ -40,6 +40,76 @@ RANK = int(os.environ.get("RANK", "0"))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
+def generate(
+        *, 
+        accelerator, 
+        answer_extractor,
+        batch, 
+        batch_size,
+        dataset_name,
+        generation_kwargs, 
+        policy_model, 
+        post_process_gen_fewshots_fn,
+        prediction_tokenizer,
+        task_name,
+        use_few_shots,
+        
+    ):
+    
+    print(f"{RANK} lib_trl_utils.batched_unroll >>>")
+
+    raw_gen_outputs = batched_unroll(
+        accelerated_model=policy_model,
+        accelerator=accelerator,
+        dataset_name=dataset_name, 
+        generation_kwargs=generation_kwargs,
+        post_process_gen_fewshots_fn=post_process_gen_fewshots_fn,
+        prediction_tokenizer=prediction_tokenizer,
+        query_tensors=batch.tok_ref_query,
+        task_name=task_name, 
+        use_few_shots=use_few_shots,
+    )
+    print(f"{RANK} lib_trl_utils.batched_unroll <<<")
+
+    if task_name == lib_utils.Task.MAIN:
+        outputs = keep_good_one_generation(
+            num_return_seq=generation_kwargs["num_return_sequences"],
+            other_rewards=None,
+            generations=raw_gen_outputs,
+            ref_answers=batch.detok_ref_answer,
+            batch_size=batch_size,
+            prediction_tokenizer=prediction_tokenizer,
+            answer_extractor=answer_extractor,
+        )
+    else:
+        assert task_name == lib_utils.Task.SENTIMENT, task_name
+
+        assert (
+            generation_kwargs["num_return_sequences"] == 1
+        ), generation_kwargs["num_return_sequences"]
+
+        outputs = raw_gen_outputs
+        assert len(outputs.response_tensors) == batch_size, (
+            len(outputs.response_tensors),
+            batch_size,
+        )
+
+    outputs = lib_base_classes.BatchedUnrollReturn(
+        response_tensors=unpad(
+            responses=outputs.response_tensors,
+            eos_token_id=prediction_tokenizer.eos_token_id,
+            pad_token_id=prediction_tokenizer.pad_token_id,
+        ),
+        raw_response_tensors=unpad(
+            outputs.raw_response_tensors,
+            eos_token_id=prediction_tokenizer.eos_token_id,
+            pad_token_id=prediction_tokenizer.pad_token_id,
+        ),
+        any_tokenizer=prediction_tokenizer,
+    )
+
+    return outputs
+
 
 def rich_escape(value):
     return rich.markup.escape(str(value))
@@ -461,7 +531,6 @@ def load_tokenizers(model_name, config):
         prediction_tokenizer.padding_side = "left"
         forward_tokenizer.padding_side = "right"
 
-
     return dict(
         forward_tokenizer=forward_tokenizer, 
         prediction_tokenizer=prediction_tokenizer,
@@ -732,15 +801,15 @@ def init_model(
 
 def batched_unroll(
     *,
-    generation_kwargs: dict[str, typing.Any],
-    query_tensors: list[torch.Tensor],
     accelerated_model,
     accelerator: accelerate.Accelerator,
-    prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-    task_name,
     dataset_name,
+    generation_kwargs: dict[str, typing.Any],
+    post_process_gen_fewshots_fn,
+    prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
+    query_tensors: list[torch.Tensor],
+    task_name,
     use_few_shots,
-    dataset_obj,
 ) -> lib_base_classes.BatchedUnrollReturn:
     model: transformers.PreTrainedModel = typing.cast(  # type: ignore
         transformers.PreTrainedModel,  # type: ignore
@@ -765,6 +834,7 @@ def batched_unroll(
     responses = model.generate(
         **tokenized,
         **generation_kwargs,
+        pad_token_id=prediction_tokenizer.pad_token_id,
     )
 
     if not model.config.is_encoder_decoder:
@@ -777,8 +847,9 @@ def batched_unroll(
     raw_responses = responses
     if task_name == lib_utils.Task.MAIN:
         if dataset_name == lib_data.DatasetChoices.COMMONSENSEQA_MC and use_few_shots:
-            responses = dataset_obj.post_process_gen_fewshots(raw_gen_outputs=responses, any_tokenizer=prediction_tokenizer)
+            responses = post_process_gen_fewshots_fn(raw_gen_outputs=responses, any_tokenizer=prediction_tokenizer)
         elif use_few_shots:
+            raise NotImplemented
             assert not hasattr(dataset_obj, "post_process_gen_fewshots"), type(dataset_obj).mro()
 
     return lib_base_classes.BatchedUnrollReturn(
@@ -813,17 +884,17 @@ def unpad(responses, pad_token_id, eos_token_id):
 
 def log_reward(
     *,
-    ppo_trainer,
+    accelerator,
     reward_output,
     metric_output,
     epoch,
     batch_idx,
 ):
-    all_rewards = ppo_trainer.accelerator.gather_for_metrics(
-        torch.tensor(reward_output.values).to(ppo_trainer.accelerator.device)
+    all_rewards = accelerator.gather_for_metrics(
+        torch.tensor(reward_output.values).to(accelerator.device)
     )
-    all_metrics = ppo_trainer.accelerator.gather_for_metrics(
-        torch.tensor(metric_output.values).to(ppo_trainer.accelerator.device)
+    all_metrics = accelerator.gather_for_metrics(
+        torch.tensor(metric_output.values).to(accelerator.device)
     )
 
     rich.print(
@@ -839,3 +910,5 @@ def log_reward(
     if RANK == 0:
         wandb.log({"avg_all_rewards": all_rewards.mean().item()})
         wandb.log({"avg_all_metrics": all_metrics.mean().item()})
+
+
