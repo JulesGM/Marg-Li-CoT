@@ -53,7 +53,6 @@ def get_dataloaders(
     eval_batch_size: int,
     qty_eval_small: int,
     data_directory: pathlib.Path,
-    data_mode: lib_sft_constants.DataModes,
 ):
     ###########################################################################
     # Datasets
@@ -69,7 +68,6 @@ def get_dataloaders(
             output_type=output_type,
             forward_tokenizer=forward_tokenizer,
             prediction_tokenizer=prediction_tokenizer,
-            data_mode=data_mode,
         )
     else:
         raise NotImplementedError(lm_mode)
