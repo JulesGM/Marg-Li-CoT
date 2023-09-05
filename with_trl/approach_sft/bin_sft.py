@@ -86,7 +86,7 @@ DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B"; DEFAULT_TRAIN_BATCH_SIZE = 8
 DEFAULT_USE_PEFT = True
 
 
-DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER
+DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.ANSWER_ONLY
 DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
 DEFAULT_GEN_KWARGS = dict(
     max_new_tokens=200,
@@ -341,7 +341,6 @@ def main(
     ###########################################################################
     # 🔍 Checks.
     ###########################################################################
-    data_mode = lib_sft_constants.DataModes(data_mode)
     lm_mode = lib_sft_constants.LMModes(lm_mode)
     precision = lib_utils.ValidPrecisions(precision)
     is_encoder_decoder = lib_sft_utils.get_is_encoder_decoder(
