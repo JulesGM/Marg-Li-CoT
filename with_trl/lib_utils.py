@@ -6,6 +6,7 @@ import typing
 from typing import Any, Optional, Union
 
 import accelerate
+import more_itertools as mit
 import numpy as np
 import rich
 import rich.table
@@ -14,20 +15,32 @@ import transformers
 from tqdm import tqdm
 import trl
 import trl_fork
-
+import wandb
 
 RANK = int(os.environ.get("RANK", 0))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 
+
+class Datasets(str, enum.Enum):
+    COMMONSENSE_QA = "commonsense_qa"
+    ARITHMETIC = "arithmetic"
+
+
 class TrlLibraryMode(enum.Enum):
     TRL = "trl"
     TRL_FORK = "trl_fork"
-    
+
+
 TRL_LIBRARIES = {
     TrlLibraryMode.TRL: trl,
     TrlLibraryMode.TRL_FORK: trl_fork,
 }
+
+
+class CVSets(str, enum.Enum):
+    TRAIN = "train"
+    VALID = "validation"
 
 
 class MovingAverage:
@@ -82,6 +95,17 @@ class ValidPrecisions(enum.Enum):
 
         return super().__eq__(value)
 
+
+def line_return_token(any_tokenizer):
+    candidate = mit.one(any_tokenizer("\n").input_ids)
+    assert isinstance(candidate, int), type(candidate)
+    decoded = any_tokenizer.decode([candidate])
+    assert decoded == "\n", (decoded, candidate)
+    a_tok = mit.one(any_tokenizer("a").input_ids)
+    decoded_test = any_tokenizer("a\na").input_ids
+    assert decoded_test == [a_tok, candidate, a_tok], decoded_test
+    return candidate
+    
 
 def not_first_token(*, tensor, forward_tokenizer):
     assert len(tensor.shape) == 2
@@ -143,9 +167,21 @@ class DictDataset(torch.utils.data.Dataset):
             self._dataset = {k: [] for k in keys}
         else:
             self._dataset = data
+            first = None
+            
+            assert isinstance(data, dict), type(data).mro()
+            for k, v in self._dataset.items():
+                assert isinstance(k, str), type(k).mro()
+                if first is None:
+                    first = len(v)
+                else:
+                    assert isinstance(v, list), type(v).mro()
+                    assert first == len(v), (first, len(v))
 
     def __getitem__(self, key: typing.Union[str, int]):
         if isinstance(key, (int, slice)):
+            if isinstance(key, int):
+                assert len(self) > key, (len(self), key)
             return {k: v[key] for k, v in self._dataset.items()}
         elif isinstance(key, str):
             return self._dataset[key]
@@ -166,6 +202,7 @@ class DictDataset(torch.utils.data.Dataset):
         return tuple(lengths)
 
     def append(self, dict_) -> None:
+
         assert dict_.keys() == self._dataset.keys(), (
             dict_.keys(),
             self._dataset.keys(),
@@ -196,6 +233,11 @@ class DictDataset(torch.utils.data.Dataset):
     def get_dict(self):
         return self._dataset
 
+    def shuffle(self):
+        indices = np.random.permutation(len(self))
+        for k, v in self._dataset.items():
+            self._dataset[k] = [v[i] for i in indices]
+
 
 def get_tmp_dir() -> pathlib.Path:
     if "SLURM_TMPDIR" not in os.environ:
@@ -206,3 +248,45 @@ def get_tmp_dir() -> pathlib.Path:
         tmp_dir = pathlib.Path(os.environ["SLURM_TMPDIR"])
 
     return tmp_dir
+
+
+class WandbTableRepair:
+    def __init__(self, *args, **kwargs):
+        self._creation_args = args
+        self._creation_kwargs = kwargs
+        self._table = wandb.Table(*args, **kwargs)
+
+    def add_data(self, *args, **kwargs):
+        self._table.add_data(*args, **kwargs)
+
+    def get_loggable_object(self):
+        old_table = self._table
+        self._table = wandb.Table(
+            *self._creation_args, 
+            **self._creation_kwargs, 
+            data=self._table.data,
+        )
+        return old_table
+    
+
+class WandbAndRichTable:
+    def __init__(self, columns, rich_kwargs=None, wandb_kwargs=None):
+        if rich_kwargs is None:
+            rich_kwargs = {}
+        if wandb_kwargs is None:
+            wandb_kwargs = {}
+
+        self._columns = columns
+        self._rich_kwargs = rich_kwargs
+        self._wandb_kwargs = wandb_kwargs
+        self._rich_table = rich.table.Table(*self._columns, **self._rich_kwargs)
+        self._wandb_table = WandbTableRepair(columns=columns, **wandb_kwargs)
+
+    def add_row(self, *args, **kwargs):
+        self._rich_table.add_row(*args, **kwargs)
+        self._wandb_table.add_data(*args, **kwargs)
+    
+    def get_loggable_object(self):
+        rich.print(self._rich_table)
+        self._rich_table = rich.table.Table(*self._columns, **self._rich_kwargs)
+        return self._wandb_table.get_loggable_object()

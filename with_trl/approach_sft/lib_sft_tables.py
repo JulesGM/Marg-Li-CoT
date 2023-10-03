@@ -7,8 +7,10 @@ import rich.markup
 import rich.table
 import torch
 import transformers
+import wandb
 
 import lib_base_classes
+import lib_utils
 
 RANK = int(os.environ.get("RANK", 0))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
@@ -17,74 +19,76 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 def predict_table(
     *,
     batch: lib_base_classes.DataListContainer,
-    predict_tokenizer, 
-    predictions, 
-    split, 
-    epoch, 
-    qty_print, 
-    local_metric_outputs, 
+    epoch: int,
+    global_step: int,
+    local_metric_outputs,
+    predict_tokenizer: transformers.PreTrainedTokenizerBase,
+    predictions,
     predictions_batch_obj,
-    tok_predict_query,
+    qty_print: int,
+    split: lib_utils.CVSets,
+    wandb_and_rich_table: lib_utils.WandbAndRichTable,
 ):
-    
+    assert RANK == 0, RANK
+
     decoded_questions = batch.detok_ref_query
-    decoded_answers = predict_tokenizer.batch_decode(predictions)
-
-    table = rich.table.Table(
-        title=f"{split} - Predictions, epoch {epoch}",
-        show_lines=True,
-    )
-
-    table.add_column("Question:")
-    table.add_column("Prediction:")
-    table.add_column("Gen A:")
-    table.add_column("Ref A:")
-    table.add_column("Qty Toks:")
+    decoded_predictions = predict_tokenizer.batch_decode(predictions)
+    assert predictions_batch_obj, predictions_batch_obj
+    assert decoded_predictions, decoded_predictions
+    assert decoded_questions, decoded_questions
+    assert local_metric_outputs["exact_match"].logging_columns["gen"]
+    assert local_metric_outputs["exact_match"].logging_columns["ref"]
 
     for (
         decoded_question,
-        decoded_answer,
+        decoded_prediction,
         local_em_gen,
         local_em_ref,
         pred_tok,
-        q_tok,
     ) in mi.take(
         qty_print,
         mi.zip_equal(
             decoded_questions,
-            decoded_answers,
+            decoded_predictions,
             local_metric_outputs["exact_match"].logging_columns["gen"],  # type: ignore
             local_metric_outputs["exact_match"].logging_columns["ref"],  # type: ignore
             predictions_batch_obj,
-            tok_predict_query.input_ids,
         ),
     ):
         # We could skip this by decoding instead of using the pre-decoded.
         # It's still weird. I feel like it should be the same.
         escaped_q = rich.markup.escape(decoded_question).strip() # type: ignore
-        escaped_a = rich.markup.escape(decoded_answer).strip() # type: ignore
-
-        table.add_row(
-            escaped_q,
-            f"[green]{escaped_a}",
-            rich.markup.escape(str(local_em_gen)),
-            rich.markup.escape(str(local_em_ref)),
-            str(len(pred_tok.response_tensor) - len(q_tok) - (pred_tok.response_tensor == predict_tokenizer.pad_token_id).sum().item()),            
+        escaped_p = rich.markup.escape(decoded_prediction).strip() # type: ignore
+        p_len = (len(pred_tok.response_tensor) 
+            - (pred_tok.response_tensor == predict_tokenizer.pad_token_id).sum().item()
         )
 
-    rich.print(table)
+        wandb_and_rich_table.add_row(
+            str(epoch),                            # "Epoch"
+            rich.markup.escape(escaped_q),         # "Question"
+            rich.markup.escape(escaped_p),         # "Prediction"
+            rich.markup.escape(str(local_em_gen)), # "Extracted Gen A"
+            rich.markup.escape(str(local_em_ref)), # "Ref A"
+            str(p_len),                            # "Qty Toks"
+        )
+
+    wandb.log({
+        f"{split.value}/predictions_table": wandb_and_rich_table.get_loggable_object()
+        }, step=global_step)
+    
 
 
 def batch_table(
     *,
     batch: lib_base_classes.DataListContainer,
-    is_forward: bool,
-    forward_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-    print_qty: int,
-    epoch_idx: int,
-    num_epochs: int,
     batch_idx: int,
+    epoch_idx: int,
+    forward_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
+    is_forward: bool,
     num_batches: int,
+    num_epochs: int,
+    print_qty: int,
+    
 ):
     """
     Prints values of a batch in a table.
@@ -122,6 +126,7 @@ def batch_table(
                 + f"{rich.markup.escape(str(i))}",
                 rich.markup.escape(text),
             )
+            
 
     if RANK == 0:
         rich.print(table)

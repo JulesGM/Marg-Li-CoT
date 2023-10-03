@@ -27,6 +27,3 @@ class DataModes(enum.Enum):
     ANSWER_ONLY = "answer_only"
 
 
-class CVSet(str, enum.Enum):
-    TRAIN = "train"
-    VALIDATION = "validation"

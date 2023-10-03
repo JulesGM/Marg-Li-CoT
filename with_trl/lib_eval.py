@@ -1,6 +1,7 @@
 """ Code used in the eval loops and nowhere else """
 import logging
 import os
+import random
 import typing
 from typing import Any, Optional, Union
 
@@ -66,7 +67,11 @@ def make_metric_and_reward_fn(
     extractor,
 ) -> typing.Tuple[typing.Callable, typing.Callable]:
     if task_name == lib_utils.Task.MAIN:
-        metric_accuracy = lib_metric.ScratchpadAnswerAccuracy(extractor=extractor)
+        accuracy = lib_metric.ScratchpadAnswerAccuracy(extractor=extractor)
+        metrics = {
+            f"accuracy_{type(extractor).__name__}": accuracy
+            
+        }
 
         if reward_type == lib_utils.RewardChoices.REF_PPL:
             assert False, "Not implemented"
@@ -86,7 +91,7 @@ def make_metric_and_reward_fn(
 
         elif reward_type == lib_utils.RewardChoices.EXACT_MATCH:
             reward_fn = lib_reward_exact_match.ExactMatchReward(
-                metric_fn=metric_accuracy,
+                metric_fn=accuracy,
             )
 
         else:
@@ -100,12 +105,15 @@ def make_metric_and_reward_fn(
             accelerator_device=accelerator_device,
             accelerator_num_processes=accelerator_num_processes,
         )
-        metric_accuracy = reward_fn
+        metrics = {
+            f"accuracy_{extractor}": 
+            lib_metric.ScratchpadAnswerAccuracy(extractor=extractor)
+        }
 
     else:
         raise ValueError(f"Unknown task: {task_name}")
 
-    return metric_accuracy, reward_fn
+    return metrics, reward_fn
 
 
 class EvalLoop:
@@ -117,8 +125,7 @@ class EvalLoop:
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
         accelerated_model,
         eval_subset_size: int,
-        metric_accuracy: typing.Callable[
-            [torch.Tensor, torch.Tensor], torch.Tensor],
+        metric_accuracy: typing.Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         accelerator: accelerate.Accelerator,
         batch_size: int,
         reward_fn,
@@ -129,11 +136,11 @@ class EvalLoop:
         dataset_type: lib_data.DatasetChoices,
     ):
         dataloader = make_eval_dataloader(
-            accelerator=accelerator,
-            batch_size=batch_size,
-            collator=lib_base_classes.DataListContainer.collate,
-            dataset=dataset,
-            subset_size=eval_subset_size,
+            accelerator = accelerator,
+            batch_size  = batch_size,
+            collator    = lib_base_classes.DataListContainer.collate,
+            dataset     = dataset,
+            subset_size = eval_subset_size,
         )
 
         self._dataset_type = dataset_type
@@ -145,6 +152,7 @@ class EvalLoop:
         self._metric_accuracy = metric_accuracy
         self._set_dataloader = dataloader
         self._accelerator = accelerator
+        
         self._wandb_table_keys = (
             "call_idx", 
             "query_end", 
@@ -154,11 +162,12 @@ class EvalLoop:
             "extracted_answer",
             "extracted_ref",
         )
-        self._wandb_table = wandb.Table(columns=list(self._wandb_table_keys))
         self._reward_fn = reward_fn
         self._task_name = task_name
         self._split = split
         self._call_idx = 0
+        self._wandb_table = lib_utils.WandbTableRepair(
+            columns=list(self._wandb_table_keys))
 
         # Unwrap dataset
         seen = set([id(dataloader)])
@@ -186,19 +195,21 @@ class EvalLoop:
 
             for batch_idx, batch in enumerate(
                 lib_utils.progress(
-                    description=f"Doing Evaluation of set: {self._split}",
-                    total=len(self._set_dataloader),
-                    seq=self._set_dataloader,
+                    self._set_dataloader,
+                    description = f"Doing Evaluation of set: {self._split}",
+                    total       = len(self._set_dataloader),
                 )
             ):
                 if RANK == 0:
                     rich.print(
-                        f"Rank:   {RANK}/{WORLD_SIZE} - "
-                        + f"Split:  [bold white on blue]{self._split}[/] - "
-                        + f"Batch:  {batch_idx}/{len(self._set_dataloader)} - "
-                        + (f"Metric: {np.mean([x.item() for x in metrics]):0.2%} - {metrics = }")
-                        if metrics
-                        else ""
+                        f"Rank:   {RANK}/{WORLD_SIZE} - " +
+                        f"Split:  [bold white on blue]{self._split}[/] - " +
+                        f"Batch:  {batch_idx}/{len(self._set_dataloader)} - " +
+                        (
+                            f"Metric: {np.mean([x.item() for x in metrics]):0.2%} - {metrics = }"
+                            if metrics
+                            else ""
+                        )
                     )
 
                 ############################################################
@@ -211,15 +222,15 @@ class EvalLoop:
                 assert batch
 
                 output = lib_trl_utils.batched_unroll(
-                    prediction_tokenizer=self._prediction_tokenizer,
-                    generation_kwargs=self._inference_gen_kwargs,
-                    accelerated_model=self._accelerated_model,
-                    accelerator=self._accelerator,
-                    query_tensors=batch.tok_ref_query,
-                    use_few_shots=self._use_few_shots,
-                    dataset_name=self._dataset_type,
-                    task_name=self._task_name,
-                    dataset_obj=self._raw_dataset
+                    accelerated_model    = self._accelerated_model,
+                    accelerator          = self._accelerator,
+                    dataset_name         = self._dataset_type,
+                    dataset_obj          = self._raw_dataset,
+                    generation_kwargs    = self._inference_gen_kwargs,
+                    prediction_tokenizer = self._prediction_tokenizer,
+                    query_tensors        = batch.tok_ref_query,
+                    task_name            = self._task_name,
+                    use_few_shots        = self._use_few_shots,
                 )
 
                 local_batch_rewards: lib_base_classes.RewardOutput = self._reward_fn(
@@ -250,17 +261,17 @@ class EvalLoop:
                     ),
                 )            
 
-                for idx_in_batch in range(len(batch.detok_ref_query)):
-                    rindex = batch.detok_ref_query[idx_in_batch].rindex("Q:")
-                    table_information.append(dict(
-                        call_idx=str(self._call_idx),
-                        query_end=str(batch.detok_ref_query[idx_in_batch][rindex:]),
-                        raw_gen=str(output.raw_response_text[idx_in_batch]),
-                        cleaned_gen=str(output.response_text[idx_in_batch]),
-                        ref=str(batch.detok_ref_answer[idx_in_batch]),
-                        extracted_answer=str(local_batch_metrics.extracted_gen[idx_in_batch]),
-                        extracted_ref=str(local_batch_metrics.extracted_ref[idx_in_batch]),
-                    ))
+                idx_in_batch = random.randint(len(batch.detok_ref_query) - 1)
+                rindex = batch.detok_ref_query[idx_in_batch].rindex("Q:")
+                table_information.append(dict(
+                    call_idx         = str(self._call_idx),
+                    cleaned_gen      = str(output.response_text[idx_in_batch]),
+                    query_end        = str(batch.detok_ref_query[idx_in_batch][rindex:]),
+                    raw_gen          = str(output.raw_response_text[idx_in_batch]),
+                    ref              = str(batch.detok_ref_answer[idx_in_batch]),
+                    extracted_answer = str(local_batch_metrics.extracted_gen[idx_in_batch]),
+                    extracted_ref    = str(local_batch_metrics.extracted_ref[idx_in_batch]),
+                ))
 
                 rewards.extend(gathered_batch_rewards)
                 metrics.extend(gathered_batch_metrics)
@@ -278,11 +289,11 @@ class EvalLoop:
                 
                 wandb.log(
                     {
-                        f"inference_loop_fn/set_{self._split}/reward_mean": reward.mean().item(),
-                        f"inference_loop_fn/set_{self._split}/reward_std": reward.std().item(),
-                        f"inference_loop_fn/set_{self._split}/metric_mean": metric.mean().item(),
-                        f"inference_loop_fn/set_{self._split}/metric_std": metric.std().item(),
-                        f"set_{self._split}/table": self._wandb_table,
+                        f"set_{self._split.value}/reward_mean": reward.mean().item(),
+                        f"set_{self._split.value}/reward_std": reward.std().item(),
+                        f"set_{self._split.value}/metric_mean": metric.mean().item(),
+                        f"set_{self._split.value}/metric_std": metric.std().item(),
+                        f"set_{self._split.value}/table": self._wandb_table.get_loggable_object(),
                     }
                 )
 

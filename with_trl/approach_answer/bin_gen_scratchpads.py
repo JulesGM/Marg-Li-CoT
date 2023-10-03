@@ -68,7 +68,6 @@ if RANK == 0:
 # Defaut Hyperparameter Values, can be changed with CLI
 ###############################################################################
 DEFAULT_DO_DISTILLATION = False
-
 DEFAULT_JUST_DEVICE_MAP = True
 
 DEFAULT_MODEL_NAME = "stabilityai/StableBeluga2"; DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16; DEFAULT_BATCH_SIZE = 16

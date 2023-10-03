@@ -1,3 +1,4 @@
+import collections
 import itertools as it
 import os
 import pathlib
@@ -12,7 +13,7 @@ import more_itertools as mit
 import numpy as np
 import rich
 import rich.box
-import rich.table
+import rich.traceback
 import torch
 import torch.utils
 import torch.utils.data
@@ -20,15 +21,18 @@ import transformers
 
 SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 sys.path.append(str(SCRIPT_DIR.parent))
+rich.traceback.install()
 
 import lib_utils
 
 import approach_sft.lib_sft_constants as lib_sft_constants
+import libs_extraction
 
 datasets.disable_caching()
+RANK = int(os.environ.get("RANK", 0))
 
 
-def openai_commonsense_qa_output(root_path):
+def openai_commonsense_qa_output(root_path, filter_bads: bool):
 
     path = pathlib.Path(root_path)
     assert path.exists(), f"{path} does not exist"
@@ -49,26 +53,52 @@ def openai_commonsense_qa_output(root_path):
         with jsonl.open(path) as f:
             data[split] = list(f)
 
-    # Invert the data
-    for split, split_data in data.items():
-        keys = list(split_data[0].keys())
-        data[split] = {key: [d[key] for d in split_data] for key in keys}
+    extractor = libs_extraction.lib_multiple_choice.MultipleChoiceRfindExtractor(
+        choices=["(A)", "(B)", "(C)", "(D)", "(E)"])
+    
+    data_by_columns = collections.defaultdict(lambda: collections.defaultdict(list))
+    for split_name, split_data in data.items():
+        is_train = split_name == lib_sft_constants.CVSet.TRAIN
+        
+        for d in split_data:
+            answer_good = extractor(d["output"]) == d["ref_qa_answer"]
+            if filter_bads and is_train and not answer_good:
+                continue
 
-    # Make into dataset objects
-    output_data = {}
-    for split, split_data in data.items():
-        output_data[split] = lib_utils.DictDataset(split_data)
+            for k, v in d.items():
+                data_by_columns[split_name][k].append(v)
 
-    return output_data
+        # Make sure all the lists are the same length
+        len_first = len(next(iter(data_by_columns[split_name].values())))
+        assert all(len(x) == len_first for x in data_by_columns[split_name].values()), (
+            split_name, [len(x) for x in data_by_columns[split_name].values()])
+
+        final_qty = len_first
+        init_qty = len(split_data)
+        kept_ratio = final_qty / init_qty
+        assert kept_ratio > 0.7, f"{kept_ratio:.1%} is too low for {split_name}, this is probably a bug"
+
+        if RANK == 0:
+            if filter_bads:
+                rich.print(f"[bold blue]{split_name}:[/] Kept {final_qty} / {init_qty}, which is {kept_ratio:.1%}")
+            else:
+                rich.print(f"[bold blue]{split_name}:[/] Kept all {final_qty} / {init_qty} examples, since filter_bads=False")
+
+    dict_datasets = {}
+    for split, split_data in data_by_columns.items():
+        dict_datasets[split] = lib_utils.DictDataset(split_data)
+
+    return dict_datasets
 
 
 def main(
+    filter_bads=True,
 ):
     import approach_sft.lib_sft_collators as lib_sft_collators
     import lib_trl_utils
     import transformers
     
-    data_directory = "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/cond-on-answers"
+    data_directory = "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/not-cond-on-answers"
     model_name_or_path = "EleutherAI/pythia-410m"
     output_type = lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER
 
@@ -81,7 +111,9 @@ def main(
     prediction_tokenizer = tmp_tokenizers["prediction_tokenizer"]
     del tmp_tokenizers
 
-    datasets = openai_commonsense_qa_output(data_directory)
+    datasets = openai_commonsense_qa_output(
+        data_directory, filter_bads=filter_bads,
+    )
     data_collator = lib_sft_collators.CausalFullCollator(
         output_type=output_type,
         forward_tokenizer=forward_tokenizer,

@@ -22,6 +22,7 @@ import transformers
 import lib_base_classes
 import libs_data
 import libs_extraction
+import lib_utils
 
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
@@ -65,14 +66,21 @@ def data_item_collator(
     
 def prep_dataset_rl(
     *,
+    answer_only: bool,
+    answer_only_path: Union[str, Path],
+    any_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
+    dataset_name: str,
     input_max_length: int,
     question_prefix: str,
     question_suffix: str,
-    dataset_name: str,
-    any_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
     split: str,
     use_few_shots: int,
 ) -> libs_data.lib_base.Dataset:
+    split = lib_utils.CVSets(split)
+
+    if answer_only and not dataset_name == DatasetChoices.COMMONSENSEQA_MC:
+        raise NotImplementedError()
+
     if dataset_name == DatasetChoices.GSM8K:
         assert not use_few_shots, "n_few_shots must be 0 for GSM8K"
         assert isinstance(LOCAL_RANK, int), type(LOCAL_RANK)
@@ -91,6 +99,8 @@ def prep_dataset_rl(
 
     elif dataset_name == DatasetChoices.COMMONSENSEQA_MC:
         dataset = libs_data.lib_commonsense_qa.CommonSenseQAMC(
+            answer_only=answer_only,
+            answer_only_path=answer_only_path,
             any_tokenizer=any_tokenizer,
             split=split,
             question_prefix=question_prefix,

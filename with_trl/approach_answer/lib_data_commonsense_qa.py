@@ -6,19 +6,20 @@ from typing import Any, Optional, Union
 
 import datasets
 import more_itertools
-import torch
+import rich.traceback
 import transformers
 import tqdm
 
-import libs_data
-import libs_extraction
-
+rich.traceback.install()
 
 LOGGER = logging.getLogger(__name__)
 _SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 sys.path.append(str(_SCRIPT_DIR.parent))
-
 from approach_answer import data_few_shot_commonsense_qa_scratchpads
+from libs_data import data_commonsense_qa_few_shot
+import libs_data
+import libs_extraction
+
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", 0))
 datasets.disable_caching()
@@ -45,7 +46,7 @@ def _tok_detok(*, batch, any_tokenizer, ignore_keys=None):
     return output
 
 
-def _prep_hf_ds(*, sample, few_shots_text):
+def _prep_hf_ds(*, sample, few_shots_text, give_model_answer):
     # Build Choices
     choices_text = []
     for label, text in more_itertools.zip_equal(
@@ -53,14 +54,25 @@ def _prep_hf_ds(*, sample, few_shots_text):
         sample["choices"]["text"]
     ):
         choices_text.append(f"({label.strip()}) {text.strip()}")
+
     choices = "\n".join(choices_text)
     ref_answer = "(" + sample["answerKey"].strip() + ")"
-    few_shots_query = (
+
+    if give_model_answer:
+        few_shots_query = (
+            f"{few_shots_text}\n\n" +
+            f"Q: {sample['question']}\n" +
+            f"Answer Choices:\n" +
+            f"{choices}\n" +
+            f"A: {ref_answer}\nReasoning: "
+        )
+    else:
+        few_shots_query = (
         f"{few_shots_text}\n\n" +
         f"Q: {sample['question']}\n" +
         f"Answer Choices:\n" +
         f"{choices}\n" +
-        f"A: {ref_answer}\nReasoning: "
+        f"A:"
     )
 
     # Build the output sample
@@ -76,16 +88,23 @@ def _prep_hf_ds(*, sample, few_shots_text):
 
 
 class CommonSenseScratchpadGenMC(libs_data.lib_base.Dataset):
-    FEW_SHOTS_STR = data_few_shot_commonsense_qa_scratchpads.FEW_SHOT.strip()
-
     def __init__(
             self, 
             *, 
             any_tokenizer: Optional[transformers.PreTrainedTokenizerBase],
             split: str,
+            give_model_answers: bool,
             text_only: bool = False,
         ):
+        
+        if give_model_answers:
+            self._few_shots_str = (
+                data_few_shot_commonsense_qa_scratchpads.FEW_SHOT.strip()
+            )
+        else:
+            self._few_shots_str = data_commonsense_qa_few_shot.FEW_SHOT.strip()
 
+        self._give_model_answers = give_model_answers
         self._text_only = text_only
         self._split = split
 
@@ -103,8 +122,12 @@ class CommonSenseScratchpadGenMC(libs_data.lib_base.Dataset):
         if LOCAL_RANK == 0:
             print(f"Dataset loaded: {split}")
             
-        assert all(k.startswith("ref_qa") or k.startswith("ref_fs") for k in self._ds.features.keys()), [
-            k for k in self._ds.features.keys() if not (k.startswith("ref_qa") or k.startswith("ref_fs"))
+        assert all(
+            k.startswith("ref_qa") or k.startswith("ref_fs") 
+            for k in self._ds.features.keys()
+        ), [
+            k for k in self._ds.features.keys() 
+            if not (k.startswith("ref_qa") or k.startswith("ref_fs"))
         ]
 
 
@@ -113,7 +136,8 @@ class CommonSenseScratchpadGenMC(libs_data.lib_base.Dataset):
         tmp_ds = hf_ds.map(
             lambda sample: _prep_hf_ds(
                 sample=sample,
-                few_shots_text=self.FEW_SHOTS_STR,
+                few_shots_text=self._few_shots_str,
+                give_model_answer=self._give_model_answers,
             ),
             num_proc=1,
         ).remove_columns(
@@ -130,7 +154,9 @@ class CommonSenseScratchpadGenMC(libs_data.lib_base.Dataset):
             )
 
             self._ds = tmp_ds.remove_columns(
-                [key for key in tmp_ds.features if not (key.endswith("_tok") or key.endswith("_detok"))]
+                [key for key in tmp_ds.features 
+                 if not (key.endswith("_tok") or key.endswith("_detok"))
+                ]
             )
         else:
             self._ds = tmp_ds

@@ -70,11 +70,18 @@ class MultipleChoiceRfindExtractor(libs_extraction.lib_base.Extractor):
         return self._choices
 
     def parse_one(self, text):
+        """
+        For all answer options, find the last one that appears in the text.
+        Then return the answer option that appears last.
+        """
         indices = {}
 
+        # Find last instance of each.
+        # rfind returns -1 if not found.
         for choice in self._choices:
             indices[choice] = text.rfind(choice)
         
+        # The winning choice is the one with the highest index.
         key, index = max(indices.items(), key=lambda kv: kv[1])
 
         if index != -1:
@@ -98,6 +105,39 @@ class MultipleChoiceRfindExtractor(libs_extraction.lib_base.Extractor):
         return extracted_answer_a == extracted_answer_b
 
     __call__ = parse_one
+
+
+class MultipleChoiceSTARExtractor(libs_extraction.lib_base.Extractor):
+    def __init__(self, choices, eos_token_text):
+        self._eos_token_text = eos_token_text
+        self._choices = choices
+
+    def parse_one(self, text):
+        
+        if self._eos_token_text in text:
+            text = text.split(self._eos_token_text)[0]
+        
+        answer = f"({text[-3]})"
+        
+        return answer if answer in self._choices else None
+    
+    def parse(self, batch):
+        return [self.parse_one(x) for x in batch]
+
+    def compare(self, extracted_answer_a, extracted_answer_b):
+        if extracted_answer_a is None or extracted_answer_b is None:
+            return False
+
+        assert extracted_answer_a in self._choices, (
+            extracted_answer_a, self._choices)
+
+        assert extracted_answer_b in self._choices, (
+            extracted_answer_b, self._choices)
+        
+        return extracted_answer_a == extracted_answer_b
+
+    __call__ = parse_one
+
 
 if __name__ == "__main__":
     import ipdb; 

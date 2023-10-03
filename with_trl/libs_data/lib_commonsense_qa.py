@@ -10,6 +10,7 @@ from typing import Any, Optional, Union
 
 import datasets
 import fire
+import jsonlines as jsonl
 import more_itertools
 import rich
 import rich.logging
@@ -34,13 +35,16 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 LOGGER = logging.getLogger(__name__)
 
 
-def _tok_detok(*, batch, any_tokenizer):
+def _tok_detok(*, batch, any_tokenizer, batched):
     output = {}
     assert "question" in batch, batch.keys()
 
     for k, v in batch.items():
         tok = any_tokenizer(v)
-        detok = any_tokenizer.batch_decode(tok.input_ids, skip_special_tokens=False)
+        if batched:
+            detok = any_tokenizer.batch_decode(tok.input_ids, skip_special_tokens=False)
+        else:
+            detok = any_tokenizer.decode(tok.input_ids, skip_special_tokens=False)
         output[k + "_tok"] = tok.input_ids
         output[k + "_detok"] = detok
 
@@ -51,10 +55,12 @@ class CommonSenseQAMC(libs_data.lib_base.FewShotMixin, libs_data.lib_base.Datase
     def __init__(
             self, 
             *, 
-            any_tokenizer, 
-            split: str,
+            answer_only: bool,
+            answer_only_path: Union[pathlib.Path, str],
+            any_tokenizer: transformers.PreTrainedTokenizerBase, 
             question_prefix: str, 
             question_suffix: Optional[str],
+            split: lib_utils.CVSets,
             use_few_shots: bool,
         ):
         assert question_prefix is None, f"question_prefix: `{question_prefix}`"
@@ -67,7 +73,7 @@ class CommonSenseQAMC(libs_data.lib_base.FewShotMixin, libs_data.lib_base.Datase
             assert not question_suffix
             few_shot_data = libs_data.data_commonsense_qa_few_shot.FEW_SHOT
             question_prefix = few_shot_data.strip() + "\n\n"
-            question_suffix = " "
+            question_suffix = ""
 
         if question_prefix is None:
             question_prefix = ""
@@ -80,26 +86,50 @@ class CommonSenseQAMC(libs_data.lib_base.FewShotMixin, libs_data.lib_base.Datase
         self._extractor = libs_extraction.lib_multiple_choice.MultipleChoiceRfindExtractor(
             ["(A)", "(B)", "(C)", "(D)", "(E)"])
 
-        self._hf_ds = datasets.load_dataset(
-            "commonsense_qa", 
-            split="validation" if split == "eval" else split,
-        )
+        self._answer_only = answer_only
 
-        self._ds = self._hf_ds.map(
-            lambda sample:
-                self._prep_hf_ds(
-                    sample=sample,
-                    question_prefix=question_prefix, 
-                    question_suffix=question_suffix,
-                )
-        ).map(
-            lambda batch: 
-                _tok_detok(
-                    batch=batch, 
-                    any_tokenizer=any_tokenizer, 
-                ),
-            batched=True,
-        )
+        split = lib_utils.CVSets(split)
+
+        if answer_only:
+            self.answer_only_path = pathlib.Path(answer_only_path)
+            self.answer_only_path = self.answer_only_path.parent / (
+                self.answer_only_path.name + f".{split.value}.jsonl")
+
+            assert self.answer_only_path.exists(), (
+                self.answer_only_path)
+            
+            with jsonl.open(self.answer_only_path) as f:
+                self._ds = [
+                    _tok_detok(
+                        batch=self._prep_answer_only(sample),
+                        any_tokenizer=any_tokenizer,
+                        batched=False
+                    )
+                for sample in f
+            ]
+            
+        else:
+            self._hf_ds = datasets.load_dataset(
+                "commonsense_qa", 
+                split=split.value
+            )
+
+            self._ds = self._hf_ds.map(
+                lambda sample:
+                    self._prep_hf_ds(
+                        sample=sample,
+                        # question_prefix=question_prefix, 
+                        # question_suffix=question_suffix,
+                    )
+            ).map(
+                lambda batch: 
+                    _tok_detok(
+                        batch=batch, 
+                        any_tokenizer=any_tokenizer, 
+                        batched=True,
+                    ),
+                batched=True,
+            )
 
         self._output_container = lib_base_classes.DataListContainer()
         
@@ -113,9 +143,37 @@ class CommonSenseQAMC(libs_data.lib_base.FewShotMixin, libs_data.lib_base.Datase
             self._output_container.detok_ref_scratchpad.append(None)
             self._output_container.obj_ref_equations   .append(None)
 
-    
-    @classmethod
-    def _prep_hf_ds(cls, *, sample, question_prefix, question_suffix):
+    def _prep_answer_only(self, sample):
+        
+        assert self._question_suffix == " ", (
+            f"self._question_suffix: `{self._question_suffix}`",
+            type(self._question_suffix)
+        )
+
+        choices = sample["ref_qa_choices"]
+        question = sample["ref_qa_question"]
+        
+        scratchpad = sample["output"]
+        for answer_choice in ["(A)", "(B)", "(C)", "(D)", "(E)"]:
+            if answer_choice in scratchpad:
+                modified_scratchpad = scratchpad[:scratchpad.rfind(answer_choice)]
+                
+                scratchpad = modified_scratchpad
+
+        output_sample = {}
+        output_sample["question"] = (
+            f"{self._question_prefix}Q: {question}\n"
+            f"Answer Choices:\n"
+            f"{choices}\n"
+            f"A: {scratchpad}"
+        )
+
+        output_sample["answer"] = sample["ref_qa_answer"]
+
+        return output_sample
+
+    def _prep_hf_ds(self, sample):
+        
         choices_text = []
         for label, text in more_itertools.zip_equal(
             sample["choices"]["label"], 
@@ -127,7 +185,10 @@ class CommonSenseQAMC(libs_data.lib_base.FewShotMixin, libs_data.lib_base.Datase
 
         # This format matches the few-shot examples
         sample["question"] = (
-            f"{question_prefix}Q: {sample['question']}\nAnswer Choices:\n{choices}\nA:{question_suffix}"
+            f"{self._question_prefix}Q: {sample['question']}\n"
+            f"Answer Choices:\n"
+            f"{choices}\n"
+            f"A:{self._question_suffix}"
         )
         sample["answer"] = "(" + sample["answerKey"].strip() + ")"
 

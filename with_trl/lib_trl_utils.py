@@ -1,11 +1,14 @@
 import collections
 import contextlib
 import copy
+from dataclasses import dataclass
 import itertools
 import more_itertools as mit
 import os
+import pathlib
+import random
+import sys
 import typing
-from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Tuple, Union
 
 import accelerate
@@ -32,9 +35,14 @@ import trl_fork.models
 import wandb
 from beartype import beartype
 
+SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
+
+sys.path.append(str(SCRIPT_DIR.parent))
+
 import lib_base_classes
 import lib_data
 import lib_utils
+import lib_peft_utils
 
 RANK = int(os.environ.get("RANK", "0"))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
@@ -83,7 +91,6 @@ def generate(
         )
     else:
         assert task_name == lib_utils.Task.SENTIMENT, task_name
-
         assert (
             generation_kwargs["num_return_sequences"] == 1
         ), generation_kwargs["num_return_sequences"]
@@ -276,6 +283,17 @@ def keep_good_one_generation(
     )
 
 
+class RLTrainingLogger:
+    def __init__(self):       
+        self._table = lib_utils.WandbTableRepair(columns=[
+            "Epoch", "Model Input", "Model Output", "Reward",])
+
+    def log(self, *, epoch, model_input, model_output, reward):
+        idx = random.randint(0, len(model_input) - 1)
+        self._table.add_row(epoch, model_input[idx], model_output[idx], reward[idx],)
+        wandb.log({"TrainingSamples": self._table.get_loggable_object()})
+
+
 def print_table(
     *,
     generation_kwargs,
@@ -396,6 +414,7 @@ def load_then_peft_ize_model(
     *,
     precision: lib_utils.ValidPrecisions,
     peft_config_dict,
+    peft_do_all_lin_layers: bool,
     model_name: str,
     use_peft: bool,
     forward_tokenizer: transformers.PreTrainedTokenizer,
@@ -508,7 +527,12 @@ def load_then_peft_ize_model(
             pretrained_model = peft.prepare_model_for_kbit_training(
                 pretrained_model,
             )
-            
+        
+        if peft_do_all_lin_layers:
+            assert "target_modules" not in peft_config_dict, peft_config_dict
+            peft_config_dict["target_modules"] = lib_peft_utils.find_all_linear_names(
+                precision.value, pretrained_model)
+
         pretrained_model = peft.get_peft_model(
             pretrained_model,
             lora_config,
@@ -526,7 +550,7 @@ def load_tokenizers(model_name, config):
     if not config.is_encoder_decoder:
         for tokenizer in (forward_tokenizer, prediction_tokenizer):
             if tokenizer.pad_token is None:
-                tokenizer.add_special_tokens({"pad_token": "<pad>"})
+                tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
         
         prediction_tokenizer.padding_side = "left"
         forward_tokenizer.padding_side = "right"
@@ -611,11 +635,11 @@ class MultiAdapterWrapper(torch.nn.Module):
 def init_model(
     *,
     model_name: str,
-    use_peft: bool,
+    peft_do_all_lin_layers: bool,
     peft_config_dict: Optional[dict[str, typing.Any]],
-    peft_qlora_mode: bool,
-    trl_library_mode,
     precision=None,
+    trl_library_mode,
+    use_peft: bool,
 ) -> tuple[
     typing.Union[
         trl.models.AutoModelForCausalLMWithValueHead,
@@ -648,12 +672,12 @@ def init_model(
 
     if precision is None:
         precision = lib_utils.ValidPrecisions.float32
+
     precision = lib_utils.ValidPrecisions(precision)
     config = transformers.AutoConfig.from_pretrained(  # type: ignore
         model_name,
         trust_remote_code=True,
     )
-    trl_library = lib_utils.TRL_LIBRARIES[trl_library_mode]
 
     ###########################################################################
     # Tokenizer stuff
@@ -667,33 +691,18 @@ def init_model(
     # HF Raw Model Stuff
     ###########################################################################
 
-    if peft_qlora_mode:
-        assert False
-        assert precision in (
-            lib_utils.ValidPrecisions.bfloat16,
-            lib_utils.ValidPrecisions.float16,
-            lib_utils.ValidPrecisions.float32,
-        ), precision
 
-        pretrained_model = peft_qlora.from_pretrained(
-            model_name,
-            bf16=precision == lib_utils.ValidPrecisions.bfloat16,
-            fp16=precision == lib_utils.ValidPrecisions.float16,
-            trust_remote_code=True,
-            use_auth_token=True,
-        )
-        
-    else:
-        pretrained_model = load_then_peft_ize_model(
-            peft_config_dict=peft_config_dict,
-            model_name=model_name,
-            precision=precision,
-            use_peft=use_peft,
-            forward_tokenizer=forward_tokenizer,
-            prediction_tokenizer=prediction_tokenizer,
-            just_device_map=False,
-            adapter_name="policy" if lib_utils.TrlLibraryMode.TRL_FORK else "default",
-        )
+    pretrained_model = load_then_peft_ize_model(
+        adapter_name="policy" if lib_utils.TrlLibraryMode.TRL_FORK else "default",
+        forward_tokenizer      = forward_tokenizer,
+        just_device_map        = False,
+        model_name             = model_name,
+        peft_do_all_lin_layers = peft_do_all_lin_layers,
+        peft_config_dict       = peft_config_dict,
+        precision              = precision,
+        prediction_tokenizer   = prediction_tokenizer,
+        use_peft               = use_peft,
+    )
 
     ###########################################################################
     # TRL Model
@@ -720,7 +729,8 @@ def init_model(
             model.pretrained_model.gradient_checkpointing_enable)
 
     elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-        
+        import ipdb; ipdb.set_trace() # TODO JULESGM: FIX
+
         trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES += (MultiAdapterWrapper,)
         print(trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES)
 
@@ -799,6 +809,7 @@ def init_model(
     
     raise ValueError(f"{trl_library_mode = }")
 
+
 def batched_unroll(
     *,
     accelerated_model,
@@ -811,6 +822,7 @@ def batched_unroll(
     task_name,
     use_few_shots,
 ) -> lib_base_classes.BatchedUnrollReturn:
+    
     model: transformers.PreTrainedModel = typing.cast(  # type: ignore
         transformers.PreTrainedModel,  # type: ignore
         accelerator.unwrap_model(accelerated_model),

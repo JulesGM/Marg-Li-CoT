@@ -1,3 +1,4 @@
+print("Starting bin_value_pretrain.py")
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -11,19 +12,24 @@ if DETERMINISTIC:
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import contextlib
+import datetime
 import enum
 import itertools as it
+import json
 import pathlib
 import random
+import shutil
 import sys
 from typing import Any, Optional, Union
 
 import accelerate
 import datasets
 import fire
+import more_itertools as mit
 import numpy as np
 import peft
 import rich
+import rich.console
 import rich.markup
 import rich.status
 import rich.table
@@ -42,7 +48,7 @@ import logging
 import lib_trl_utils
 import lib_eval
 
-rich.traceback.install()
+
 datasets.disable_caching()
 RANK = int(os.getenv("RANK", 0))
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", 0))
@@ -68,31 +74,37 @@ torch.use_deterministic_algorithms(DETERMINISTIC)
 ###############################################################################
 # Will change depending on the model.
 ###############################################################################
-DEFAULT_MODEL_NAME = "gpt2"
-DEFAULT_BATCH_SIZE = 16
+DEFAULT_MODEL_NAME = "EleutherAI/gpt-j-6B"
+# DEFAULT_MODEL_NAME = "EleutherAI/pythia-70m-deduped"
+
+DEFAULT_BATCH_SIZE = 4
 DEFAULT_EVAL_BATCH_SIZE = DEFAULT_BATCH_SIZE
 DEFAULT_TRAIN_NUM_EPOCHS = 1
 
 DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
-DEFAULT_WANDB_DIR = lib_utils.get_tmp_dir() / "bin_value_pretrain.py"
+DEFAULT_WANDB_DIR = lib_utils.get_tmp_dir() / "bin_value_pretrain"
 DEFAULT_WANDB_ENTITY = "julesgm"
 DEFAULT_WANDB_PROJECT = "value-pretraining"
+
+DEFAULT_CKPT_ROOT = pathlib.Path(
+    os.getenv("SCRATCH", "/network/scratch/g/gagnonju")
+) / "MargLiCotCkpts" / "ValueFnPretraining"
 
 
 DEFAULT_LEARNING_RATE: float = 1.41e-5
 DEFAULT_GEN_KWARGS = dict(
-    min_new_tokens=5,
-    num_return_sequences=1,
-    early_stopping=True,
+    min_new_tokens       = 1,
+    num_return_sequences = 2,
+    early_stopping       = True,
+    do_sample            = True,
     
-    synced_gpus=True,
-    repetition_penalty=1,
-    temperature=1.,
-    top_k=0.0,
-    top_p=1.0,
-    use_cache=True,
-    max_new_tokens=200,
-    do_sample=True,
+    synced_gpus          = False,
+    repetition_penalty   = 1,
+    temperature          = 1.,
+    top_k                = 0.0,
+    top_p                = 1.0,
+    use_cache            = True,
+    max_new_tokens       = 100,
 )
 
 DEFAULT_PEFT_CONFIG_DICT = dict(
@@ -107,6 +119,7 @@ DEFAULT_PEFT_CONFIG_DICT = dict(
 ###############################################################################
 # Will Never change.
 ###############################################################################
+DEFAULT_DO_ALL_LIN_LAYERS = True
 DEFAULT_USE_FEW_SHOTS = True
 DEFAULT_PEFT_QLORA_MODE = False
 DEFAULT_CAUSAL_QUESTION_PREFIX = None
@@ -149,7 +162,13 @@ def prepare_model_inputs(
         input_data["decoder_attention_mask"] = decoder_inputs["attention_mask"]
 
     else:
+        assert (
+            isinstance(queries[0], torch.Tensor) and 
+            isinstance(responses[0], torch.Tensor)
+        ), (type(queries).mro(), type(responses).mro())
+
         input_ids = [torch.cat([q, r]) for q, r in zip(queries, responses)]
+        
         input_data = data_collator(
             [{"input_ids": ids, "attention_mask": torch.ones_like(ids)} 
              for ids in input_ids]
@@ -162,16 +181,18 @@ def prepare_model_inputs(
 
 def forward_pass(
     *,
-    accelerator: accelerate.Accelerator,
+    accelerator:       accelerate.Accelerator,
     data_collator,
-    model: trl.PreTrainedModelWrapper,
-    queries: torch.Tensor,
-    responses: torch.Tensor,
+    model:             trl.PreTrainedModelWrapper,
+    queries:           torch.Tensor,
+    responses:         torch.Tensor,
     forward_tokenizer: transformers.PreTrainedTokenizerBase,
 ):
 
     bs = len(queries)
-    is_encoder_decoder = accelerator.unwrap_model(model).pretrained_model.config.is_encoder_decoder
+    is_encoder_decoder = accelerator.unwrap_model(
+        model).pretrained_model.config.is_encoder_decoder
+    
     assert not is_encoder_decoder
 
     ############################################################################
@@ -249,7 +270,7 @@ def forward_pass(
         masks[j, :start] = 0
         masks[j, end:] = 0
 
-    return values[:, :-1], masks[:, :-1].to(accelerator.device)
+    return values[:, :-1], masks[:, :-1]
 
 
 def compute_rewards(
@@ -257,10 +278,17 @@ def compute_rewards(
     scores: torch.FloatTensor,
     masks: torch.LongTensor,
 ):
+    """
+    Applies the mask, then puts the reward on the last non zero element of the sequence.
+    """
+    
     rewards = []
+
+    assert masks.dtype == torch.long, masks.dtype
+
     for score, mask in zip(scores, masks):
         # reward is preference model score + KL penalty
-        reward = torch.zeros_like(masks)
+        reward = torch.zeros_like(mask, dtype=torch.bfloat16)
         last_non_masked_index = mask.nonzero()[-1]
         reward[last_non_masked_index] += score
         rewards.append(reward)
@@ -268,136 +296,252 @@ def compute_rewards(
     return torch.stack(rewards)
 
 
-def v_loss(
-    *, 
-    rewards: torch.Tensor,
-    values: torch.Tensor,
-    masks: torch.Tensor,
-    gamma: float,
-    lam: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
-    lastgaelam = 0
-    advantages_reversed = []
-    assert len(rewards.shape), 2
-    gen_len = rewards.shape[-1]
-
-    values = values * masks
-
-    rewards = compute_rewards(masks=masks, rewards=rewards)
-    rewards = rewards.to(masks.device) * masks
-
-    for t in reversed(range(gen_len)):
-        nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
-        delta = rewards[:, t] + gamma * nextvalues - values[:, t]
-        lastgaelam = delta + gamma * lam * lastgaelam
-        advantages_reversed.append(lastgaelam)
-    advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
-
-    returns = advantages + values
-    advantages = trl.trainer.ppo_trainer.masked_whiten(advantages, masks)
-    advantages = advantages.detach()
-
-    vf_losses1 = (values - returns) ** 2
-    vf_loss = 0.5 * trl.trainer.ppo_trainer.masked_mean(vf_losses1, masks)
-
-    return vf_loss, advantages.detach(), returns.detach()
-
-
-def step(
-    *,
-    accelerator: accelerate.Accelerator,
-    answer_extractor,
-    batch,
-    batch_idx: int,
-    batch_size: int,
-    cv_set: CVSets,
-    dataset_name: str,
-    forward_data_collator, 
-    epoch: int,
-    generation_kwargs: dict[str, Any],
-    metric_accuracy,
-    model: trl.AutoModelForCausalLMWithValueHead,
-    optimizer: torch.optim.Optimizer,
-    post_process_gen_fewshots_fn,
-    prediction_tokenizer: transformers.PreTrainedTokenizerBase,
-    forward_tokenizer: transformers.PreTrainedTokenizerBase,
-    reward_fn,
-    task_name: str,
-    use_few_shots: bool,
-):
-    with (
-        accelerator.accumulate(model) 
-        if cv_set == CVSets.TRAIN 
-        else contextlib.nullcontext()
+class ValueModelPretrainer:
+    def __init__(
+        self,
+        *,
+        accelerator: accelerate.Accelerator,
+        answer_extractor,
+        console,
+        dataset_name: str,
+        forward_tokenizer: transformers.PreTrainedTokenizerBase,
+        gamma: float,
+        lam: float,
+        metrics,
+        model: trl.AutoModelForCausalLMWithValueHead,
+        optimizer: torch.optim.Optimizer,
+        post_process_gen_fewshots_fn,
+        prediction_tokenizer: transformers.PreTrainedTokenizerBase,
+        reward_fn,
+        task_name: str,
+        use_few_shots: bool,
     ):
+        self._accelerator                  = accelerator
+        self._answer_extractor             = answer_extractor
+        self._console                      = console
+        self._dataset_name                 = dataset_name
+        self._forward_tokenizer            = forward_tokenizer
+        self._gamma                        = gamma
+        self._lam                          = lam
+        self._metrics                      = metrics
+        self._model                        = model
+        self._optimizer                    = optimizer
+        self._post_process_gen_fewshots_fn = post_process_gen_fewshots_fn
+        self._prediction_tokenizer         = prediction_tokenizer
+        self._reward_fn                    = reward_fn
+        self._task_name                    = task_name
+        self._use_few_shots                = use_few_shots
+        self._wandb_table                  = {}
+
+
+    @property
+    def model(self):
+        return self._model
+
+    @property
+    def accelerator(self):
+        return self._accelerator
+
+
+    def _v_loss(
+        self, 
+        *, 
+        masks: torch.Tensor,
+        scores: torch.Tensor,
+        values: torch.Tensor,
         
-        import ipdb; ipdb.set_trace()
-        
-        outputs = lib_trl_utils.generate(
-            accelerator=accelerator, 
-            answer_extractor=answer_extractor,
-            batch=batch, 
-            batch_size=batch_size,
-            dataset_name=dataset_name,
-            generation_kwargs=generation_kwargs, 
-            policy_model=model,
-            post_process_gen_fewshots_fn=post_process_gen_fewshots_fn,
-            prediction_tokenizer=prediction_tokenizer,
-            task_name=task_name,
-            use_few_shots=use_few_shots,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        lastgaelam = 0
+        advantages_reversed = []
+        assert len(scores.shape), 2
+
+        values = values * masks
+
+        rewards = compute_rewards(masks=masks, scores=scores)
+        rewards = rewards.to(masks.device) * masks
+        gen_len = rewards.shape[-1]
+
+        for t in reversed(range(gen_len)):
+            nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
+            delta      = rewards[:, t] + self._gamma * nextvalues - values[:, t]
+            lastgaelam = delta + self._gamma * self._lam * lastgaelam
+            advantages_reversed.append(lastgaelam)
+        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
+
+        returns = advantages + values
+        advantages = trl.trainer.ppo_trainer.masked_whiten(advantages, masks)
+        advantages = advantages.detach()
+
+        vf_losses = (values - returns) ** 2
+        vf_loss = 0.5 * trl.trainer.ppo_trainer.masked_mean(vf_losses, masks)
+
+        return (
+            vf_loss, 
+            advantages.detach().cpu(),
+            returns   .detach().cpu(),
+            rewards   .detach().cpu(),
+            vf_losses .detach().cpu(),
         )
 
+    def _show_table(self, *, tokens, values, advantages, returns, rewards, losses, masks, cv_set, global_step):
+        
+        title = f"({cv_set.value}) Value Table:"
+        
+        rich_table = rich.table.Table(
+            title         = title, 
+            show_header   = False,
+            show_lines    = True,
+            title_justify = "left",
+        )
+        
+        max_len = 100
+        wandb_padding_amount = max_len - len(values) - 1    
+        old_wandb_table = self._wandb_table.get(cv_set, None)
+    
+
+        if old_wandb_table is not None:
+            self._wandb_table[cv_set] = wandb.Table(columns=[str(i) for i in range(max_len)], data=old_wandb_table.data)
+        else:
+            self._wandb_table[cv_set] = wandb.Table(columns=[str(i) for i in range(max_len)],)
+
+        assert len(tokens) == len(values    ), (len(tokens), len(values    ))
+        assert len(tokens) == len(advantages), (len(tokens), len(advantages))
+        assert len(tokens) == len(returns   ), (len(tokens), len(returns   ))
+        assert len(tokens) == len(rewards   ), (len(tokens), len(rewards   ))
+        assert len(tokens) == len(losses    ), (len(tokens), len (losses    ))
+        
+        rows = {}
+        rows["tokens"] = [
+            rich.markup.escape(self._forward_tokenizer.decode(x)) 
+            for x in tokens
+        ]
+        rows["values"    ] = [f"{x:0.2}" for x in values]
+        rows["advantages"] = [f"{x:0.2}" for x in advantages]
+        rows["returns"   ] = [f"{x:0.2}" for x in returns]
+        rows["rewards"   ] = [f"{x:0.2}" for x in rewards]
+        rows["losses"    ] = [f"{x:0.2}" for x in losses]
+
+        for row_name, data in rows.items():
+            rich_table.add_row(f"[bold blue]{row_name}", *data)
+            self._wandb_table[cv_set].add_data(row_name, *data, *["" for _ in range(wandb_padding_amount)])
+        
+        # A separator of sorts
+        self._wandb_table[cv_set].add_data(*["###" for _ in range(max_len)])
+        self._console.print(rich_table)
+        wandb.log({f"{cv_set.value}/table": self._wandb_table[cv_set]}, step=global_step)
+
+    def step(
+        self,
+        *,
+        batch,
+        batch_idx: int,
+        cv_set: CVSets,
+        do_log: bool,
+        epoch: int,
+        forward_data_collator,
+        policy_outputs,
+        global_step: int,
+    ):
+
         if cv_set == CVSets.TRAIN:
-            optimizer.zero_grad()
+            self._model.train()
+        else:
+            self._model.eval()
 
         with (
-            contextlib.nullcontext() 
+            self._accelerator.accumulate(self._model) 
             if cv_set == CVSets.TRAIN 
             else torch.no_grad()
         ):
+
+            if cv_set == CVSets.TRAIN:
+                self._optimizer.zero_grad()
+            
+
+            responses = [
+                torch.tensor(x, device="cpu")
+                if not isinstance(x, torch.Tensor) else x.cpu()
+                for x in policy_outputs.response_tensors
+            ]
+            queries = [
+                torch.tensor(x, device="cpu")
+                if not isinstance(x, torch.Tensor) else x.cpu()
+                for x in batch.tok_ref_query
+            ]
+
             values, masks = forward_pass(
-                data_collator=forward_data_collator,
-                forward_tokenizer=forward_tokenizer,
-                accelerator=accelerator,
-                model=model,
-                queries=batch.tok_ref_query,
-                responses=batch.tok_ref_answer,
+                accelerator       = self._accelerator,
+                data_collator     = forward_data_collator,
+                forward_tokenizer = self._forward_tokenizer,
+                model             = self._model,
+                queries           = queries,
+                responses         = responses,
             )
 
-        reward_output = reward_fn(
-            batch=batch,
-            responses=outputs.response_text,
-        )
+            reward_output = self._reward_fn(
+                batch=batch,
+                responses=policy_outputs.response_text,
+            )
 
-        metric_output = metric_accuracy(
-            batch=batch,
-            responses=outputs.response_text,
-        )
+            # Compute metrics
+            metrics_outputs = {}
+            for metric_name, metric in self._metrics.items():
+                local = metric(
+                    batch     = batch,
+                    responses = policy_outputs.response_text,
+                )
+                metrics_outputs[metric_name] = self._accelerator.gather_for_metrics(
+                    torch.tensor(local.values, device=self._accelerator.device)).mean()
 
-        loss, advantages, returns = v_loss(
-            rewards=torch.stack(reward_output.values).to(accelerator.device),
-            values=values,
-            gamma=1,
-            lam=0.95,
-            masks=masks,
-        )
 
-        if RANK == 0:
-            wandb.log({
-                f"{cv_set}/loss": loss, 
-                # f"{cv_set}/advantages": advantages, 
-                # f"{cv_set}/returns": returns,
-                # f"{cv_set}/values": values,
-            })
+            loss, advantages, returns, rewards, vf_losses = self._v_loss(
+                scores = torch.stack(reward_output.values).to(self._accelerator.device),
+                values = values,
+                masks  = masks,
+            )
 
-        ###########################################################################
-        # Print Rewards
-        ###########################################################################
+            if RANK == 0 and global_step % 10 == 0:
+                rand_idx = random.randint(0, len(advantages) - 1)
+                b_masks  = masks[rand_idx].bool().cpu()
+                
+                self._show_table(
+                    advantages  = advantages[rand_idx].detach().masked_select(b_masks),
+                    cv_set      = cv_set,
+                    global_step = global_step,
+                    losses      = vf_losses [rand_idx].detach().masked_select(b_masks),
+                    masks       = masks.cpu(),
+                    returns     = returns   [rand_idx].detach().masked_select(b_masks),
+                    rewards     = rewards   [rand_idx].detach().masked_select(b_masks),
+                    tokens      = responses [rand_idx],
+                    values      = values    [rand_idx].detach().cpu().masked_select(b_masks),
+                )
 
-        if cv_set == CVSets.TRAIN:
-            accelerator.backward(loss)
-            optimizer.step()
+            if RANK == 0 and do_log:
+
+                wandb.log({
+                    f"{cv_set.value}/value_loss": loss, 
+                }, step=global_step)
+
+                for k, v in metrics_outputs.items():
+                    wandb.log({f"{cv_set.value}/{k}": v}, step=global_step)
+
+            ###########################################################################
+            # Print Rewards
+            ###########################################################################
+
+            if cv_set == CVSets.TRAIN:
+                self._accelerator.backward(loss)
+                self._optimizer.step()
+
+            device = self._accelerator.device
+            return (
+                self._accelerator.gather(loss      .detach().to(device).contiguous()).cpu(),
+                self._accelerator.gather(advantages.detach().to(device).contiguous()).cpu(),
+                self._accelerator.gather(returns   .detach().to(device).contiguous()).cpu(), 
+                metrics_outputs,
+            )
+
 
 
 def main(
@@ -405,43 +549,61 @@ def main(
     batch_size                     : int   = DEFAULT_BATCH_SIZE,
     causal_question_prefix         : str   = DEFAULT_CAUSAL_QUESTION_PREFIX,
     causal_question_suffix         : str   = DEFAULT_CAUSAL_QUESTION_SUFFIX,
+    ckpt_root                      : str   = DEFAULT_CKPT_ROOT,
     dataset_name                   : lib_data.DatasetChoices   = lib_data.DatasetChoices.COMMONSENSEQA_MC,
     eval_batch_size                : int   = DEFAULT_EVAL_BATCH_SIZE,
     generation_kwargs              : dict  = DEFAULT_GEN_KWARGS,
     gradient_accumulation_steps    : int   = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
-    model_name                     : str   = DEFAULT_MODEL_NAME,
     input_max_length               : int   = DEFAULT_INPUT_MAX_LENGTH,
+    model_name                     : str   = DEFAULT_MODEL_NAME,
     learning_rate                  : float = DEFAULT_LEARNING_RATE,
     num_samples_eval               : int   = DEFAULT_NUM_SAMPLES_EVAL,
     num_train_batches_between_eval : int   = DEFAULT_NUM_TRAIN_BATCHES_BETWEEN_EVAL,
     peft_config_dict               : dict  = DEFAULT_PEFT_CONFIG_DICT,
-    peft_qlora_mode                : bool  = DEFAULT_PEFT_QLORA_MODE,
+    peft_do_all_lin_layers         : dict  = DEFAULT_DO_ALL_LIN_LAYERS,
     precision                      : lib_utils.ValidPrecisions = DEFAULT_PRECISION,
-    reward_type                    : lib_utils.RewardChoices = DEFAULT_REWARD_TYPE,
+    reward_type                    : lib_utils.RewardChoices   = DEFAULT_REWARD_TYPE,
+    stop_at_line_return            : bool  = True,
     task_name                      : str   = DEFAULT_TASK_NAME,
     train_num_epochs               : int   = DEFAULT_TRAIN_NUM_EPOCHS,
-    trl_library_mode               : lib_utils.TrlLibraryMode = DEFAULT_TRL_LIBRARY_MODE,
+    trl_library_mode               : lib_utils.TrlLibraryMode  = DEFAULT_TRL_LIBRARY_MODE,
     use_few_shots                  : bool  = DEFAULT_USE_FEW_SHOTS,
     use_peft                       : bool  = DEFAULT_USE_PEFT,
     wandb_dir                      : str   = DEFAULT_WANDB_DIR,
     wandb_entity                   : str   = DEFAULT_WANDB_ENTITY,
     wandb_project                  : str   = DEFAULT_WANDB_PROJECT,
 ):
+    
     precision = lib_utils.ValidPrecisions(precision)  # type: ignore
     args = locals().copy()
     
+    rich_console = rich.console.Console(force_terminal=True, width=240)
+    rich.traceback.install(console=rich_console)
+
+    ckpt_root = pathlib.Path(ckpt_root)
+    assert ckpt_root and ckpt_root.exists() and ckpt_root.is_dir(), (
+        ckpt_root, ckpt_root.exists(), ckpt_root.is_dir())
+
     # Display command line args
     if RANK == 0:
-        table = rich.table.Table("Key", "Value", title="Command Line Arguments", show_lines=True)
+        table = rich.table.Table(
+            "Key", "Value", 
+            title="Command Line Arguments", 
+            show_lines=True,
+        )
         for key, value in sorted(args.items(), key=lambda x: x[0]):
-            table.add_row("[bold]" + rich.markup.escape(str(key)), rich.markup.escape(str(value)))
+            table.add_row(
+                "[bold]" + 
+                rich.markup.escape(str(key)), 
+                rich.markup.escape(str(value))
+            )
         rich.print(table)
     
     # Check some command line args
     task_name = lib_utils.Task(task_name)
     dataset_name = lib_data.DatasetChoices(dataset_name)
     trl_library_mode = lib_utils.TrlLibraryMode(trl_library_mode)
-    trl_library = lib_utils.TRL_LIBRARIES[trl_library_mode]
+    # trl_library = lib_utils.TRL_LIBRARIES[trl_library_mode]
 
     # Setup logging
     logging.basicConfig(
@@ -456,7 +618,7 @@ def main(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[
             accelerate.utils.DistributedDataParallelKwargs(
-                find_unused_parameters=False,
+                find_unused_parameters=True,
             )
         ]
     )
@@ -483,29 +645,27 @@ def main(
             causal_question_suffix,
         )
 
-    if not peft_qlora_mode:
-        assert peft_config_dict is not None
-        assert "task_type" not in peft_config_dict
+    assert peft_config_dict is not None
+    assert "task_type" not in peft_config_dict
 
-        if not hf_config.is_encoder_decoder:
-            peft_config_dict["task_type"] = peft.TaskType.CAUSAL_LM
-        elif hf_config.is_encoder_decoder:
-            peft_config_dict["task_type"] = peft.TaskType.SEQ_2_SEQ_LM
-        else:
-            raise ValueError(f"Unknown model type: {model_name}")
+    if not hf_config.is_encoder_decoder:
+        peft_config_dict["task_type"] = peft.TaskType.CAUSAL_LM
+    elif hf_config.is_encoder_decoder:
+        peft_config_dict["task_type"] = peft.TaskType.SEQ_2_SEQ_LM
+    else:
+        raise ValueError(f"Unknown model type: {model_name}")
 
+    if not peft_do_all_lin_layers: 
         assert "target_modules" not in peft_config_dict, peft_config_dict
+
         peft_config_dict[
             "target_modules"
         ] = peft.utils.other.TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[
             hf_config.model_type
         ]
-    else:
-        peft_config_dict = None
 
     if task_name == lib_utils.Task.MAIN:
         reward_type = lib_utils.RewardChoices(reward_type)
-
 
     if RANK == 0:
         wandb.init(
@@ -535,12 +695,12 @@ def main(
         disable=RANK != 0,
     ):
         output = lib_trl_utils.init_model(
-            peft_config_dict=peft_config_dict,
-            peft_qlora_mode=peft_qlora_mode,
-            model_name=model_name,
-            precision=precision,
-            use_peft=use_peft,
-            trl_library_mode=trl_library_mode,
+            model_name       = model_name,
+            peft_config_dict = peft_config_dict,
+            precision        = precision,
+            trl_library_mode = trl_library_mode,
+            use_peft         = use_peft,
+            peft_do_all_lin_layers = peft_do_all_lin_layers,
         )
 
         # Deal with fork vs non-fork
@@ -558,57 +718,70 @@ def main(
         pad_token_id = forward_tokenizer.pad_token_id
         assert pad_token_id == prediction_tokenizer.pad_token_id
 
+        if stop_at_line_return:
+            assert (
+                "eos_token_id" not in generation_kwargs
+            ), generation_kwargs["eos_token_id"]
+
+            generation_kwargs["eos_token_id"] = (
+                lib_utils.line_return_token(forward_tokenizer)
+            )
+
     ###########################################################################
     # Load Datasets
     ###########################################################################
     dataset = lib_data.prep_dataset_rl(
-        input_max_length=input_max_length,
-        question_prefix=causal_question_prefix,
-        question_suffix=causal_question_suffix,
-        any_tokenizer=forward_tokenizer,
-        use_few_shots=use_few_shots,
-        dataset_name=dataset_name,
-        split="train",
+        answer_only      = False,
+        answer_only_path = None,
+        input_max_length = input_max_length,
+        question_prefix  = causal_question_prefix,
+        question_suffix  = causal_question_suffix,
+        any_tokenizer    = forward_tokenizer,
+        use_few_shots    = use_few_shots,
+        dataset_name     = dataset_name,
+        split            = lib_utils.CVSets.TRAIN,
     )
 
     eval_dataset = lib_data.prep_dataset_rl(
-        input_max_length=input_max_length,
-        question_prefix=causal_question_prefix,
-        question_suffix=causal_question_suffix,
-        any_tokenizer=forward_tokenizer,
-        use_few_shots=use_few_shots,
-        dataset_name=dataset_name,
-        split="eval",
+        answer_only      = False,
+        answer_only_path = None,
+        input_max_length = input_max_length,
+        question_prefix  = causal_question_prefix,
+        question_suffix  = causal_question_suffix,
+        any_tokenizer    = forward_tokenizer,
+        use_few_shots    = use_few_shots,
+        dataset_name     = dataset_name,
+        split            = lib_utils.CVSets.VALID,
     )
     
     dataloader = torch.utils.data.DataLoader(
         dataset, 
-        collate_fn=lib_data.data_item_collator, 
-        batch_size=batch_size,
-        shuffle=True,
+        collate_fn = lib_data.data_item_collator, 
+        batch_size = batch_size,
+        shuffle    = True,
     )
 
     eval_dataloader_small = torch.utils.data.DataLoader(
         torch.utils.data.Subset(eval_dataset, range(num_samples_eval)), 
-        collate_fn=lib_data.data_item_collator, 
-        batch_size=eval_batch_size,
-        shuffle=False,
+        collate_fn = lib_data.data_item_collator, 
+        batch_size = eval_batch_size,
+        shuffle    = False,
     )
     
     eval_dataloader_all = torch.utils.data.DataLoader(
         eval_dataset, 
-        collate_fn=lib_data.data_item_collator, 
-        batch_size=eval_batch_size,
-        shuffle=False,
+        collate_fn = lib_data.data_item_collator, 
+        batch_size = eval_batch_size,
+        shuffle    = False,
     )
 
-    metric_accuracy, reward_fn = lib_eval.make_metric_and_reward_fn(
-        accelerator_device=accelerator.device,
-        accelerator_num_processes=accelerator.num_processes,
-        reward_type=reward_type,
-        task_name=task_name,
-        extractor=dataset.get_extractor(),
-        use_peft=use_peft,
+    metrics, reward_fn = lib_eval.make_metric_and_reward_fn(
+        accelerator_device        = accelerator.device,
+        accelerator_num_processes = accelerator.num_processes,
+        reward_type               = reward_type,
+        task_name                 = task_name,
+        extractor                 = dataset.get_extractor(),
+        use_peft                  = use_peft,
     )
 
     ###########################################################################
@@ -617,8 +790,13 @@ def main(
     if not hf_config.is_encoder_decoder:
         if peft_config_dict:
             assert peft_config_dict["task_type"] == peft.TaskType.CAUSAL_LM
-        
-    optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
+    
+    optimizer = torch.optim.Adam(params=[
+            x for x in accelerator.unwrap_model(model).v_head.parameters() 
+            if x.requires_grad
+        ],
+        lr=learning_rate,
+    )
 
     ###########################################################################
     # TRAINING LOOP
@@ -629,31 +807,34 @@ def main(
         model, optimizer, dataloader, eval_dataloader_small, eval_dataloader_all,
     )
 
-    fixed_step_kwargs = dict(
-        accelerator=accelerator,
-        answer_extractor=dataset.get_extractor(),
-        batch_size=batch_size,
-        dataset_name=dataset_name,
-        forward_data_collator=transformers.DataCollatorForLanguageModeling(
-            forward_tokenizer, mlm=False),
-        forward_tokenizer=forward_tokenizer,
-        generation_kwargs=generation_kwargs,
-        metric_accuracy=metric_accuracy,
-        model=model,
-        optimizer=optimizer,
-        post_process_gen_fewshots_fn=dataset.post_process_gen_fewshots,
-        prediction_tokenizer=prediction_tokenizer,
-        reward_fn=reward_fn,
-        task_name=task_name,
-        use_few_shots=use_few_shots,
+    collator = transformers.DataCollatorForLanguageModeling(
+        forward_tokenizer, mlm=False)
+
+    value_trainer = ValueModelPretrainer(
+        accelerator                  = accelerator,
+        answer_extractor             = dataset.get_extractor(),
+        console                      = rich_console,
+        dataset_name                 = dataset_name,
+        forward_tokenizer            = forward_tokenizer,
+        gamma                        = 1.,
+        lam                          = .95,
+        metrics                      = metrics,
+        model                        = model,
+        optimizer                    = optimizer,
+        post_process_gen_fewshots_fn = dataset.post_process_gen_fewshots,
+        prediction_tokenizer         = prediction_tokenizer,
+        reward_fn                    = reward_fn,
+        task_name                    = task_name,
+        use_few_shots                = use_few_shots,
     )
 
+    global_step = 0
     for epoch in range(train_num_epochs):
         while True:
             train_data_loader = enumerate(lib_utils.progress(
+                dataloader,
                 description=f"Epoch {epoch}",
                 disable=RANK!=0,
-                seq=dataloader,
             ))
             
             # If we can't do a single batch, then we are done with the epoch
@@ -663,14 +844,37 @@ def main(
                 train_data_loader,
                 num_train_batches_between_eval,
             ):
+                global_step += len(batch.detok_ref_scratchpad) * WORLD_SIZE
                 at_least_one = True
-                step(
-                    cv_set=CVSets.TRAIN,
-                    batch=batch,
-                    batch_idx=train_batch_idx,
-                    epoch=epoch,
-                    **fixed_step_kwargs,
-                )
+
+                with value_trainer.accelerator.unwrap_model(
+                    value_trainer.model
+                ).pretrained_model.disable_adapter():
+
+                    outputs = lib_trl_utils.generate(
+                        accelerator                  = value_trainer.accelerator, 
+                        answer_extractor             = dataset.get_extractor(),
+                        batch                        = batch, 
+                        batch_size                   = batch_size,
+                        dataset_name                 = dataset_name,
+                        generation_kwargs            = generation_kwargs, 
+                        policy_model                 = value_trainer.model, 
+                        post_process_gen_fewshots_fn = dataset.post_process_gen_fewshots,
+                        prediction_tokenizer         = prediction_tokenizer,
+                        task_name                    = task_name,
+                        use_few_shots                = use_few_shots,
+                    )
+
+                    value_trainer.step(
+                        batch                 = batch,
+                        batch_idx             = train_batch_idx,
+                        cv_set                = CVSets.TRAIN,
+                        epoch                 = epoch,
+                        forward_data_collator = collator, 
+                        do_log                = True,
+                        policy_outputs        = outputs,
+                        global_step           = global_step,
+                    )
 
             if not at_least_one:
                 break
@@ -681,12 +885,15 @@ def main(
                 seq=eval_dataloader_small,
             )):
                 with torch.no_grad():
-                    step(
-                        cv_set=CVSets.EVAL,
-                        batch=batch,
-                        batch_idx=eval_batch_idx,
-                        epoch=epoch,
-                        **fixed_step_kwargs,
+                    value_trainer.step(
+                        batch                 = batch,
+                        batch_idx             = eval_batch_idx,
+                        cv_set                = CVSets.EVAL,
+                        epoch                 = epoch,
+                        forward_data_collator = collator,
+                        do_log                = True,
+                        policy_outputs        = outputs,
+                        global_step           = global_step,
                     )
 
 

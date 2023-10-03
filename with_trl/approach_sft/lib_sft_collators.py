@@ -51,7 +51,7 @@ class CausalFullCollator:
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
         prediction_tokenizer: transformers.PreTrainedTokenizerBase,
     ):
-
+        assert False
         self._forward_tokenizer = forward_tokenizer
         self._prediction_tokenizer = prediction_tokenizer
         self._output_type = output_type
@@ -71,11 +71,13 @@ class CausalFullCollator:
         - Chain of thought then answer
         - Answer only
         """
+        import ipdb; ipdb.set_trace()
 
         if self.output_type == lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER:
-            questions = [f["ref_qa_question"].strip() for f in features]
-            answers = [f["ref_qa_answer"].strip() for f in features]
-            choices = [f["ref_qa_choices"].strip() for f in features]
+            questions   = [f["ref_qa_question"].strip() for f in features]
+            answers     = [f["ref_qa_answer"].strip() for f in features]
+            choices     = [f["ref_qa_choices"].strip() for f in features]
+
             generations = [f["output"].strip() for f in features]
 
             full_query_text = [
@@ -100,21 +102,22 @@ class CausalFullCollator:
 
         elif self.output_type == lib_sft_constants.OutputTypes.ANSWER_ONLY:
             questions = [f["ref_qa_question"].strip() for f in features]
-            answers = [f["ref_qa_answer"].strip() for f in features]
+            choices   = [f["ref_qa_choices"].strip() for f in features]
+            answers   = [f["ref_qa_answer"].strip() for f in features]
 
             forward_input_text = [
                 f"Q: {question}\n" +
                 f"Answer Choices:\n" +
-                f"{choices}\n" +
+                f"{choice}\n" +
                 f"A: {answer}"
-                for question, answer 
-                in mit.zip_equal(questions, answers)
+                for question, choice, answer 
+                in mit.zip_equal(questions, choices, answers)
             ]
             predict_input_text = [
                 f"Q: {question}\n" +
-                f"Answer Choices:\n{choices}\n" +
+                f"Answer Choices:\n{choice}\n" +
                 f"A: "
-                for question in questions
+                for question, choice in mit.zip_equal(questions, choices)
             ]
             
         else:
@@ -141,5 +144,122 @@ class CausalFullCollator:
             forward=self._forward_tokenizer.pad(dict(input_ids=forward_input_ids), return_tensors="pt"),
             predict=predict_input_ids,
             extra_info={key: [f[key] for f in features] for key in keys},
+        )
+
+
+class CausalMaskedCollator:
+    def __init__(
+        self, 
+        *, 
+        output_type, 
+        forward_tokenizer: transformers.PreTrainedTokenizerBase,
+        prediction_tokenizer: transformers.PreTrainedTokenizerBase,
+        has_choices,
+    ):
+        
+        self._forward_tokenizer = forward_tokenizer
+        self._prediction_tokenizer = prediction_tokenizer
+        self._output_type = output_type
+        self._has_choices = has_choices
+
+        assert self._prediction_tokenizer.padding_side == "left", (
+            self._prediction_tokenizer.padding_side)
+        assert self._forward_tokenizer.padding_side == "right", (
+            self._forward_tokenizer.padding_side)
+
+    @property
+    def output_type(self):
+        return self._output_type
+
+    def __call__(self, features: list[lib_base_classes.DataItemContainer]):
+        """
+        Two main modes:
+        - Chain of thought then answer
+        - Answer only
+        """
+
+        questions   = [f["ref_qa_question"].strip() for f in features]
+        answers     = [f["ref_qa_answer"  ].strip() for f in features]
+        scratchpads = [f["ref_qa_scratchpad"].strip() for f in features]
+        if self._has_choices:
+            choices     = [f["ref_qa_choices" ].strip() for f in features]
+
+        if self._has_choices:
+            full_query_text = [
+                f"Q: {question}\n" +
+                f"Answer Choices:\n" +
+                f"{choice}\n" + 
+                f"A: "
+                for question, choice 
+                in mit.zip_equal(questions, choices)
+            ]
+            del questions
+            del choices
+        else:
+            full_query_text = questions
+            del questions
+
+        full_query_tok = self._prediction_tokenizer(full_query_text).input_ids
+        predict_input_tok = full_query_tok
+
+        if self.output_type == lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER:
+            scratchpads_tok = self._prediction_tokenizer(scratchpads).input_ids
+            forward_input_tok = [
+                q               + g + [self._forward_tokenizer.eos_token_id]
+                for q, g in 
+                mit.zip_equal(full_query_tok, scratchpads_tok)
+            ]
+            masked_forward = [
+                len(q) * [-100] + g + [self._forward_tokenizer.eos_token_id]
+                for q, g in 
+                mit.zip_equal(full_query_tok, scratchpads_tok)
+            ]
+            del scratchpads_tok
+            del scratchpads
+
+        elif self.output_type == lib_sft_constants.OutputTypes.ANSWER_ONLY:
+            answers_tok = self._prediction_tokenizer(answers).input_ids
+            forward_input_tok = [
+                q               + a + [self._forward_tokenizer.eos_token_id]
+                for q, a in 
+                mit.zip_equal(full_query_tok, answers_tok)
+            ]
+            masked_forward = [
+                len(q) * [-100] + a + [self._forward_tokenizer.eos_token_id]
+                for q, a in 
+                mit.zip_equal(full_query_tok, answers_tok)
+            ]
+            del answers_tok
+            del answers
+
+        else:
+            raise NotImplementedError(self.output_type)
+
+        forward_input_tok = self._forward_tokenizer.pad(
+            dict(input_ids=forward_input_tok), 
+            return_tensors="pt",
+        )
+        predict_input_tok = self._prediction_tokenizer.pad(
+            dict(input_ids=predict_input_tok), 
+            return_tensors="pt",
+        )
+        masked_forward = self._forward_tokenizer.pad(
+            dict(input_ids=masked_forward), 
+            return_tensors="pt",
+        )
+
+        assert masked_forward.input_ids.shape == forward_input_tok.input_ids.shape, (
+            masked_forward.input_ids.shape, forward_input_tok.input_ids.shape
+        )
+
+        keys = features[0].keys()
+
+        return dict(
+            forward        = forward_input_tok,
+            masked_forward = masked_forward,
+            predict        = predict_input_tok,
+            extra_info     = {
+                key: [f[key] for f in features] for key in keys
+            },
         )
 
