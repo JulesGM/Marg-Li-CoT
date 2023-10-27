@@ -133,7 +133,6 @@ class CommonSenseQAMC(libs_data.lib_base.FewShotMixin, libs_data.lib_base.Datase
 
         self._output_container = lib_base_classes.DataListContainer()
         
-
         for sample in tqdm.tqdm(self._ds, desc="Building DataListContainer"):
             self._output_container.tok_ref_query       .append(torch.tensor(sample["question_tok"]))
             self._output_container.tok_ref_answer      .append(torch.tensor(sample["answer_tok"]))

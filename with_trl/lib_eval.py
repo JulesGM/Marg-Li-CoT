@@ -1,4 +1,5 @@
 """ Code used in the eval loops and nowhere else """
+import itertools
 import logging
 import os
 import random
@@ -18,7 +19,9 @@ import trl_fork
 import wandb
 
 import lib_base_classes
+import lib_constant
 import lib_data
+import libs_data
 import lib_metric
 import lib_reward_exact_match
 import lib_reward_ppl
@@ -61,17 +64,32 @@ def make_metric_and_reward_fn(
     *,
     accelerator_device,
     accelerator_num_processes,
+    dataset_name,
+    dataset,
+    pad_token,
     reward_type,
     task_name: lib_utils.Task,
     use_peft: bool,
     extractor,
 ) -> typing.Tuple[typing.Callable, typing.Callable]:
     if task_name == lib_utils.Task.MAIN:
-        accuracy = lib_metric.ScratchpadAnswerAccuracy(extractor=extractor)
+        accuracy = lib_metric.ScratchpadAnswerAccuracy(
+            extractor=extractor,
+            pad_token=pad_token,
+        )
         metrics = {
-            f"accuracy_{type(extractor).__name__}": accuracy
-            
+            f"accuracy_{type(extractor).__name__}": accuracy   
         }
+
+        # if dataset_name == lib_data.DatasetChoices.ARITHMETIC:
+        #     for i in range(dataset.max_num_digits):
+        #         metrics[f"accuracy_with_{i}_digits"] = (
+        #             libs_data.lib_arithmetic.PerNumberOfDigitsAccuracy(
+        #                 extractor=dataset.get_extractor(), 
+        #                 num_digits=i,
+        #                 pad_token=pad_token,
+        #         ))
+
 
         if reward_type == lib_utils.RewardChoices.REF_PPL:
             assert False, "Not implemented"
@@ -107,7 +125,10 @@ def make_metric_and_reward_fn(
         )
         metrics = {
             f"accuracy_{extractor}": 
-            lib_metric.ScratchpadAnswerAccuracy(extractor=extractor)
+            lib_metric.ScratchpadAnswerAccuracy(
+                extractor=extractor, 
+                pad_token=pad_token
+            )
         }
 
     else:
@@ -116,82 +137,93 @@ def make_metric_and_reward_fn(
     return metrics, reward_fn
 
 
+def unwrap_dataset(dataloader):
+    seen = set([id(dataloader)])
+    maybe_dataset = dataloader.dataset
+    while hasattr(maybe_dataset, "dataset"):
+        seen.add(id(maybe_dataset))
+        assert id(maybe_dataset.dataset) not in seen # Prevent infinite loops
+        maybe_dataset = maybe_dataset.dataset
+    return maybe_dataset
+
+
 class EvalLoop:
     def __init__(
         self,
         *,
-        inference_gen_kwargs: typing.Dict[str, typing.Any],
-        prediction_tokenizer: transformers.PreTrainedTokenizerBase,
-        forward_tokenizer: transformers.PreTrainedTokenizerBase,
         accelerated_model,
-        eval_subset_size: int,
-        metric_accuracy: typing.Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         accelerator: accelerate.Accelerator,
         batch_size: int,
-        reward_fn,
-        task_name: lib_utils.Task,
         dataset: torch.utils.data.Dataset,
-        split: str,
-        use_few_shots: bool,
         dataset_type: lib_data.DatasetChoices,
+        eval_subset_size: int,
+        forward_tokenizer: transformers.PreTrainedTokenizerBase,
+        inference_gen_kwargs: typing.Dict[str, typing.Any],
+        metrics,
+        prediction_tokenizer: transformers.PreTrainedTokenizerBase,
+        reward_fn,
+        split: str,
+        task_name: lib_utils.Task,
+        use_few_shots: bool,
+        metric_exclusion = {f"accuracy_with_{i}_digits" for i in range(5)}
     ):
-        dataloader = make_eval_dataloader(
-            accelerator = accelerator,
-            batch_size  = batch_size,
-            collator    = lib_base_classes.DataListContainer.collate,
-            dataset     = dataset,
-            subset_size = eval_subset_size,
-        )
-
-        self._dataset_type = dataset_type
-        self._use_few_shots = use_few_shots
-        self._inference_gen_kwargs = inference_gen_kwargs
-        self._prediction_tokenizer = prediction_tokenizer
-        self._forward_tokenizer = forward_tokenizer
-        self._accelerated_model = accelerated_model
-        self._metric_accuracy = metric_accuracy
-        self._set_dataloader = dataloader
-        self._accelerator = accelerator
         
-        self._wandb_table_keys = (
-            "call_idx", 
-            "query_end", 
-            "raw_gen", 
-            "cleaned_gen", 
-            "ref", 
-            "extracted_answer",
-            "extracted_ref",
+        dataloader = make_eval_dataloader(
+            accelerator  = accelerator,
+            batch_size   = batch_size,
+            collator     = lib_base_classes.DataListContainer.collate,
+            dataset      = dataset,
+            subset_size  = eval_subset_size,
         )
-        self._reward_fn = reward_fn
-        self._task_name = task_name
-        self._split = split
-        self._call_idx = 0
-        self._wandb_table = lib_utils.WandbTableRepair(
-            columns=list(self._wandb_table_keys))
+        wandb_table_keys = tuple(itertools.chain((
+                "call_idx",  "query_end",  "raw_gen", "cleaned_gen", "ref", 
+            ), (f"{metric_name}_extract_gen" for metric_name in metrics 
+            ), (f"{metric_name}_extract_ref" for metric_name in metrics)
+        ))
+        wandb_table = lib_utils.WandbTableRepair(
+            wandb_kwargs= dict(columns=list(wandb_table_keys)))
 
-        # Unwrap dataset
-        seen = set([id(dataloader)])
-        maybe_dataset = dataloader.dataset
-        while hasattr(maybe_dataset, "dataset"):
-            seen.add(id(maybe_dataset))
-            assert id(maybe_dataset.dataset) not in seen # Prevent infinite loops
-            maybe_dataset = maybe_dataset.dataset
-        self._raw_dataset = maybe_dataset
+        self._accelerated_model    = accelerated_model
+        self._accelerator          = accelerator
+        self._call_idx             = 0
+        self._dataset_type         = dataset_type
+        self._forward_tokenizer    = forward_tokenizer
+        self._inference_gen_kwargs = inference_gen_kwargs
+        self._metric_exclusion     = metric_exclusion
+        self._metrics              = metrics
+        self._prediction_tokenizer = prediction_tokenizer
+        self._raw_dataset          = unwrap_dataset(dataloader)
+        self._reward_fn            = reward_fn
+        self._set_dataloader       = dataloader
+        self._split                = split
+        self._task_name            = task_name
+        self._use_few_shots        = use_few_shots
+        self._wandb_table          = wandb_table
+        self._wandb_table_keys     = wandb_table_keys
 
-        assert use_few_shots is maybe_dataset.use_few_shots, (
-            use_few_shots, maybe_dataset.use_few_shots)
-
+        assert use_few_shots is self._raw_dataset.use_few_shots, (
+            use_few_shots, self._raw_dataset.use_few_shots)
+        
     def __call__(self):
+        """
+        
+        1. Unroll
+        2. Compute & Gather Rewards
+        3. Compute & Gather Metrics
+        4. Extract a random example from the batch to log
+        5. Stack Rewards, Stack and Filter Metrics
+        6. Create the Results Table
+
+        """
         assert isinstance(
             self._set_dataloader.sampler,
             torch.utils.data.sampler.SequentialSampler,
         )
 
-        # Should not be needed but we take no chances.
         with torch.no_grad():
             rewards = []
-            metrics = []
-            table_information = lib_utils.DictDataset(keys=self._wandb_table_keys)
+            filtered_metrics_values = lib_utils.DictDataset(keys=self._metrics.keys())
+            table_information       = lib_utils.DictDataset(keys=self._wandb_table_keys)
 
             for batch_idx, batch in enumerate(
                 lib_utils.progress(
@@ -200,100 +232,145 @@ class EvalLoop:
                     total       = len(self._set_dataloader),
                 )
             ):
-                if RANK == 0:
-                    rich.print(
-                        f"Rank:   {RANK}/{WORLD_SIZE} - " +
-                        f"Split:  [bold white on blue]{self._split}[/] - " +
-                        f"Batch:  {batch_idx}/{len(self._set_dataloader)} - " +
-                        (
-                            f"Metric: {np.mean([x.item() for x in metrics]):0.2%} - {metrics = }"
-                            if metrics
-                            else ""
-                        )
-                    )
-
-                ############################################################
-                # Keys of batch:
-                #   - "query"
-                #   - "input_ids"
-                #   - "ref_answer"
-                #   - "ref_scratchpad"
-                ############################################################
                 assert batch
 
+                ############################################################
+                # Unroll
+                ############################################################
                 output = lib_trl_utils.batched_unroll(
                     accelerated_model    = self._accelerated_model,
                     accelerator          = self._accelerator,
                     dataset_name         = self._dataset_type,
-                    dataset_obj          = self._raw_dataset,
                     generation_kwargs    = self._inference_gen_kwargs,
+                    post_process_gen_fewshots_fn = 
+                        self._raw_dataset.post_process_gen_fewshots,
                     prediction_tokenizer = self._prediction_tokenizer,
                     query_tensors        = batch.tok_ref_query,
                     task_name            = self._task_name,
                     use_few_shots        = self._use_few_shots,
                 )
 
+                ############################################################
+                # Compute & Gather Rewards
+                ############################################################
                 local_batch_rewards: lib_base_classes.RewardOutput = self._reward_fn(
                     responses=output.response_text,
                     batch=batch,
-                )
-                local_batch_metrics: lib_base_classes.MetricOutput = self._metric_accuracy(
-                    responses=output.response_text,
-                    batch=batch,
-                )
-
-                assert local_batch_rewards.extracted_gen == local_batch_metrics.extracted_gen, (
-                    local_batch_rewards.extracted_gen, local_batch_metrics.extracted_gen
-                )
-                assert local_batch_rewards.extracted_ref == local_batch_metrics.extracted_ref, (
-                    local_batch_rewards.extracted_ref, local_batch_metrics.extracted_ref
                 )
 
                 gathered_batch_rewards = self._accelerator.gather_for_metrics(
                     tensor=torch.tensor(local_batch_rewards.values).to(
                         self._accelerator.device
                     ),
+                )           
+                rewards.extend(gathered_batch_rewards)
+
+                ############################################################
+                # Compute & Gather Metrics
+                ############################################################
+                gathered_metric_values, local_metrics = lib_utils.compute_and_gather_metrics(
+                    accelerator   = self._accelerator, 
+                    batch         = batch, 
+                    metrics       = self._metrics, 
+                    response_text = output.response_text, 
+                )
+                filtered_metrics_values.extend(gathered_metric_values)
+
+                ############################################################
+                # Extract a random example from the batch to log
+                ############################################################
+                assert lib_utils.all_equal(
+                    len(x.values) for x in local_metrics.values()), sorted(
+                        (k, len(v.values)) for k, v in local_metrics.items()
+                    )
+
+                idx_in_local_batch = random.randint(0, len(batch.detok_ref_query) - 1)
+                rindex = batch.detok_ref_query[idx_in_local_batch].rindex("Q:")
+
+                sub_metric_gen = {
+                    f"{metric_name}_extract_gen": 
+                    metric_value   .extracted_gen[idx_in_local_batch] 
+                    if metric_value.extracted_gen[idx_in_local_batch] 
+                    is not None else "N/A"
+                    for metric_name, metric_value in local_metrics.items()
+                }
+
+                sub_metric_ref = {
+                    f"{metric_name}_extract_ref": 
+                    metric_value   .extracted_ref[idx_in_local_batch] 
+                    if metric_value.extracted_ref[idx_in_local_batch] 
+                    is not None else "N/A"
+                    for metric_name, metric_value in local_metrics.items()
+                }
+
+                table_information.append(dict(
+                    call_idx    = str(self._call_idx),
+                    cleaned_gen = str(output.response_text    [idx_in_local_batch]),
+                    raw_gen     = str(output.raw_response_text[idx_in_local_batch]),
+                    query_end   = str(batch.detok_ref_query   [idx_in_local_batch][rindex:]),
+                    ref         = str(batch.detok_ref_answer  [idx_in_local_batch]),
+                ) | sub_metric_gen | sub_metric_ref)
+            
+            ############################################################
+            # Stack Rewards, Stack and Filter Metrics
+            ############################################################
+            # Rewards
+            reward = torch.stack(rewards, dim=0)
+
+            # Metrics
+            filtered_metrics_values = lib_utils.DictDataset(data={
+                metric_name: 
+                torch.stack(metric_values, dim=0) if metric_values else None
+                for metric_name, metric_values in filtered_metrics_values.items()
+                if not any(metric_value is None for metric_value in metric_values)
+            })
+            
+            for metric_name, metric_values in filtered_metrics_values.items():
+                LOGGER.info(
+                    f"[bold red on white]\[{self._split}]{metric_name}:[/] - "
+                    f"{metric_values.mean().item():0.1%}"
                 )
 
-                gathered_batch_metrics = self._accelerator.gather_for_metrics(
-                    tensor=torch.tensor(local_batch_metrics.values).to(
-                        self._accelerator.device
-                    ),
-                )            
-
-                idx_in_batch = random.randint(len(batch.detok_ref_query) - 1)
-                rindex = batch.detok_ref_query[idx_in_batch].rindex("Q:")
-                table_information.append(dict(
-                    call_idx         = str(self._call_idx),
-                    cleaned_gen      = str(output.response_text[idx_in_batch]),
-                    query_end        = str(batch.detok_ref_query[idx_in_batch][rindex:]),
-                    raw_gen          = str(output.raw_response_text[idx_in_batch]),
-                    ref              = str(batch.detok_ref_answer[idx_in_batch]),
-                    extracted_answer = str(local_batch_metrics.extracted_gen[idx_in_batch]),
-                    extracted_ref    = str(local_batch_metrics.extracted_ref[idx_in_batch]),
-                ))
-
-                rewards.extend(gathered_batch_rewards)
-                metrics.extend(gathered_batch_metrics)
-
-            reward = torch.stack(rewards, dim=0)
-            metric = torch.stack(metrics, dim=0)
-
-            LOGGER.info(
-                f"[bold red on white]\[{self._split}]EM Accuracy:[/] - {metric.mean().item():0.1%}"
-            )
-
             self._call_idx += 1
+
+            ############################################################
+            # Create the Results Table
+            ############################################################
             if RANK == 0:
                 self._wandb_table.add_data(*table_information.values())
-                
+                metrics_mean = {}
+                metrics_std = {}
+
+                for metric_name, metric_values in filtered_metrics_values.items():
+                    if isinstance(metric_values, dict):
+                        metrics_mean.update({
+                            f"us/set_{self._split.value}/{metric_name}_{k}/mean":
+                            v.mean().item()
+                            for k, v in metric_values.items()
+                        })
+                        metrics_std.update({
+                            f"us/set_{self._split.value}/{metric_name}_{k}/std":
+                            v.std().item()
+                            for k, v in metric_values.items()
+                        })
+                    else:
+                        if metric_values:
+                            metrics_mean.update({
+                                f"us/set_{self._split.value}/{metric_name}/mean": 
+                                metric_values.mean().item(),
+                            })
+                            metrics_std.update({
+                                f"us/set_{self._split.value}/{metric_name}/std": 
+                                metric_values.std().item(),
+                            })
+
+                assert all(key.startswith(f"{lib_constant.WANDB_NAMESPACE}/") for key in metrics_mean)
+                assert all(key.startswith(f"{lib_constant.WANDB_NAMESPACE}/") for key in metrics_std)
                 wandb.log(
                     {
-                        f"set_{self._split.value}/reward_mean": reward.mean().item(),
-                        f"set_{self._split.value}/reward_std": reward.std().item(),
-                        f"set_{self._split.value}/metric_mean": metric.mean().item(),
-                        f"set_{self._split.value}/metric_std": metric.std().item(),
-                        f"set_{self._split.value}/table": self._wandb_table.get_loggable_object(),
-                    }
+                        f"{lib_constant.WANDB_NAMESPACE}/set_{self._split.value}/reward_mean": reward.mean().item(),
+                        f"{lib_constant.WANDB_NAMESPACE}/set_{self._split.value}/reward_std" : reward.std().item(),
+                        f"{lib_constant.WANDB_NAMESPACE}/set_{self._split.value}/table"      : self._wandb_table.get_loggable_object(),
+                    } | metrics_mean | metrics_std
                 )
 

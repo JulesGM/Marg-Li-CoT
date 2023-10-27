@@ -13,10 +13,10 @@ import os
 # We are required to do these before the imports for them to take effect
 ###############################################################################
 # os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
-os.environ["DATASETS_VERBOSITY"] = "warning"
-os.environ["WANDB_SILENT"] = "true"
-os.environ["NCCL_DEBUG"] = "WARN"
+# os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
+# os.environ["DATASETS_VERBOSITY"] = "warning"
+# os.environ["WANDB_SILENT"] = "true"
+# os.environ["NCCL_DEBUG"] = "WARN"
 ###############################################################################
 
 import json

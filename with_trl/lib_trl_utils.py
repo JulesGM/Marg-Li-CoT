@@ -40,6 +40,7 @@ SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 sys.path.append(str(SCRIPT_DIR.parent))
 
 import lib_base_classes
+import lib_constant
 import lib_data
 import lib_utils
 import lib_peft_utils
@@ -67,15 +68,15 @@ def generate(
     print(f"{RANK} lib_trl_utils.batched_unroll >>>")
 
     raw_gen_outputs = batched_unroll(
-        accelerated_model=policy_model,
-        accelerator=accelerator,
-        dataset_name=dataset_name, 
-        generation_kwargs=generation_kwargs,
-        post_process_gen_fewshots_fn=post_process_gen_fewshots_fn,
-        prediction_tokenizer=prediction_tokenizer,
-        query_tensors=batch.tok_ref_query,
-        task_name=task_name, 
-        use_few_shots=use_few_shots,
+        accelerated_model = policy_model,
+        accelerator       = accelerator,
+        dataset_name      = dataset_name, 
+        generation_kwargs = generation_kwargs,
+        post_process_gen_fewshots_fn = post_process_gen_fewshots_fn,
+        prediction_tokenizer         = prediction_tokenizer,
+        query_tensors     = batch.tok_ref_query,
+        task_name         = task_name, 
+        use_few_shots     = use_few_shots,
     )
     print(f"{RANK} lib_trl_utils.batched_unroll <<<")
 
@@ -121,19 +122,6 @@ def generate(
 def rich_escape(value):
     return rich.markup.escape(str(value))
 
-
-def get_rank() -> int:
-    return int(os.getenv("RANK", "0"))
-
-
-def get_local_rank() -> int:
-    return int(os.getenv("LOCAL_RANK", "0"))
-
-
-def get_world_size() -> int:
-    return int(os.getenv("WORLD_SIZE", "1"))
-
-
 IntSequence = typing.TypeVar(
     "IntSequence",
     list[int],
@@ -161,7 +149,7 @@ def check_max_qty_of_token_id(
     list_of_sequences: list[torch.Tensor], max_qty: int, token_id: int
 ):
     for sequence in list_of_sequences:
-        qty_found = (sequence == token_id).long().sum().item()
+        qty_found = (sequence == token_id).sum().item()
         assert qty_found <= max_qty, (qty_found, max_qty)
 
 
@@ -185,14 +173,12 @@ def keep_good_one_generation(
     assert isinstance(generations, lib_base_classes.BatchedUnrollReturn
         ), type(generations)
 
-
     array_response_text = np.array(
         generations.response_text,
         dtype=object,
     ).reshape((batch_size, num_return_seq))
 
     device = generations.response_tensors[0].device
-    
     response_tensors = prediction_tokenizer.pad(
             dict(input_ids=generations.response_tensors), 
             return_tensors="pt", 
@@ -205,7 +191,6 @@ def keep_good_one_generation(
     ).reshape(batch_size, num_return_seq, -1)
 
     del generations
-
     assert isinstance(ref_answers[0][0], str), type(ref_answers[0][0])
 
     selections = []
@@ -285,13 +270,20 @@ def keep_good_one_generation(
 
 class RLTrainingLogger:
     def __init__(self):       
-        self._table = lib_utils.WandbTableRepair(columns=[
-            "Epoch", "Model Input", "Model Output", "Reward",])
+        self._table = lib_utils.WandbTableRepair(
+            wandb_kwargs=dict(
+                columns=["Epoch", "Model Input", "Model Output", "Reward",]
+            )
+        )
 
     def log(self, *, epoch, model_input, model_output, reward):
-        idx = random.randint(0, len(model_input) - 1)
-        self._table.add_row(epoch, model_input[idx], model_output[idx], reward[idx],)
-        wandb.log({"TrainingSamples": self._table.get_loggable_object()})
+        if RANK == 0:
+            idx = random.randint(0, len(model_input) - 1)
+            self._table.add_data(epoch, model_input[idx], model_output[idx], reward[idx],)
+            wandb.log({
+                f"{lib_constant.WANDB_NAMESPACE}/TrainingSamples": 
+                self._table.get_loggable_object()
+            })
 
 
 def print_table(
@@ -336,8 +328,8 @@ def print_table(
         # Escape brackets for rich
         rindex = query.rfind("Q:")
         if rindex == -1:
-            rindex = -300
-            
+            rindex = 0
+        
         table.add_row(
             f"[black on white]{rich_escape(query[rindex:])}",
             f"[black on white]{rich_escape(response)}",
@@ -401,7 +393,7 @@ def print_trainable_parameters(
 
     if do_print:
         rich.print(
-            f"[bold blue]({get_rank()}/{get_world_size()}):[/] "
+            f"[bold blue]({RANK}/{WORLD_SIZE}):[/] "
             f"trainable params: {rich_escape(trainable_params)} || "
             f"all params: {rich_escape(all_param)} || "
             f"trainable%: {100 * trainable_params / all_param}"
@@ -470,11 +462,11 @@ def load_then_peft_ize_model(
         
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
-            device_map={"": torch.device(int(LOCAL_RANK))},
-            load_in_4bit=precision == lib_utils.ValidPrecisions._4bit,
-            load_in_8bit=precision == lib_utils.ValidPrecisions._8bit,
-            quantization_config=quantization_config,
-            pad_token_id = forward_tokenizer.pad_token_id,
+            device_map   = {"": torch.device(int(LOCAL_RANK))},
+            load_in_4bit = precision == lib_utils.ValidPrecisions._4bit,
+            load_in_8bit = precision == lib_utils.ValidPrecisions._8bit,
+            quantization_config = quantization_config,
+            low_cpu_mem_usage   = os.environ.get("SLURM_JOB_PARTITION", "") == "main",
         )
         
         # Make sure that there is only one device
@@ -490,18 +482,23 @@ def load_then_peft_ize_model(
     else:
         assert isinstance(precision.value, torch.dtype), (
             f"{type(precision.value) = }")
+        
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
-            torch_dtype=precision.value,
-            device_map="auto" if just_device_map else None,
-            pad_token_id = forward_tokenizer.pad_token_id,
+            device_map   = "auto" if just_device_map else None,
+            torch_dtype  = precision.value,
         )
-        assert not just_device_map or all(x.device.type == "cuda" for x in pretrained_model.parameters())
+        assert not just_device_map or all(
+            x.device.type == "cuda" 
+            for x in pretrained_model.parameters()
+        )
 
     ###########################################################################
     # Fix tokenizers for causal models
     ###########################################################################
     if not config.is_encoder_decoder:
+        config.pad_token_id = prediction_tokenizer.pad_token_id
+
         # Fix pretrained model to handle the new pad token
         assert len(forward_tokenizer) == len(prediction_tokenizer), (
             f"{len(forward_tokenizer) = }\n" 
@@ -529,9 +526,10 @@ def load_then_peft_ize_model(
             )
         
         if peft_do_all_lin_layers:
-            assert "target_modules" not in peft_config_dict, peft_config_dict
-            peft_config_dict["target_modules"] = lib_peft_utils.find_all_linear_names(
-                precision.value, pretrained_model)
+            lora_config.target_modules = lib_peft_utils.find_all_linear_names(
+                precision.value, 
+                pretrained_model,
+            )
 
         pretrained_model = peft.get_peft_model(
             pretrained_model,
@@ -730,7 +728,7 @@ def init_model(
 
     elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
         import ipdb; ipdb.set_trace() # TODO JULESGM: FIX
-
+        assert False
         trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES += (MultiAdapterWrapper,)
         print(trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES)
 
@@ -841,25 +839,28 @@ def batched_unroll(
         ),
         return_tensors="pt",
         padding=True,
-    ).to(torch.device(get_local_rank()))
+    ).to(accelerator.device)
 
     responses = model.generate(
         **tokenized,
         **generation_kwargs,
-        pad_token_id=prediction_tokenizer.pad_token_id,
+        pad_token_id = prediction_tokenizer.pad_token_id,
     )
 
     if not model.config.is_encoder_decoder:
-        seq_len = typing.cast(
-            torch.Tensor,
-            tokenized["input_ids"],
-        ).shape[1]
+        seq_len = tokenized["input_ids"].shape[1]
         responses = responses[:, seq_len:]
 
     raw_responses = responses
     if task_name == lib_utils.Task.MAIN:
-        if dataset_name == lib_data.DatasetChoices.COMMONSENSEQA_MC and use_few_shots:
-            responses = post_process_gen_fewshots_fn(raw_gen_outputs=responses, any_tokenizer=prediction_tokenizer)
+        if (
+            dataset_name == lib_data.DatasetChoices.COMMONSENSEQA_MC or 
+            dataset_name == lib_data.DatasetChoices.ARITHMETIC
+        ) and use_few_shots:    
+            responses = post_process_gen_fewshots_fn(
+                raw_gen_outputs = responses, 
+                any_tokenizer   = prediction_tokenizer,
+            )
         elif use_few_shots:
             raise NotImplemented
             assert not hasattr(dataset_obj, "post_process_gen_fewshots"), type(dataset_obj).mro()
@@ -897,17 +898,23 @@ def unpad(responses, pad_token_id, eos_token_id):
 def log_reward(
     *,
     accelerator,
-    reward_output,
-    metric_output,
-    epoch,
+    batch,
     batch_idx,
+    epoch,
+    metrics,
+    response_text,
+    reward_output,
 ):
     all_rewards = accelerator.gather_for_metrics(
         torch.tensor(reward_output.values).to(accelerator.device)
     )
-    all_metrics = accelerator.gather_for_metrics(
-        torch.tensor(metric_output.values).to(accelerator.device)
-    )
+
+    # gathered_batch_metrics, local_metric_values = lib_utils.compute_and_gather_metrics(
+    #     accelerator   = accelerator, 
+    #     batch         = batch, 
+    #     metrics       = metrics, 
+    #     response_text = response_text, 
+    # )
 
     rich.print(
         f"[bold blue]"
@@ -920,7 +927,9 @@ def log_reward(
     )
 
     if RANK == 0:
-        wandb.log({"avg_all_rewards": all_rewards.mean().item()})
-        wandb.log({"avg_all_metrics": all_metrics.mean().item()})
+        wandb.log({
+            f"{lib_constant.WANDB_NAMESPACE}/avg_all_rewards": 
+            all_rewards.mean().item()
+        })
 
 

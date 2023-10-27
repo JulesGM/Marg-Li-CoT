@@ -43,7 +43,7 @@ class ExactMatchReward(lib_base_classes.Reward):
         return lib_base_classes.RewardOutput(
             moving_averages={k: v[0] for k, v in mov_wind_acc.items()},
             logging_columns=metric.logging_columns,
-            values=[torch.tensor(x - 0.5) * 4 for x in metric.values],
+            values=[torch.tensor(x) for x in metric.values],
             name="exact_match",
             extracted_gen=metric.extracted_gen,
             extracted_ref=metric.extracted_ref,

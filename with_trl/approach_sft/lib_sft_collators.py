@@ -72,6 +72,7 @@ class CausalFullCollator:
         - Answer only
         """
         import ipdb; ipdb.set_trace()
+        assert False
 
         if self.output_type == lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER:
             questions   = [f["ref_qa_question"].strip() for f in features]

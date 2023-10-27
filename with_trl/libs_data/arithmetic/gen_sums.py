@@ -5,6 +5,7 @@ import sys
 import os
 
 import fire
+import jsonlines as jl
 import rich
 import rich.markup
 import rich.table
@@ -41,7 +42,7 @@ def to_list(num):
 
 
 def to_str(num):
-    return " ".join(to_list(num))
+    return "".join(to_list(num))
 
 
 def gen_examples(
@@ -62,31 +63,31 @@ def gen_examples(
 
         first_number  = random.randrange(int(10 ** digits), int(10 ** (digits + 1)))
         second_number = random.randrange(int(10 ** digits), int(10 ** (digits + 1)))
-
-        input_sum = f"{to_str(first_number)} + {to_str(second_number)}"
+        input_sum     = f"{to_str(first_number)} + {to_str(second_number)}"
         resultant_str = f"Input:\n{input_sum}\nTarget:\n"
 
         scratch_pad = None
         if include_scratchpad:
-            scratch_pad = f"<scratch>\n{input_sum} , C: 0\n"
-            carry = 0
+            scratch_pad = f"<scratch>\n"
+            carry       = 0
             running_sum = ""
-            initial = True
 
             for first_digit, second_digit in reversed(list(zip(
                 to_list(first_number), to_list(second_number)
             ))):
             
-                dig_sum = int(first_digit) + int(second_digit) + carry
-                if not initial:
-                    scratch_pad += f"{first_digit} + {second_digit} , {running_sum}C: {carry}\n"
-                carry = int(dig_sum >= 10)
-                running_sum = f"{dig_sum % 10} {running_sum}"
-                initial = False
+                dig_sum      = int(first_digit) + int(second_digit) + carry
+                running_sum  = f"{dig_sum % 10}{running_sum}"
+                maybe_prev_c = f" + 1 (Previous carry)" if carry else ""
+                carry        = int(dig_sum >= 10)
+                scratch_pad += (
+                    f"{first_digit} + {second_digit}{maybe_prev_c} , " +
+                    f"{running_sum} Carry: {carry}\n"
+                )
 
-            scratch_pad += f", {running_sum}C: {carry}\n"
-            scratch_pad += f"{carry} {running_sum}".strip() + "\n"
-            scratch_pad += "</scratch>\n"
+            # scratch_pad += f", {running_sum}C: {carry}\n"
+            scratch_pad   += f"{carry} {running_sum}".strip() + "\n"
+            scratch_pad   += "</scratch>\n"
             resultant_str += scratch_pad
             
         resultant_str += to_str(first_number + second_number)
@@ -94,10 +95,10 @@ def gen_examples(
         complete_str.append(resultant_str)
 
         obj = dict(
-            input_sum   = input_sum, 
-            scratch_pad = scratch_pad,
-            answer      = to_str(first_number + second_number),
-            digits      = digits,
+            input      = input_sum, 
+            answer     = to_str(first_number + second_number),
+            num_digits = digits,
+            scratchpad = scratch_pad,
         )
 
         sample_dicts.append(obj)
@@ -106,16 +107,18 @@ def gen_examples(
 
 
 def main(
-    val_start = 3,
-    max_digits = 5,
-    n_samples = 2000,
-    include_scratchpad = True,
+    gen_text = False,
+
+    val_start           = 3,
+    max_digits          = 5,
+    n_samples           = 2000,
+    include_scratchpad  = True,
 
     # For few-shots
-    randomized_digits = False,
+    randomized_digits   = False,
     examples_per_prompt = 1, # Num. shots per pool
-    fixed_examples = False, # Randomize from pool
-    context_examples = 50, # Pool of few-shots
+    fixed_examples      = False, # Randomize from pool
+    context_examples    = 50, # Pool of few-shots
 ):
 
     args = locals()
@@ -144,7 +147,7 @@ def main(
             folder_name = cv_set.value
             
             if include_scratchpad:
-                folder_name += '_scratch'
+                folder_name += "_scratch"
 
                 # Potentially add few-shot scratchpads if not randomized digits
                 if fixed_examples and not randomized_digits:
@@ -162,27 +165,38 @@ def main(
                 os.mkdir(folder_name)
                 
             complete_str = ""
-            for _ in range(n_samples):
-                n_gen_examples = 1 if fixed_examples else examples_per_prompt
-                if fixed_examples:
-                    complete_str += "".join(random.sample(few_shot_str, examples_per_prompt - 1))
-
-                # Main sample generation
-                sample_strs, sample_list_dicts = gen_examples(
-                    n_examples         = n_gen_examples,
-                    digits             = digits,
-                    include_scratchpad = include_scratchpad,
-                    randomized_digits  = False,
-                    min_digit          = None,
-                    max_digit          = None,
-                )
-
-                complete_str += "".join(sample_strs)
+            with jl.open(f"{folder_name}/{digits + 1}.jsonl", "w") as f:
                 
-                complete_str += '<|endoftext|>'
+                for _ in range(n_samples):
+                    
+                    n_gen_examples = 1 if fixed_examples else examples_per_prompt
 
-            with open(f"{folder_name}/{digits + 1}.txt", "w") as f:
-                f.write(complete_str)
+                    if fixed_examples:
+                        complete_str += "".join(random.sample(
+                            few_shot_str, examples_per_prompt - 1
+                        ))
+
+                    # Main sample generation
+                    sample_strs, sample_list_dicts = gen_examples(
+                        n_examples         = n_gen_examples,
+                        digits             = digits,
+                        include_scratchpad = include_scratchpad,
+                        randomized_digits  = False,
+                        min_digit          = None,
+                        max_digit          = None,
+                    )
+                    
+                    for sample_dict in sample_list_dicts:
+                        f.write(sample_dict)
+
+                    complete_str += "".join(sample_strs)
+                    complete_str += "<|endoftext|>"
+
+            if gen_text:
+                with open(f"{folder_name}/{digits + 1}.txt", "w") as f:
+                    f.write(complete_str)
+
+                    
 
 if __name__ == "__main__":
     fire.Fire(main)

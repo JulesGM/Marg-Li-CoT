@@ -155,7 +155,7 @@ class CommonSenseScratchpadGenMC(libs_data.lib_base.Dataset):
 
             self._ds = tmp_ds.remove_columns(
                 [key for key in tmp_ds.features 
-                 if not (key.endswith("_tok") or key.endswith("_detok"))
+                 if not (key.endswith("_tok") or key.endswith("_detok_skip") or key.endswith("_detok") or key.endswith("_detok_not_skip"))
                 ]
             )
         else:

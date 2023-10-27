@@ -26,8 +26,9 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
     Takes
     """
 
-    def __init__(self, extractor):
+    def __init__(self, extractor, pad_token):
         self._extractor = extractor
+        self._pad_token = pad_token
 
     def _make_comparable(
         self, match: re.Match, original_text: typing.Optional[str] = None
@@ -81,12 +82,14 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
             assert isinstance(raw_ref, list), type(raw_ref)
             assert len(raw_ref) == 1, len(raw_ref)
             assert isinstance(raw_ref[0], str), type(raw_ref[0])
+            assert self._pad_token not in raw_ref[0], raw_gen
             extracted_ref = self._extractor(raw_ref[0])
 
             # -----------------------------------------------------------------
             # Prepare Gen
             # -----------------------------------------------------------------
             assert raw_gen is not None, raw_gen
+            assert self._pad_token not in raw_gen, raw_gen
             extracted_gen = self._extractor(raw_gen)
 
 
@@ -146,12 +149,16 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
         #######################################################################
         num_nones_parsed = sum(
             x["gen"] is None for x in parsed) # type: ignore
-        assert parsed
+        
+        if generated_texts:
+            fraction_failed = f"{num_nones_parsed / len(generated_texts):0.1%}"
+        else:
+            fraction_failed = "N/A"
 
         LOGGER.debug(
             f"[bold green]EM Result:[bold white] {np.mean(em_values):0.2%}\n"
             f"[bold red on white]Fraction of no answer found: "
-            f"{num_nones_parsed / len(generated_texts):0.1%}\n"
+            f"{fraction_failed}\n"
         )
 
         assert len(em_values) == len(generated_texts) == len(reference_answer_texts), (

@@ -17,6 +17,8 @@ import trl
 import trl_fork
 import wandb
 
+import lib_base_classes
+
 RANK = int(os.environ.get("RANK", 0))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
@@ -153,6 +155,17 @@ def maybe_context_manager(caller, disable):
         with caller():
             yield
 
+def all_equal(iterable):
+    
+    it = iter(iterable)
+    try:
+        first = next(it)
+    except StopIteration:
+        return True
+    
+    return all(first == rest for rest in it)
+
+
 class DictDataset(torch.utils.data.Dataset):
     # Object Pandas without the fluff
 
@@ -211,6 +224,15 @@ class DictDataset(torch.utils.data.Dataset):
         for k, v in dict_.items():
             self._dataset[k].append(v)
 
+    def extend(self, dict_) -> None:
+        assert dict_.keys() == self._dataset.keys(), (
+            dict_.keys(),
+            self._dataset.keys(),
+        )
+
+        for k, v in dict_.items():
+            self._dataset[k].extend(v)
+
     def __iter__(self):
         len_ = len(self)
 
@@ -251,42 +273,119 @@ def get_tmp_dir() -> pathlib.Path:
 
 
 class WandbTableRepair:
-    def __init__(self, *args, **kwargs):
-        self._creation_args = args
-        self._creation_kwargs = kwargs
-        self._table = wandb.Table(*args, **kwargs)
+    def __init__(self, *, wandb_args=None, wandb_kwargs=None, new_table_mode=False):
+        if wandb_args is None:
+            wandb_args = []
+        if wandb_kwargs is None:
+            wandb_kwargs = {}
+        self._creation_args = wandb_args
+        self._creation_kwargs = wandb_kwargs
+        self._new_table_mode = new_table_mode
+        self._table = wandb.Table(*wandb_args, **wandb_kwargs)
 
     def add_data(self, *args, **kwargs):
         self._table.add_data(*args, **kwargs)
 
     def get_loggable_object(self):
-        old_table = self._table
-        self._table = wandb.Table(
-            *self._creation_args, 
-            **self._creation_kwargs, 
-            data=self._table.data,
-        )
-        return old_table
+        if self._new_table_mode:
+            table_to_return = self._table
+            self._table = wandb.Table(
+                *self._creation_args, 
+                **self._creation_kwargs, 
+                data=self._table.data,
+            )
+        else:
+            table_to_return = self._table
+
+        return table_to_return
     
 
 class WandbAndRichTable:
     def __init__(self, columns, rich_kwargs=None, wandb_kwargs=None):
+        
         if rich_kwargs is None:
             rich_kwargs = {}
+
         if wandb_kwargs is None:
             wandb_kwargs = {}
 
-        self._columns = columns
-        self._rich_kwargs = rich_kwargs
+        self._columns      = columns
+        self._rich_kwargs  = rich_kwargs
         self._wandb_kwargs = wandb_kwargs
-        self._rich_table = rich.table.Table(*self._columns, **self._rich_kwargs)
-        self._wandb_table = WandbTableRepair(columns=columns, **wandb_kwargs)
+        self._rich_table   = rich.table.Table(
+            *self._columns, 
+            **self._rich_kwargs,
+        )
+        self._wandb_table = WandbTableRepair(
+            wandb_kwargs = dict(columns=columns, **wandb_kwargs)
+        )
 
     def add_row(self, *args, **kwargs):
-        self._rich_table.add_row(*args, **kwargs)
+        self._rich_table .add_row (*args, **kwargs)
         self._wandb_table.add_data(*args, **kwargs)
     
     def get_loggable_object(self):
         rich.print(self._rich_table)
         self._rich_table = rich.table.Table(*self._columns, **self._rich_kwargs)
         return self._wandb_table.get_loggable_object()
+    
+
+def compute_and_gather_metrics(
+        *, 
+        accelerator:   accelerate.Accelerator,
+        batch:         lib_base_classes.DataListContainer,
+        metrics:       dict[str, lib_base_classes.Metric],
+        response_text: list[str],
+    ):
+    
+    ###########################################################################
+    # Entrance checks.
+    ###########################################################################
+    assert isinstance(response_text, list), type(response_text)
+    assert isinstance(response_text[0], str), type(response_text[0])
+    assert isinstance(batch, lib_base_classes.DataListContainer), type(batch)
+    assert isinstance(accelerator, accelerate.Accelerator), type(accelerator)
+
+    assert isinstance(metrics, dict), type(metrics)
+    first_metric = next(iter(metrics.values()), None)
+    assert not metrics or isinstance(first_metric, lib_base_classes.Metric), metrics
+    del first_metric
+
+    ###########################################################################
+    # Action.
+    ###########################################################################
+    gathered_values = {}
+    local_metric_values = {}
+    for metric_name, metric_callable in metrics.items():
+        local_metric = metric_callable(
+            responses = response_text,
+            batch     = batch,
+        )
+        assert len(local_metric.values) == len(batch), (
+            len(local_metric.values), 
+            len(batch),
+        )
+        local_metric_values[metric_name] = local_metric
+        
+        not_none_values = [x for x in local_metric.values if x is not None]
+        if not_none_values:
+            gathered_values[metric_name] = accelerator.gather_for_metrics(
+                torch.tensor(not_none_values).to(accelerator.device))
+
+    ###########################################################################
+    # Exit checks.
+    ###########################################################################
+    assert isinstance(    gathered_values, dict), type(    gathered_values)
+    assert isinstance(local_metric_values, dict), type(local_metric_values)
+    
+    first_gathered_values = next(iter(gathered_values.values()), None)
+    assert not gathered_values or isinstance(first_gathered_values, 
+        torch.Tensor), type(first_gathered_values)
+    del first_gathered_values
+
+    first_local_metric_values = next(iter(local_metric_values.values()), None)
+    assert not local_metric_values or isinstance(first_local_metric_values, 
+        lib_base_classes.MetricOutput), type(first_local_metric_values)
+    del first_local_metric_values
+
+    return gathered_values, local_metric_values

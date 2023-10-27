@@ -9,7 +9,9 @@ import torch
 import transformers
 import wandb
 
+
 import lib_base_classes
+import lib_constant
 import lib_utils
 
 RANK = int(os.environ.get("RANK", 0))
@@ -73,7 +75,7 @@ def predict_table(
         )
 
     wandb.log({
-        f"{split.value}/predictions_table": wandb_and_rich_table.get_loggable_object()
+        f"{lib_constant.WANDB_NAMESPACE}/{split.value}/predictions_table": wandb_and_rich_table.get_loggable_object()
         }, step=global_step)
     
 

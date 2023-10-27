@@ -8,7 +8,7 @@ import rich.rule
 SCRIPT_DIR = Path(__file__).absolute().parent
 
 
-def main(in_path=SCRIPT_DIR, out_root=SCRIPT_DIR, dry=True):
+def main(in_path=SCRIPT_DIR, out_root=SCRIPT_DIR, dry=False):
     in_path = Path(in_path)
     out_root = Path(out_root)
     assert in_path.exists(), in_path

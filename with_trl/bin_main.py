@@ -1,17 +1,18 @@
 #!/usr/bin/env python
 import os
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
-os.environ["DATASETS_VERBOSITY"] = "warning"
-os.environ["WANDB_SILENT"] = "true"
-os.environ["NCCL_DEBUG"] = "WARN"
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
+# os.environ["DATASETS_VERBOSITY"] = "warning"
+# os.environ["WANDB_SILENT"] = "true"
+# os.environ["NCCL_DEBUG"] = "WARN"
 
 DETERMINISTIC = False
 if DETERMINISTIC:
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import collections
+import getpass
 import enum
 import itertools
 import logging
@@ -28,6 +29,7 @@ import numpy as np
 import peft
 import rich
 import rich.console
+import rich.highlighter
 import rich.logging
 import rich.markup
 import rich.status
@@ -52,21 +54,20 @@ import lib_data
 import lib_eval
 import lib_trl_utils
 import lib_utils
-import approach_value_model_pretraining.bin_value_pretrain as lib_value_pretrain
 
-rich.traceback.install()
 datasets.disable_caching()
+rich.traceback.install(console=rich.console.Console(force_terminal=True))
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "0"))
 RANK = int(os.environ.get("RANK", "0"))
 LOGGER = logging.getLogger(__name__)
 
-datasets.logging.set_verbosity_warning()
-transformers.logging.set_verbosity_warning()  # type: ignore
-logging.getLogger("datasets").setLevel(logging.WARNING)
-logging.getLogger("transformers").setLevel(logging.WARNING)
-logging.getLogger("deepspeed").setLevel(logging.WARNING)
+# datasets.logging.set_verbosity_warning()
+# transformers.logging.set_verbosity_warning()  # type: ignore
+# logging.getLogger("datasets").setLevel(logging.WARNING)
+# logging.getLogger("transformers").setLevel(logging.WARNING)
+# logging.getLogger("deepspeed").setLevel(logging.WARNING)
 
 np.random.seed(0)
 random.seed(1)
@@ -86,9 +87,9 @@ DEFAULT_REWARD_VERBOSE = False
 ##############################################################################
 DEFAULT_USE_FEW_SHOTS = True
 DEFAULT_GEN_KWARGS = dict(
-    early_stopping       = True,
     min_new_tokens       = 5,
-    num_return_sequences = 1,
+    num_return_sequences = 4,
+    num_beams            = 4,
 
     ##########################################
     synced_gpus        = os.getenv("ACCELERATE_DEEPSPEED_ZERO_STAGE", "") == "3",
@@ -103,7 +104,7 @@ DEFAULT_GEN_KWARGS = dict(
 
 DEFAULT_TRL_LIBRARY_MODE = lib_utils.TrlLibraryMode.TRL
 DEFAULT_TASK_NAME: str = lib_utils.Task.MAIN
-DEFAULT_EVAL_EVERY: int = 100
+DEFAULT_EVAL_EVERY: int = 0
 DEFAULT_VALUE_MODEL_PRETRAIN_AMOUNT: int = 1
 
 
@@ -113,17 +114,18 @@ class TrainingState(enum.Enum):
 
 
 if DEFAULT_TASK_NAME == lib_utils.Task.MAIN:
-    DEFAULT_WANDB_PROJECT: str = "commonsense"
     DEFAULT_REWARD_TYPE = lib_utils.RewardChoices.EXACT_MATCH
-    DEFAULT_DATASET_NAME = lib_data.DatasetChoices.COMMONSENSEQA_MC
+    DEFAULT_DATASET_NAME = lib_data.DatasetChoices.ARITHMETIC
+    DEFAULT_WANDB_PROJECT: str = f"rl_{DEFAULT_DATASET_NAME.value}"
 
     # -------------------------------------------------------
     #########################################################
-    DEFAULT_GEN_KWARGS["do_sample"] = False    
-    DEFAULT_MODEL_NAME = "EleutherAI/gpt-j-6B"; DEFAULT_BATCH_SIZE: int = 8; DEFAULT_MINI_BATCH_SIZE: int = 1
-    # DEFAULT_MODEL_NAME = "EleutherAI/pythia-410m-v0"; DEFAULT_BATCH_SIZE: int = 24; DEFAULT_MINI_BATCH_SIZE: int = 2
+    DEFAULT_GEN_KWARGS["do_sample"] = False
+    # DEFAULT_MODEL_NAME = "EleutherAI/gpt-j-6B"; DEFAULT_BATCH_SIZE: int = 2; DEFAULT_MINI_BATCH_SIZE: int = 1
+    DEFAULT_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"; DEFAULT_BATCH_SIZE: int = 2; DEFAULT_MINI_BATCH_SIZE: int = 1
+    # DEFAULT_MODEL_NAME = "EleutherAI/pythia-70m-deduped"; DEFAULT_BATCH_SIZE: int = 24; DEFAULT_MINI_BATCH_SIZE: int = 2
     
-    DEFAULT_ANSWER_ONLY = True; 
+    DEFAULT_ANSWER_ONLY = False 
     DEFAULT_GEN_KWARGS["max_new_tokens"] = 10 if DEFAULT_ANSWER_ONLY else 200
 
     DEFAULT_INFERENCE_BATCH_SIZE: int = DEFAULT_BATCH_SIZE
@@ -141,6 +143,7 @@ if DEFAULT_TASK_NAME == lib_utils.Task.MAIN:
     # -------------------------------------------------------
 
 
+    DEFAULT_PEFT_DO_ALL_LIN_LAYERS = True
     assert DEFAULT_EVAL_EVERY == 0 or DEFAULT_EVAL_EVERY >= (
         DEFAULT_GRADIENT_ACCUMULATION_STEPS // WORLD_SIZE
     ), (
@@ -151,8 +154,8 @@ if DEFAULT_TASK_NAME == lib_utils.Task.MAIN:
 
     DEFAULT_INFERENCE_GEN_KWARGS = DEFAULT_GEN_KWARGS.copy()
     DEFAULT_INFERENCE_GEN_KWARGS["num_beams"] = 1
-    DEFAULT_INFERENCE_GEN_KWARGS["do_sample"] = False
     DEFAULT_INFERENCE_GEN_KWARGS["num_return_sequences"] = 1
+    DEFAULT_INFERENCE_GEN_KWARGS["do_sample"] = False
     # We could use a custom batch size too.
 
 
@@ -201,8 +204,13 @@ DEFAULT_PEFT_CONFIG = dict(
 )
 
 DEFAULT_INPUT_MAX_LENGTH = 115
-DEFAULT_WANDB_DIR = lib_utils.get_tmp_dir() / "bin_main.py"
+# get username with os
 
+if RANK == 0:
+    DEFAULT_WANDB_DIR = pathlib.Path("/tmp") / f"{getpass.getuser()}_{os.getpid()}"
+else:
+    DEFAULT_WANDB_DIR = None
+DEFAULT_ARITHMETIC_DATASET_ROOT_FOLDER_DIR = "/home/mila/g/gagnonju/Marg-Li-CoT/with_trl/libs_data/arithmetic/"
 
 
 
@@ -211,6 +219,7 @@ def main(
     *,
     answer_only: bool = DEFAULT_ANSWER_ONLY,
     answer_only_path: str = DEFAULT_ANSWER_ONLY_PATH,
+    arithmetic_dataset_root_folder_dir = DEFAULT_ARITHMETIC_DATASET_ROOT_FOLDER_DIR,
     batch_size: int = DEFAULT_BATCH_SIZE,
     causal_question_prefix: str = DEFAULT_CAUSAL_QUESTION_PREFIX,
     causal_question_suffix: str = DEFAULT_CAUSAL_QUESTION_SUFFIX,
@@ -227,34 +236,57 @@ def main(
     mini_batch_size: int = DEFAULT_MINI_BATCH_SIZE,
     model_name: str = DEFAULT_MODEL_NAME,
     peft_config_dict: Optional[dict[str, Any]] = DEFAULT_PEFT_CONFIG,
-    peft_qlora_mode: bool = DEFAULT_PEFT_QLORA_MODE,
+    # peft_qlora_mode: bool = DEFAULT_PEFT_QLORA_MODE,/
+    peft_do_all_lin_layers = DEFAULT_PEFT_DO_ALL_LIN_LAYERS,
     precision: Union[str, torch.dtype, lib_utils.ValidPrecisions] = DEFAULT_PRECISION,
     reward_type: Union[None, str, lib_utils.RewardChoices] = DEFAULT_REWARD_TYPE,
-    stop_at_line_return: bool = True,
+    stop_at_line_return: bool = False,
     task_name: lib_utils.Task = lib_utils.Task(DEFAULT_TASK_NAME),
     trl_library_mode: lib_utils.TrlLibraryMode = DEFAULT_TRL_LIBRARY_MODE,
     use_peft: bool = DEFAULT_USE_PEFT,
     use_few_shots: int = DEFAULT_USE_FEW_SHOTS,
-    value_model_pretrain: bool,
-    value_model_pretrain_amount: int = DEFAULT_VALUE_MODEL_PRETRAIN_AMOUNT,
+    # value_model_pretrain: bool,
     wandb_dir: str = DEFAULT_WANDB_DIR,
     wandb_project: str = DEFAULT_WANDB_PROJECT,
+    extractor_arithmetic_ignore_one_line=True
 ):
     args = locals().copy()
     precision = lib_utils.ValidPrecisions(precision)  # type: ignore
     
     # Display command line args
     if RANK == 0:
+        args_to_highlight = {"model_name"}
+        args_to_hide = {
+            "causal_question_prefix",
+            "causal_question_suffix",
+            "gradient_accumulation_steps",
+            "input_max_length",
+            "just_metrics",
+            "peft_config_dict",
+            "precision",
+            "stop_at_line_return"
+            "task_name", 
+            "wandb_project", 
+        }
         table = rich.table.Table(
             "Key", 
             "Value", 
             title="Command Line Arguments", 
-            show_lines=True,
+            highlight=True,
         )
         for key, value in sorted(args.items(), key=lambda x: x[0]):
+            if key in args_to_hide:
+                continue
+
+            style_key = "[bold]"
+            style_value = ""
+            if key in args_to_highlight:
+                style_key = "[red bold]"
+                style_value = "[red bold]"
+
             table.add_row(
-                "[bold]" + rich.markup.escape(str(key)), 
-                rich.markup.escape(str(value))
+                style_key + rich.markup.escape(str(key)), 
+                style_value + rich.markup.escape(str(value))
             )
         rich.print(table)
     
@@ -295,7 +327,6 @@ def main(
             causal_question_suffix,
         )
 
-    
     assert peft_config_dict is not None
     assert "task_type" not in peft_config_dict, peft_config_dict
 
@@ -306,12 +337,13 @@ def main(
     else:
         raise ValueError(f"Unknown model type: {model_name}")
 
-    assert "target_modules" not in peft_config_dict, peft_config_dict
-    peft_config_dict[
-        "target_modules"
-    ] = peft.utils.other.TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[
-        hf_config.model_type
-    ]
+    if not peft_do_all_lin_layers:
+        assert "target_modules" not in peft_config_dict, peft_config_dict
+        peft_config_dict[
+            "target_modules"
+        ] = peft.utils.other.TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[
+            hf_config.model_type
+        ]
 
     accelerator_kwargs = dict(
         kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(
@@ -334,6 +366,11 @@ def main(
         reward_type = lib_utils.RewardChoices(reward_type)
 
     if RANK == 0:
+        wandb_dir = pathlib.Path(wandb_dir)
+        if not wandb_dir.exists():
+            wandb_dir.mkdir(parents=True)
+            assert wandb_dir.exists(), wandb_dir
+            
         wandb.init(
             save_code=True,
             project=wandb_project,
@@ -362,23 +399,25 @@ def main(
         disable=RANK != 0,
     ):
         output = lib_trl_utils.init_model(
-            model_name=trl_config.model_name,
-            peft_config_dict=peft_config_dict,
-            peft_qlora_mode=peft_qlora_mode,
-            precision=precision,
-            trl_library_mode=trl_library_mode,
-            use_peft=use_peft,
+            model_name             = trl_config.model_name,
+            peft_config_dict       = peft_config_dict,
+            # peft_qlora_mode       = peft_qlora_mode,
+            peft_do_all_lin_layers = peft_do_all_lin_layers,
+            precision              = precision,
+            trl_library_mode       = trl_library_mode,
+            use_peft               = use_peft,
         )
 
         # Deal with fork vs non-fork
-        forward_tokenizer = output["forward_tokenizer"]
+        forward_tokenizer    = output["forward_tokenizer"]
         prediction_tokenizer = output["prediction_tokenizer"]
-        trainer_kwargs = {}
+        trainer_kwargs       = {}
+
         if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
-            trainer_kwargs["model"] = output["model"]
+            trainer_kwargs[       "model"] = output[       "model"]
         elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
             trainer_kwargs["policy_model"] = output["policy_model"]
-            trainer_kwargs["value_model"] = output["value_model"]
+            trainer_kwargs[ "value_model"] = output[ "value_model"]
         else:
             raise ValueError(f"Unknown trl_library_mode: {trl_library_mode}")
 
@@ -391,13 +430,33 @@ def main(
     ###########################################################################
     # Extract "\n"
     ###########################################################################
-    if stop_at_line_return:
-        line_return_tok = lib_utils.line_return_token(any_tokenizer=prediction_tokenizer)
-        generation_kwargs["eos_token_id"] = line_return_tok
-        inference_gen_kwargs["eos_token_id"] = line_return_tok
-        assert "eos_token_id" not in generation_kwargs, generation_kwargs
-        assert "eos_token_id" not in inference_gen_kwargs, inference_gen_kwargs
+    # assert not stop_at_line_return
+    # if stop_at_line_return:
+    #     if dataset_name == lib_data.DatasetChoices.ARITHMETIC:
+    #         assert False
+    #     line_return_tok = lib_utils.line_return_token(any_tokenizer=prediction_tokenizer)
+    #     assert "eos_token_id" not in generation_kwargs, generation_kwargs
+    #     assert "eos_token_id" not in inference_gen_kwargs, inference_gen_kwargs
+    #     generation_kwargs   ["eos_token_id"] = line_return_tok
+    #     inference_gen_kwargs["eos_token_id"] = line_return_tok
         
+    # elif True:
+
+    # This is a way to stop decoding.
+    line_return_tok = prediction_tokenizer.encode("\n!")[-1]
+    decoding_test_output = prediction_tokenizer.decode([line_return_tok])
+    assert decoding_test_output == "!", (
+        f"\"{decoding_test_output}\" != \"!\""
+    )
+
+    assert "eos_token_id" not in generation_kwargs, generation_kwargs
+    assert "eos_token_id" not in inference_gen_kwargs, inference_gen_kwargs
+    generation_kwargs   ["eos_token_id"] = line_return_tok
+    inference_gen_kwargs["eos_token_id"] = line_return_tok
+
+    # else:
+    #     generation_kwargs["eos_token_id"] = eos_token_id
+    #     inference_gen_kwargs["eos_token_id"] = eos_token_id
 
     ###########################################################################
     # Load Datasets
@@ -412,6 +471,8 @@ def main(
         question_suffix=causal_question_suffix,
         split=lib_utils.CVSets.TRAIN,
         use_few_shots=use_few_shots,
+        arithmetic_dataset_root_folder_dir=arithmetic_dataset_root_folder_dir,
+        extractor_arithmetic_ignore_one_line=extractor_arithmetic_ignore_one_line,
     )
 
     eval_dataset = lib_data.prep_dataset_rl(
@@ -424,6 +485,8 @@ def main(
         question_suffix=causal_question_suffix,
         split=lib_utils.CVSets.VALID,
         use_few_shots=use_few_shots,
+        arithmetic_dataset_root_folder_dir=arithmetic_dataset_root_folder_dir,
+        extractor_arithmetic_ignore_one_line=extractor_arithmetic_ignore_one_line,
     )
     
     ###########################################################################
@@ -447,13 +510,16 @@ def main(
         tokenizer=forward_tokenizer,
         **trainer_kwargs,
     )
-
-    metric_accuracy, reward_fn = lib_eval.make_metric_and_reward_fn(
+    
+    metrics, reward_fn = lib_eval.make_metric_and_reward_fn(
         accelerator_device=ppo_trainer.accelerator.device,
         accelerator_num_processes=ppo_trainer.accelerator.num_processes,
+        dataset_name=dataset_name,
+        dataset=dataset,
+        extractor=dataset.get_extractor(),
+        pad_token=forward_tokenizer.pad_token,
         reward_type=reward_type,
         task_name=task_name,
-        extractor=dataset.get_extractor(),
         use_peft=use_peft,
     )
 
@@ -472,7 +538,7 @@ def main(
         eval_subset_size     = eval_subset_size,
         forward_tokenizer    = forward_tokenizer,
         inference_gen_kwargs = inference_gen_kwargs,
-        metric_accuracy      = metric_accuracy,
+        metrics              = metrics,
         prediction_tokenizer = prediction_tokenizer,
         reward_fn            = reward_fn,
         split                = lib_utils.CVSets.TRAIN,
@@ -489,7 +555,7 @@ def main(
         forward_tokenizer    = forward_tokenizer,
         eval_subset_size     = eval_subset_size,
         inference_gen_kwargs = inference_gen_kwargs,
-        metric_accuracy      = metric_accuracy,
+        metrics              = metrics,
         prediction_tokenizer = prediction_tokenizer,
         reward_fn            = reward_fn,
         split                = lib_utils.CVSets.VALID,
@@ -506,22 +572,17 @@ def main(
     # Training Loop
     ###########################################################################
 
-    epoch_counts = collections.defaultdict(lambda: -1)
+    epoch_count = -1
     training_logger = lib_trl_utils.RLTrainingLogger()
 
     for epoch in itertools.count():
-        if epoch < value_model_pretrain_amount:
-            training_state = TrainingState.VALUE_MODEL_PRETRAINING
-        else:
-            training_state = TrainingState.REGULAR_TRAINING
 
-        epoch_counts[training_state] += 1
+        epoch_count += 1
 
         for batch_idx, batch in enumerate(
             lib_utils.progress(
                 description=(
-                    f"{training_state} "
-                    f"Epoch {epoch_counts[training_state]}, "
+                    f"Epoch {epoch_count}, "
                     f"Global Epoch: {epoch}"
                     ),
                 disable=True,
@@ -537,11 +598,11 @@ def main(
             ############################################################
 
             if eval_every and batch_idx % eval_every == 0:
-                rich.print("[red bold]DOING EVAL: [white]TRAIN SET")
+                if RANK == 0: rich.print("[red bold]DOING EVAL: [white]TRAIN SET")
                 train_eval()
-                rich.print("[red bold]DOING EVAL: [white]EVAL SET")
+                if RANK == 0: rich.print("[red bold]DOING EVAL: [white]EVAL SET")
                 eval_eval()
-                rich.print("[red bold]DONE WITH EVAL")
+                if RANK == 0: rich.print("[red bold]DONE WITH EVAL")
 
             outputs = lib_trl_utils.generate(
                 accelerator                  = ppo_trainer.accelerator, 
@@ -562,19 +623,17 @@ def main(
                 responses=outputs.response_text,
             )
 
-            metric_output = metric_accuracy(
-                batch=batch,
-                responses=outputs.response_text,
-            )
 
             ###########################################################################
             # Print Rewards
             ###########################################################################
             lib_trl_utils.log_reward(
                 accelerator   = ppo_trainer.accelerator,
+                batch         = batch,
                 batch_idx     = batch_idx,
                 epoch         = epoch,
-                metric_output = metric_output,
+                metrics       = metrics,
+                response_text = outputs.response_text,
                 reward_output = reward_output,
             )
 
@@ -590,11 +649,11 @@ def main(
                 lib_trl_utils.check_all_start_with_token_id(
                     outputs.response_tensors, pad_token_id)
 
-            lib_trl_utils.check_max_qty_of_token_id(
-                list_of_sequences=outputs.response_tensors,
-                max_qty=1,
-                token_id=eos_token_id,
-            )
+            # lib_trl_utils.check_max_qty_of_token_id(
+            #     list_of_sequences=outputs.response_tensors,
+            #     max_qty=1,
+            #     token_id=eos_token_id,
+            # )
 
             # There should be no pad_token_ids, but the pad
             # token id might be the eos token id, so we can't
@@ -606,7 +665,7 @@ def main(
                     token_id=pad_token_id,
                 )
 
-            print(f"{RANK} ppo_trainer.step >>>")
+            if RANK == 0: print(f"{RANK} ppo_trainer.step >>>")
 
             step_kwargs = {}
             if trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
@@ -619,10 +678,7 @@ def main(
                 **step_kwargs,
             )
 
-
-
-
-            print(f"{RANK} ppo_trainer.step done <<<")
+            if RANK == 0: print(f"{RANK} ppo_trainer.step done <<<")
 
             # Log stats
             assert isinstance(reward_output.values, list), type(reward_output.values)

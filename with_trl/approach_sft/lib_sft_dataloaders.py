@@ -66,7 +66,7 @@ def get_dataloaders(
             split                   = cv_set,
             question_prefix         = None, 
             question_suffix         = None,
-            sft_simple_mode         = True,
+            sft_mode         = True,
             use_few_shots           = False,
             shuffle_once            = cv_set != lib_utils.CVSets.TRAIN,
         ) for cv_set in lib_utils.CVSets

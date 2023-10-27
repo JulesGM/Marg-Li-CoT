@@ -35,6 +35,7 @@ class DatasetChoices(str, enum.Enum):
     GSM8K = "gsm8k"
     COMMONSENSEQA_MC = "commonsenseqa_mc"
     SENTIMENT = "sentiment"
+    ARITHMETIC = "arithmetic"
 
 
 DATASET_KEY_TO_CLASS = {
@@ -58,7 +59,7 @@ def data_item_collator(
     
     new_batch = lib_base_classes.DataListContainer()
     for item in batch:
-        for k, v in vars(item).items():
+        for k, v in item.items():
             vars(new_batch)[k].append(v)
 
     return new_batch
@@ -75,6 +76,8 @@ def prep_dataset_rl(
     question_suffix: str,
     split: str,
     use_few_shots: int,
+    arithmetic_dataset_root_folder_dir: Optional[str],
+    extractor_arithmetic_ignore_one_line,
 ) -> libs_data.lib_base.Dataset:
     split = lib_utils.CVSets(split)
 
@@ -117,10 +120,27 @@ def prep_dataset_rl(
         )
 
     elif dataset_name == DatasetChoices.SENTIMENT:
+        assert False
         dataset = libs_data.lib_sentiment.SentimentData(
             any_tokenizer=any_tokenizer, 
             split=split,
         )
+
+    elif dataset_name == DatasetChoices.ARITHMETIC:
+        dataset = libs_data.lib_arithmetic.Arithmetic(
+            dataset_root_folder_dir=arithmetic_dataset_root_folder_dir,
+            any_tokenizer   = any_tokenizer,
+            eos_token       = any_tokenizer.eos_token,
+            pad_token       = any_tokenizer.pad_token,
+            question_prefix = None,
+            question_suffix = None,
+            sft_mode = False,
+            shuffle_once    = False,
+            split           = split,
+            use_few_shots   = True,
+            extractor_ignore_one_line = extractor_arithmetic_ignore_one_line,
+        )
+
     else:
         raise ValueError(f"Unsupported task: {dataset_name}")
 

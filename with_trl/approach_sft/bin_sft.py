@@ -44,6 +44,7 @@ SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 sys.path.append(str(SCRIPT_DIR.parent))
 
 import lib_base_classes
+import lib_constant
 import lib_trl_utils
 import lib_metric
 import lib_utils
@@ -99,7 +100,7 @@ DEFAULT_N_BATCHES_PREDICT_TRAIN = 50
 DEFAULT_PEFT_DO_ALL_LIN_LAYERS = True
 DEFAULT_MASK_QUERY = False
 DEFAULT_FILTER_OUT_BAD = True
-DEFAULT_LEARNING_RATE = 10 ** -3.5
+DEFAULT_LEARNING_RATE = 10 ** -4
 
 DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
 DEFAULT_GEN_KWARGS = dict(
@@ -126,7 +127,7 @@ DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "sft_output"
 DEFAULT_WANDB_PROJECT_NAME = "sft_arithmetic"
 DEFAULT_WANDB_ENTITY = "julesgm"
 DEFAULT_NUM_EPOCHS = 1000
-DEFAULT_QTY_EVAL_SMALL = 50
+DEFAULT_QTY_EVAL_SMALL = 150
 DEFAULT_BATCH_TABLE_PRINT_QTY = 2
 DEFAULT_PREDICT_QTY_PRINT = 2
 DEFAULT_PEFT_CONFIG = dict(
@@ -137,6 +138,7 @@ DEFAULT_PEFT_CONFIG = dict(
     bias="none",
     task_type=peft.TaskType.CAUSAL_LM,
 )
+
 
 ########################################################################
 def empty_cache(accelerator):
@@ -292,7 +294,7 @@ def step(
 
     if RANK == 0 and log:
         wandb.log(
-            {f"{cv_set.value}/loss": loss_logging.item()}, 
+            {f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/loss": loss_logging.item()}, 
             step=global_step, 
         )
         
@@ -380,7 +382,8 @@ class Evaluator:
         
         if RANK == 0 and log:
             dict_to_log = {
-                f"{self._cv_split.value}/{metric_name}": np.mean(metric_value) 
+                f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/{metric_name}": 
+                np.mean(metric_value) 
                 for metric_name, metric_value in metrics_outputs.items()
             }
 
@@ -434,18 +437,20 @@ class Evaluator:
         if RANK == 0:
             assert "loss" not in metrics
             dict_to_log = {
-                f"{self._cv_split.value}/{metric_name}": np.mean(metric_values)
+                f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/{metric_name}": np.mean(metric_values)
                 for metric_name, metric_values in metrics.items()
             }
             
-            dict_to_log[f"{self._cv_split.value}/loss"] = np.mean(losses)
+            dict_to_log[f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/loss"] = np.mean(losses)
             wandb.log(dict_to_log, step=global_step)
 
 
 class ForwardLogger:
     def __init__(self, *, any_tokenizer, cv_set):
         if RANK == 0:
-            self._table = lib_utils.WandbTableRepair(columns=["epoch", "input"])
+            self._table = lib_utils.WandbTableRepair(
+                wandb_kwargs=dict(columns=["epoch", "input"])
+            )
             self._any_tokenizer = any_tokenizer
             self._cv_set = cv_set
 
@@ -455,7 +460,7 @@ class ForwardLogger:
             idx = random.randint(0, len(batch) - 1)
             self._table.add_data(epoch, self._any_tokenizer.decode(batch[idx]))
             wandb.log(
-                {f"{self._cv_set.value}/forward_logger": self._table.get_loggable_object()}, 
+                {f"{lib_constant.WANDB_NAMESPACE}/{self._cv_set.value}/forward_logger": self._table.get_loggable_object()}, 
                 step=global_step,
             )
 
@@ -698,7 +703,7 @@ def main(
         train_dataset_iterator = iter(dataloaders[lib_utils.CVSets.TRAIN])
 
         if RANK == 0:
-            wandb.log({"epoch": epoch_idx}, step=global_step)
+            wandb.log({f"{lib_constant.WANDB_NAMESPACE}/epoch": epoch_idx}, step=global_step)
 
         """
         We want to evaluate every few batches. We:

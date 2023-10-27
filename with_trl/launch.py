@@ -7,7 +7,7 @@ import subprocess
 import fire
 import nvgpu
 import rich
-
+import rich.panel
 
 MODULE = "accelerate"
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -26,16 +26,29 @@ def main(name, one=False, config_file=SCRIPT_DIR / "accelerate_ddp_no.yaml"):
     assert config_file.exists(), config_file
     # kill_wandb_servers()
 
-    num_processes = 1 if one else len(nvgpu.info())
+    num_processes = 1 if one else len(nvgpu.gpu_info())
     
     command = [
         "accelerate",
         "launch",
         "--num_processes", num_processes,
         "--config_file", config_file,
-        SCRIPT_PATH,
-        name
     ]
+    if one:
+        command += [
+            "--no_python",
+            "python",
+            "-m",
+            "ipdb",
+            "-c",
+            "continue",
+        ]
+
+    command += [
+        SCRIPT_PATH,
+        name,
+    ]
+    
     command = list(map(str, command))
 
     rich.print(rich.panel.Panel(

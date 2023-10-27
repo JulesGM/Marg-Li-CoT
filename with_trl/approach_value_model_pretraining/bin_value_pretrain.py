@@ -1,11 +1,11 @@
 print("Starting bin_value_pretrain.py")
 import os
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
-os.environ["DATASETS_VERBOSITY"] = "warning"
-os.environ["WANDB_SILENT"] = "true"
-os.environ["NCCL_DEBUG"] = "WARN"
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
+# os.environ["DATASETS_VERBOSITY"] = "warning"
+# os.environ["WANDB_SILENT"] = "true"
+# os.environ["NCCL_DEBUG"] = "WARN"
 
 DETERMINISTIC = False
 if DETERMINISTIC:
@@ -16,6 +16,7 @@ import datetime
 import enum
 import itertools as it
 import json
+import logging
 import pathlib
 import random
 import shutil
@@ -42,11 +43,11 @@ import wandb
 SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 sys.path.append(str(SCRIPT_DIR.parent))
 
-import lib_utils
+import lib_constant
 import lib_data
-import logging
-import lib_trl_utils
 import lib_eval
+import lib_trl_utils
+import lib_utils
 
 
 datasets.disable_caching()
@@ -54,11 +55,11 @@ RANK = int(os.getenv("RANK", 0))
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", 0))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 
-datasets.logging.set_verbosity_warning()
-transformers.logging.set_verbosity_warning()  # type: ignore
-logging.getLogger("datasets").setLevel(logging.WARNING)
-logging.getLogger("transformers").setLevel(logging.WARNING)
-logging.getLogger("deepspeed").setLevel(logging.WARNING)
+# datasets.logging.set_verbosity_warning()
+# transformers.logging.set_verbosity_warning()  # type: ignore
+# logging.getLogger("datasets").setLevel(logging.WARNING)
+# logging.getLogger("transformers").setLevel(logging.WARNING)
+# logging.getLogger("deepspeed").setLevel(logging.WARNING)
 
 np.random.seed(0)
 random.seed(1)
@@ -429,7 +430,7 @@ class ValueModelPretrainer:
         # A separator of sorts
         self._wandb_table[cv_set].add_data(*["###" for _ in range(max_len)])
         self._console.print(rich_table)
-        wandb.log({f"{cv_set.value}/table": self._wandb_table[cv_set]}, step=global_step)
+        wandb.log({f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/table": self._wandb_table[cv_set]}, step=global_step)
 
     def step(
         self,
@@ -520,11 +521,11 @@ class ValueModelPretrainer:
             if RANK == 0 and do_log:
 
                 wandb.log({
-                    f"{cv_set.value}/value_loss": loss, 
+                    f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/value_loss": loss, 
                 }, step=global_step)
 
                 for k, v in metrics_outputs.items():
-                    wandb.log({f"{cv_set.value}/{k}": v}, step=global_step)
+                    wandb.log({f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/{k}": v}, step=global_step)
 
             ###########################################################################
             # Print Rewards

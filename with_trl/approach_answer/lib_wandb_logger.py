@@ -5,6 +5,7 @@ import more_itertools as mit
 import rich
 import rich.table
 import wandb
+import lib_constant
 
 class WandbLoggingState:
     def __init__(self, any_tokenizer, split, also_print):
@@ -34,8 +35,9 @@ class WandbLoggingState:
         for clean_text, raw_text, sample in mit.zip_equal(
             clean_output_text, raw_output_text, batch,
         ):
-            end_of_few_shots = sample["ref_fs_scratchpad_gen_query_detok"].rfind("Q:")
-            sample_specific = sample["ref_fs_scratchpad_gen_query_detok"][end_of_few_shots:]
+            ref_sp = sample["ref_fs_scratchpad_gen_query_detok_not_skip"]
+            end_of_few_shots = ref_sp.rfind("Q:")
+            sample_specific = ref_sp[end_of_few_shots:]
 
             self._table.add_data(
                 batch_idx,
@@ -56,8 +58,8 @@ class WandbLoggingState:
         rich.print(self._rich_table)
         
         try:
-            wandb.log({f"{self._split}/batch": self._table})
-            wandb.log({f"{self._split}/just_clean_gen": self._table_just_clean_gen})
+            wandb.log({f"{lib_constant.WANDB_NAMESPACE}/{self._split}/batch": self._table})
+            wandb.log({f"{lib_constant.WANDB_NAMESPACE}/{self._split}/just_clean_gen": self._table_just_clean_gen})
         except Exception as e:
             rich.print(f"[red bold]{e}")
             rich.print(f"Wandb logging failed. Continuing without logging.")
