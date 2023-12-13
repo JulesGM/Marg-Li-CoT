@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import contextlib
+import math
 import enum
+import jsonlines as jl
 import os
 import pathlib
 import typing
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import accelerate
 import more_itertools as mit
@@ -98,6 +102,76 @@ class ValidPrecisions(enum.Enum):
         return super().__eq__(value)
 
 
+
+def readable(obj, title="", outer_kwargs=None, is_inner=False):
+    assert isinstance(obj, (dict, list, tuple)), type(obj)
+
+    if outer_kwargs is None:
+        outer_kwargs = {}
+
+    if is_inner:
+        kwargs = dict(
+            show_edge   = True,
+            show_footer = False,
+            show_header = False,
+            # show_lines = True,
+        )
+    else:
+        kwargs = dict(
+            show_header = True,
+            show_edge   = True,
+            show_footer = False,
+            # show_lines = True,
+            
+        )
+
+    dict_mode = isinstance(obj, dict)
+    
+    if dict_mode:
+        fields = ["Keys", "Values"]
+    else:
+        assert isinstance(obj, (tuple, list))
+        fields = ["Values"]
+
+    if title:
+        title = f"{title}: "
+
+    table = rich.table.Table(
+        *fields,
+        highlight=True, 
+        expand=True,
+        title=title + (
+            "Dict" 
+            if dict_mode 
+            else type(obj).__name__
+        ),
+        title_justify="left",
+        **kwargs,
+    )
+
+    def should_nest(v):
+        is_collection = isinstance(v, (dict, list, tuple))
+        return is_collection and not len(v) == 0
+
+    if dict_mode:
+        for k, v in sorted(obj.items(), key=lambda kv: kv[0]):
+            if should_nest(v):
+                table.add_row(str(k), readable(v, title=k, is_inner=True))
+            else:
+                table.add_row(str(k), rich.markup.escape(str(v)))
+    else:
+        for v in obj:
+            if should_nest(v):
+                table.add_row(readable(v, is_inner=True))
+            else:
+                table.add_row(rich.markup.escape(str(v)))
+
+    if not is_inner:
+        rich.print(table)
+
+    return table
+
+
 def line_return_token(any_tokenizer):
     candidate = mit.one(any_tokenizer("\n").input_ids)
     assert isinstance(candidate, int), type(candidate)
@@ -122,7 +196,12 @@ def not_last_token(*, tensor, predict_tokenizer):
 
 
 def progress(seq, description, total=None, disable=False):
-    yield from tqdm(seq, desc=description, total=total, disable=disable)
+    yield from tqdm(
+        seq, 
+        desc    = description, 
+        total   = total, 
+        disable = disable
+    )
 
 
 def child_names(pt_module):
@@ -134,18 +213,28 @@ def print_accelerate_envs():
         keys = [k for k in sorted(os.environ) if "accelerate" in k.lower()]
 
         table = rich.table.Table(
-            "Key", "Value", title="Accelerate Environment Variables"
+            "Key", 
+            "Value", 
+            highlight     = True,
+            show_header   = False,
+            title         = " Accelerate Environment Variables:",
+            title_justify = "left",
         )
+
         for k in keys:
             if "accelerate" in k.lower():
                 form_k = k.replace(
                     "DEEPSPEED",
                     "[green]DEEPSPEED[/]",
                 )
-                table.add_row(form_k, os.environ[k])
-        table.caption = str(len(table.rows))
-        rich.print(table)
 
+                table.add_row(
+                    rich.markup.escape(str(form_k)), 
+                    rich.markup.escape(str(os.environ[k]))
+                )
+
+        print()
+        rich.print(table)
 
 @contextlib.contextmanager
 def maybe_context_manager(caller, disable):
@@ -272,36 +361,129 @@ def get_tmp_dir() -> pathlib.Path:
     return tmp_dir
 
 
+def is_valid_simple_filename(filename):
+    assert isinstance(filename, str), type(filename)
+    
+    for char in filename:
+        if not char.isalnum() and not char in "_-":
+            return False
+        
+    return True
+
+
 class WandbTableRepair:
-    def __init__(self, *, wandb_args=None, wandb_kwargs=None, new_table_mode=False):
-        if wandb_args is None:
-            wandb_args = []
+    def __init__(
+            self, *, 
+            columns:         list[str],
+            new_table_mode:  bool                     = False,
+            run_output_path: str | pathlib.Path       = None,
+            save_to_file:    bool                     = False,
+            table_name:      str,
+            wandb_on:        bool                     = False,
+            wandb_kwargs:    Optional[dict[str, Any]] = None, 
+        ):
+
+        #######################################################################
+        # Checks
+        #######################################################################
+        assert isinstance(wandb_on, bool), type(wandb_on)
         if wandb_kwargs is None:
             wandb_kwargs = {}
-        self._creation_args = wandb_args
+
+        if save_to_file:
+            if not is_valid_simple_filename(table_name):
+                raise ValueError(
+                    "table_name must be a valid simple filename, " +
+                    f"so alphanum or _-. Got {table_name}"
+                )
+            self._file_path = pathlib.Path(run_output_path) / f"{table_name}.jsonl"
+        else:
+            self._file_path = None
+
+        #######################################################################
+        # Action
+        #######################################################################
+        self._columns_list    = list(columns)
+        self._columns_keys    = set (columns)
         self._creation_kwargs = wandb_kwargs
-        self._new_table_mode = new_table_mode
-        self._table = wandb.Table(*wandb_args, **wandb_kwargs)
+        self._new_table_mode  = new_table_mode
+        self._save_to_file    = save_to_file
+        
+        assert not wandb_on
+        self._wandb_on        = wandb_on
+        
+        if wandb_on:
+            self._table = wandb.Table(columns=columns, **wandb_kwargs)
+        else:
+            self._table = None
 
     def add_data(self, *args, **kwargs):
-        self._table.add_data(*args, **kwargs)
+        assert bool(args) ^ bool(kwargs), (
+            args, kwargs)
 
+        if self._wandb_on:
+            if not args:
+                args = self._dict_to_list(kwargs)
+            self._table.add_data(*args)
+
+        if not kwargs:
+            kwargs = self._list_to_dict(args)
+
+        if self._save_to_file:
+            self._write_to_file(kwargs)
+        
     def get_loggable_object(self):
-        if self._new_table_mode:
-            table_to_return = self._table
-            self._table = wandb.Table(
-                *self._creation_args, 
-                **self._creation_kwargs, 
-                data=self._table.data,
-            )
+        if self._wandb_on:
+            if self._new_table_mode:
+                table_to_return = self._table
+                self._recreate_table(self)
+            else:
+                table_to_return = self._table
         else:
-            table_to_return = self._table
+            table_to_return = None
 
         return table_to_return
     
+    def _list_to_dict(self, values):
+        return {
+            column_name: value 
+            for column_name, value 
+            in mit.zip_equal(self._columns_list, values)
+        }
+    
+    def _dict_to_list(self, values):
+        return [
+            values[column_name] 
+            for column_name 
+            in self._columns_list
+        ]
+
+    def _write_to_file(self, dict_values):
+        # We don't want multiple processes trying to write to the file.
+        assert isinstance(dict_values, dict), type(dict_values)
+
+        assert RANK == 0, RANK 
+        with jl.open(self._file_path, "a") as f:
+            f.write(dict_values)
+
+    def _recreate_table(self):
+        assert self._wandb_on, self._wandb_on
+        self._table = wandb.Table(
+            columns = self._columns_list,
+            data    = self._table.data,
+            **self._creation_kwargs,
+        )
 
 class WandbAndRichTable:
-    def __init__(self, columns, rich_kwargs=None, wandb_kwargs=None):
+    def __init__(
+            self, *, 
+            columns, 
+            new_table_mode,
+            table_name,
+            run_output_path,
+            rich_kwargs  = None, 
+            wandb_kwargs = None,
+        ):
         
         if rich_kwargs is None:
             rich_kwargs = {}
@@ -312,12 +494,24 @@ class WandbAndRichTable:
         self._columns      = columns
         self._rich_kwargs  = rich_kwargs
         self._wandb_kwargs = wandb_kwargs
-        self._rich_table   = rich.table.Table(
+        
+        if "title" not in self._rich_kwargs:
+            self._rich_kwargs["title"] = table_name
+
+        self._rich_table = rich.table.Table(
             *self._columns, 
             **self._rich_kwargs,
         )
+        
+        self._run_output_path = run_output_path
+
         self._wandb_table = WandbTableRepair(
-            wandb_kwargs = dict(columns=columns, **wandb_kwargs)
+            columns         = columns,
+            new_table_mode  = new_table_mode,
+            run_output_path = run_output_path,
+            table_name      = table_name, 
+            wandb_kwargs    = wandb_kwargs,
+            wandb_on        = True,
         )
 
     def add_row(self, *args, **kwargs):
@@ -389,3 +583,36 @@ def compute_and_gather_metrics(
     del first_local_metric_values
 
     return gathered_values, local_metric_values
+
+
+def check_curriculum_schedule(curriculum):
+    # Check that distributions sum to 1
+    for num_steps, difficulty_distribution in curriculum:
+        if not math.isclose(sum(difficulty_distribution.values()), 1.):
+            raise ValueError(
+                "Difficulty distributions must sum to 1. "
+                f"{num_steps = }, {difficulty_distribution =}"
+            )
+        
+    # Check that the number of steps are integers and  strictly increasing
+    if not curriculum[0][0] == 0:
+        raise ValueError(
+            f"First step must be 0. {curriculum[0][0] = }"
+        )
+    
+    for i in range(1, len(curriculum)):
+        current_curriculum_step = curriculum[i][0]
+        previous_curriculum_step = curriculum[i - 1][0]
+
+        # Check that the number of steps are integers
+        if not isinstance(current_curriculum_step, int):
+            raise ValueError(
+                f"Number of steps must be integers. {curriculum[i][0] = }"
+            )
+        # Check that the number of steps are strictly increasing
+        if not current_curriculum_step > previous_curriculum_step:
+            raise ValueError(
+                f"Number of steps must be strictly increasing. {curriculum[i][0] = }"
+            )
+
+    return curriculum

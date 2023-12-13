@@ -75,8 +75,11 @@ def predict_table(
         )
 
     wandb.log({
-        f"{lib_constant.WANDB_NAMESPACE}/{split.value}/predictions_table": wandb_and_rich_table.get_loggable_object()
-        }, step=global_step)
+            f"{lib_constant.WANDB_NAMESPACE}/{split.value}/predictions_table": 
+            wandb_and_rich_table.get_loggable_object()
+        }, 
+        step=global_step,
+    )
     
 
 

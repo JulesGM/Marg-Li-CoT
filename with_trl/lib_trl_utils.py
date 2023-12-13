@@ -1,8 +1,9 @@
+import bisect
 import collections
 import contextlib
-import copy
-from dataclasses import dataclass
+import dataclasses
 import itertools
+import math
 import more_itertools as mit
 import os
 import pathlib
@@ -51,26 +52,36 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
 def generate(
         *, 
-        accelerator, 
+        accelerator,
         answer_extractor,
-        batch, 
+        batch,
         batch_size,
         dataset_name,
-        generation_kwargs, 
-        policy_model, 
+        generation_kwargs,
+        policy_model,
         post_process_gen_fewshots_fn,
         prediction_tokenizer,
         task_name,
         use_few_shots,
-        
+        step_information,
     ):
     
-    print(f"{RANK} lib_trl_utils.batched_unroll >>>")
+    """
+    
+    step_information = dict(
+        trainer_step = ppo_trainer.current_step,
+        batch_idx    = batch_idx,
+        epoch_idx    = epoch, 
+    )
 
-    raw_gen_outputs = batched_unroll(
+    """
+    
+    print(f"[RANK: {RANK}] lib_trl_utils.batched_unroll: ({step_information = }) >>>")
+    raw_gen_outputs, scores = batched_unroll(
         accelerated_model = policy_model,
         accelerator       = accelerator,
         dataset_name      = dataset_name, 
+        difficulty_levels = batch.difficulty_level,
         generation_kwargs = generation_kwargs,
         post_process_gen_fewshots_fn = post_process_gen_fewshots_fn,
         prediction_tokenizer         = prediction_tokenizer,
@@ -83,14 +94,16 @@ def generate(
     if task_name == lib_utils.Task.MAIN:
         outputs = keep_good_one_generation(
             num_return_seq=generation_kwargs["num_return_sequences"],
-            other_rewards=None,
+            other_rewards=dict(scores=scores),
             generations=raw_gen_outputs,
             ref_answers=batch.detok_ref_answer,
             batch_size=batch_size,
             prediction_tokenizer=prediction_tokenizer,
             answer_extractor=answer_extractor,
+            difficulty_levels=batch.difficulty_level,
         )
     else:
+        assert False
         assert task_name == lib_utils.Task.SENTIMENT, task_name
         assert (
             generation_kwargs["num_return_sequences"] == 1
@@ -156,12 +169,13 @@ def check_max_qty_of_token_id(
 def keep_good_one_generation(
     *,
     num_return_seq: int,
-    other_rewards: Optional[torch.Tensor],
-    generations: lib_base_classes.BatchedUnrollReturn,
     ref_answers: Union[list[list[str]], torch.Tensor],
     batch_size: int,
     prediction_tokenizer: Optional[transformers.PreTrainedTokenizerBase],  # type: ignore
     answer_extractor,
+    other_rewards: Optional[torch.Tensor],
+    generations: lib_base_classes.BatchedUnrollReturn,
+    difficulty_levels: list[int],
 ) -> lib_base_classes.BatchedUnrollReturn:
     """
 
@@ -196,54 +210,80 @@ def keep_good_one_generation(
     selections = []
 
     table = rich.table.Table(
+        "Difficulty Level",
         "Ref Comparable", 
         "Generated answers", 
         "Lengths", 
-        "<eos>?",
         "Ratio Good",
-        title="keep_good_one_generation", 
+        title=f"(RANK={RANK}) keep_good_one_generation", 
         show_lines=True,
+        expand=True,
     )
     ratios_good = []
 
     for b_idx in range(batch_size):
+        
+        # Extract the reference answer
         ref_comparable = answer_extractor(ref_answers[b_idx])
         assert ref_comparable is not None, ref_answers[b_idx]
 
-        generated_answers = [answer_extractor(gen) for gen in array_response_text[b_idx]]
+        # Extract the generated answers
+        gen_answ_beams = [answer_extractor(gen) for gen in array_response_text[b_idx]]
+        is_good_beams = [gen == ref_comparable for gen in gen_answ_beams]
+        ratio_good_beams = np.mean(np.array(is_good_beams, dtype=np.float32))
+        values_to_counts = collections.Counter(x for x in gen_answ_beams)
 
-        goods = [gen == ref_comparable for gen in generated_answers]
-        # goods_str = " ".join([f"[green]{g}[/]" if g else str(g) for g in goods])
-        ratio = np.mean(np.array(goods, dtype=np.float32))
+        # Count the length of the generated tokens
+        lengths = collections.Counter(len(x) for x in response_tensors[b_idx])
+        length = more_itertools.one(lengths.keys())
 
-        # table.add_row("[bold white on red]Ref Answer",        f"{ref_answers[b_idx]}")
+        inner_table = rich.table.Table(
+            expand        = True,
+            show_edge     = False,
+            show_footer   = False,
+            title_justify = "center",
+        )
+        inner_table.add_column(  "Gen", justify="left")
+        inner_table.add_column("Count", justify="left")
+
+        for val, count in values_to_counts.most_common():
+            inner_table.add_row(val, str(count))
+        
         table.add_row(
+            rich_escape(difficulty_levels[b_idx]),
             rich_escape(ref_comparable),
-            rich_escape(collections.Counter(x for x in generated_answers)),
-            rich_escape(collections.Counter(len(x) for x in response_tensors[b_idx])),
-            rich_escape(collections.Counter(prediction_tokenizer.eos_token in x for x in array_response_text[b_idx])),
-            f"[green]{ratio:0.2%}[/] or [green]{np.sum(goods)}[/]/[green]{len(goods)}[/]",
+            inner_table,
+            rich_escape(length),
+            f"[green]{ratio_good_beams:0.2%}[/] or " + 
+            f"[green]{np.sum(is_good_beams)}[/]/[green]{len(is_good_beams)}[/]",
         )
 
-        if any(goods):
+        if any(is_good_beams):
             # Return the good with the max other reward
-            good_idx = [i for i, g in enumerate(goods) if g]
+            good_idx = [i for i, g in enumerate(is_good_beams) if g]
             if other_rewards:
-                good_rewards = other_rewards[b_idx][torch.tensor(good_idx)]
+                good_rewards = other_rewards["scores"][b_idx][torch.tensor(good_idx)]
                 selection = torch.argmax(good_rewards)
             else:
+                assert False
                 good_idx_id = torch.randint(0, len(good_idx), (1,))
                 selection = good_idx[good_idx_id]
         else:
             # Return the one with the max other reward
             if other_rewards:
-                selection = torch.argmax(other_rewards[b_idx])
+                selection = torch.argmax(other_rewards["scores"][b_idx])
             else:
                 selection = torch.randint(0, num_return_seq, (1,))[0]
+                
         selections.append(selection)
-        ratios_good.append(ratio)
+        ratios_good.append(ratio_good_beams)
 
-    table.caption = f"Ratio Average: {np.mean(ratios_good):0.2%}, At least one good ratio: {np.mean([ratio > 0 for ratio in ratios_good]):0.2%}"
+    ratio_avg = np.mean(ratios_good)
+    at_least_one_good = np.mean([ratio > 0 for ratio in ratios_good])
+    table.caption = (
+        f"Ratio Average: {ratio_avg:0.2%}, " +
+        f"At least one good ratio: {at_least_one_good:0.2%}"
+    )
 
     rich.print(table)
 
@@ -267,36 +307,20 @@ def keep_good_one_generation(
         raw_response_tensors=output_raw_generation_tensors,
     )
 
-
-class RLTrainingLogger:
-    def __init__(self):       
-        self._table = lib_utils.WandbTableRepair(
-            wandb_kwargs=dict(
-                columns=["Epoch", "Model Input", "Model Output", "Reward",]
-            )
-        )
-
-    def log(self, *, epoch, model_input, model_output, reward):
-        if RANK == 0:
-            idx = random.randint(0, len(model_input) - 1)
-            self._table.add_data(epoch, model_input[idx], model_output[idx], reward[idx],)
-            wandb.log({
-                f"{lib_constant.WANDB_NAMESPACE}/TrainingSamples": 
-                self._table.get_loggable_object()
-            })
-
-
 def print_table(
     *,
-    generation_kwargs,
+    call_source: str,
     extra_columns: Optional[dict[str, list]] = None,
+    difficulty_levels: list[int],
+    generation_kwargs,
     log_header: str,
-    responses: list[str],
-    queries: list[str],
-    rewards: list[float],
     name: str,
     qty: int,
+    queries: list[str],
+    responses: list[str],
+    rewards: list[float],
 ):
+    
     if extra_columns is None:
         extra_columns = {}
 
@@ -308,16 +332,22 @@ def print_table(
         assert len(v) == len(rewards), f"{k = } {len(v) = } {len(rewards) = }"
 
     table = rich.table.Table(
-        "Query",
-        "Response",
+        "Difficulty Level",
+        "Training Query",
+        "Training Response",
         "Reward",
         *extra_columns.keys(),
         show_lines=True,
-        title=f"{rich_escape(name)} - {rich_escape(log_header)} - Samples:",
+        title=(
+            f"{rich_escape(name)} - " +
+            f"{rich_escape(log_header)} - " +
+            f"<{call_source}>.lib_trl_utils.print_table(...): Samples:"
+        ),
     )
 
-    for query, response, reward, *extra in itertools.islice(
+    for difficulty_level, query, response, reward, *extra in itertools.islice(
         more_itertools.zip_equal(
+            difficulty_levels,
             queries,
             responses,
             rewards,
@@ -331,6 +361,7 @@ def print_table(
             rindex = 0
         
         table.add_row(
+            rich_escape(difficulty_level),
             f"[black on white]{rich_escape(query[rindex:])}",
             f"[black on white]{rich_escape(response)}",
             f"{reward:0.3}",
@@ -341,8 +372,8 @@ def print_table(
         kwargs_table = rich.table.Table("Key", "Value", title="Gen Kwargs")
         for k, v in generation_kwargs.items():
             kwargs_table.add_row(rich.markup.escape(str(k)), rich.markup.escape(str(v)))
-        
         rich.print(kwargs_table)
+        
         rich.print(table)
 
 
@@ -404,9 +435,9 @@ def print_trainable_parameters(
 
 def load_then_peft_ize_model(
     *,
-    precision: lib_utils.ValidPrecisions,
     peft_config_dict,
     peft_do_all_lin_layers: bool,
+    precision: lib_utils.ValidPrecisions,
     model_name: str,
     use_peft: bool,
     forward_tokenizer: transformers.PreTrainedTokenizer,
@@ -808,11 +839,115 @@ def init_model(
     raise ValueError(f"{trl_library_mode = }")
 
 
+
+class CurriculumSchedule:
+    @dataclasses.dataclass(frozen=True)
+    class CurriculumEntry:
+        """
+        Only steps are comparable
+        """
+
+        step: int
+        proportions: dict[int, float]
+
+        def __post_init__(self):
+            # Make sure the proportions sum to approx 1
+            self.check()
+
+        def check(self) -> None:
+            sum_ = sum(self.proportions.values()) 
+            assert math.isclose(sum_, 1), sum_
+            # Check types
+            assert isinstance(self.step, int), type(self.step)
+            assert isinstance(self.proportions, dict), type(self.proportions)
+            assert all(
+                isinstance(x, int) 
+                for x in self.proportions
+            ), type(self.proportions)
+            assert all(
+                isinstance(x, float) 
+                for x in self.proportions.values()
+            ), type(self.proportions)
+
+    CE = CurriculumEntry
+
+    def __init__(self, entries: list[CE]=None, literals=None):
+        # Make sure the indices are strictly increasing
+        # and start at 0
+        assert entries or literals, (entries, literals)
+        assert not (entries and literals), (entries, literals)
+        if not entries:
+            assert isinstance(literals, list), literals
+            assert all(isinstance(x, tuple) for x in literals), literals
+            entries = [self.CE(*x) for x in literals]
+            del literals
+
+        self._entries = entries
+        self.check()
+    
+    def __call__(self, step: int) -> CE:
+        assert isinstance(step, int), type(step)
+
+        # Index of first <= step.
+        index = bisect.bisect_right(
+            [x.step for x in self._entries],
+            step
+        ) - 1
+        entry = self[index]
+
+        assert entry.step <= step, (entry.step, step)
+        not_last = index < len(self._entries) - 1
+
+        if not_last:
+            assert step < self[index + 1].step
+
+        return entry
+ 
+    def __len__(self) -> int:
+        return len(self._entries)
+    
+    def __getitem__(self, index) -> CurriculumEntry:
+        return self._entries[index]
+
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+    
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._entries})>"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    def check(self) -> None:
+        assert all(
+            isinstance(x, self.CE) 
+            for x in self._entries), self._entries
+        assert all(
+            x.step < y.step 
+            for x, y in zip(self._entries, self._entries[1:])
+        ), self._entries
+        assert self._entries[0].step == 0, self._entries[0].step
+        
+    def check(self):
+        for i, entry in enumerate(self._entries):
+            assert entry.step == i, (entry.step, i)
+            assert isinstance(entry.proportions, dict), type(entry.proportions)
+            assert all(
+                isinstance(x, int) 
+                for x in entry.proportions
+            ), type(entry.proportions)
+            assert all(
+                isinstance(x, float) 
+                for x in entry.proportions.values()
+            ), type(entry.proportions)
+
+
 def batched_unroll(
     *,
     accelerated_model,
     accelerator: accelerate.Accelerator,
     dataset_name,
+    difficulty_levels,
     generation_kwargs: dict[str, typing.Any],
     post_process_gen_fewshots_fn,
     prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
@@ -841,35 +976,87 @@ def batched_unroll(
         padding=True,
     ).to(accelerator.device)
 
-    responses = model.generate(
+    model_outputs = model.generate(
         **tokenized,
         **generation_kwargs,
         pad_token_id = prediction_tokenizer.pad_token_id,
+        output_scores=True,
+        return_dict_in_generate=True, 
     )
+    responses = model_outputs.sequences
 
-    if not model.config.is_encoder_decoder:
-        seq_len = tokenized["input_ids"].shape[1]
-        responses = responses[:, seq_len:]
+    assert not model.config.is_encoder_decoder
+
+    in_seq_len = tokenized["input_ids"].shape[1]
+    responses = responses[:, in_seq_len:]
 
     raw_responses = responses
     if task_name == lib_utils.Task.MAIN:
         if (
             dataset_name == lib_data.DatasetChoices.COMMONSENSEQA_MC or 
             dataset_name == lib_data.DatasetChoices.ARITHMETIC
-        ) and use_few_shots:    
+        ) and use_few_shots:
             responses = post_process_gen_fewshots_fn(
                 raw_gen_outputs = responses, 
                 any_tokenizer   = prediction_tokenizer,
             )
         elif use_few_shots:
             raise NotImplemented
-            assert not hasattr(dataset_obj, "post_process_gen_fewshots"), type(dataset_obj).mro()
+            assert not hasattr(dataset_obj, "post_process_gen_fewshots"), (
+                type(dataset_obj).mro())
 
-    return lib_base_classes.BatchedUnrollReturn(
+    outputs = lib_base_classes.BatchedUnrollReturn(
         response_tensors=list(responses),
         raw_response_tensors=list(raw_responses),
         any_tokenizer=prediction_tokenizer,
     )
+
+    ###########################################################################
+    batch_size       = tokenized.input_ids.shape[0]
+    output_length    = model_outputs.sequences.shape[-1]
+    responses        = model_outputs.sequences       .reshape(batch_size, -1, output_length)
+    sequences_scores = model_outputs.sequences_scores.reshape(batch_size, -1)
+    ###########################################################################
+
+    table = rich.table.Table(
+        title="Batch Unroll", 
+        show_lines=True,
+        show_header=False,
+        show_edge=True,
+        highlight=True
+    )
+
+    output_text = np.array(outputs.response_text, dtype=object).reshape(
+        (batch_size, -1)
+    )
+
+    for batch_idx in range(batch_size):
+        
+        sorted_idx = sorted(
+            range(len(sequences_scores[batch_idx])),
+            key     = lambda i: sequences_scores[batch_idx][i],
+            reverse = True,
+        )
+        sorted_texts  = [output_text     [batch_idx][idx] for idx in sorted_idx]
+        sorted_scores = [sequences_scores[batch_idx][idx] for idx in sorted_idx]
+
+        for (seq_idx, val), score in more_itertools.zip_equal(
+            enumerate(sorted_texts), sorted_scores
+        ):
+            
+            score = str(score.item())
+            table.add_row(
+                (f"[bold green]Winner[/]\n" if seq_idx == 0 else "") +
+                f"{difficulty_levels[batch_idx] = } \n"
+                f"{batch_idx = } \n"
+                f"{seq_idx   = } \n"
+                f"{score     = }", 
+                str(val).strip(),
+            )
+
+    rich.print(table)
+
+    return outputs, sequences_scores
 
 
 def unpad(responses, pad_token_id, eos_token_id):
@@ -893,43 +1080,3 @@ def unpad(responses, pad_token_id, eos_token_id):
             )
         final_responses.append(response)
     return final_responses
-
-
-def log_reward(
-    *,
-    accelerator,
-    batch,
-    batch_idx,
-    epoch,
-    metrics,
-    response_text,
-    reward_output,
-):
-    all_rewards = accelerator.gather_for_metrics(
-        torch.tensor(reward_output.values).to(accelerator.device)
-    )
-
-    # gathered_batch_metrics, local_metric_values = lib_utils.compute_and_gather_metrics(
-    #     accelerator   = accelerator, 
-    #     batch         = batch, 
-    #     metrics       = metrics, 
-    #     response_text = response_text, 
-    # )
-
-    rich.print(
-        f"[bold blue]"
-        + f"({RANK}/{WORLD_SIZE}) "
-        + f"({epoch = } {batch_idx = }) "
-        + f"[/][white bold]"
-        + f"Average rewards: "
-        + f"{all_rewards.mean().item():0.4} "
-        + f"+- {all_rewards.std().item():0.1}"
-    )
-
-    if RANK == 0:
-        wandb.log({
-            f"{lib_constant.WANDB_NAMESPACE}/avg_all_rewards": 
-            all_rewards.mean().item()
-        })
-
-

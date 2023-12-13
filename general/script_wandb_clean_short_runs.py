@@ -9,6 +9,7 @@ from typing import *
 
 from beartype import beartype
 import fire
+import inquirer
 import pretty_traceback  # type: ignore
 import rich.markup
 import rich.panel
@@ -23,7 +24,6 @@ with rich.status.Status("Importing wandb...", spinner="monkey"):
 pretty_traceback.install()
 NUM_MINUTES_TO_KEEP = 5
 NORMALIZED_LEN      = 2
-PROJECT_NAME        = None
 FILL_CHAR           = " "
 USERNAME            = "julesgm"
 
@@ -180,30 +180,29 @@ def fetch_projects(username):
     return wandb.Api().projects(username)
         
 
-@beartype
 def main(
+    project:     str  = None,
     *,
-    print_defaults: bool = False,
-    project:   str  = PROJECT_NAME,
-    min_minutes:    int  = NUM_MINUTES_TO_KEEP,
-    username:       str  = USERNAME,
+    min_minutes: int  = NUM_MINUTES_TO_KEEP,
+    username:    str  = USERNAME,
 ):
 
     if project is None:
         projects = fetch_projects(username)
-        rich.print(rich.panel.Panel("You need to pick a project name with [green bold]--project[/] when running the script."))
-        table = rich.table.Table("Project Names")
-        for project in projects:
-            table.add_row("[bold bright_cyan]" + rich.markup.escape(str(project.name)))
-        rich.print(table)
-        return
-    
-
-    if print_defaults:
-        rich.print("[bold white]Defaults:[/]")
-        for k, v in locals().items():
-            rich.print(f"\t- {k}: {v}")
-        exit()
+        # table = rich.table.Table("Project Names")
+        # for project in projects:
+        #     table.add_row("[bold bright_cyan]" + rich.markup.escape(str(project.name)))
+        # rich.print(table)
+        results = inquirer.prompt([
+            inquirer.List(
+                "project_name", 
+                choices=[p.name for p in projects],
+                message="You need to pick a project name:",
+            )
+        ])
+        if not results or not results["project_name"]:
+            return
+        project = results["project_name"]
 
     assert min_minutes < 60, (
         "Use hours if you want more than 59 minutes."

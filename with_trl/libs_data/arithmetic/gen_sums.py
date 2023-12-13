@@ -3,13 +3,17 @@ import random
 import subprocess
 import sys
 import os
+import typing
 
 import fire
 import jsonlines as jl
+import more_itertools
 import rich
 import rich.markup
 import rich.table
+import rich.traceback
 
+rich.traceback.install()
 
 class CVSets(enum.Enum):
     TRAIN = "train"
@@ -36,13 +40,17 @@ def run_cmd(ctx_name, cmd):
     rich.print(f"{header}Done running cmd.")
 
 
-def to_list(num):
-    list_str = list(str(num))
-    return list_str
+def split_num_to_digits(num):
+    return list(str(num))
 
 
-def to_str(num):
-    return "".join(to_list(num))
+def integer_to_str(num, separate_digits, separator):
+
+    if separate_digits:
+        assert isinstance(separator, str), type(separator).mro()
+        return separator.join(split_num_to_digits(num))
+    
+    return str(num)
 
 
 def gen_examples(
@@ -53,6 +61,8 @@ def gen_examples(
         min_digit: int,
         max_digit: int,
         include_scratchpad: bool,
+        separate_digits: bool,
+        separator: typing.Optional[str],
     ):
     
     complete_str = []
@@ -63,8 +73,26 @@ def gen_examples(
 
         first_number  = random.randrange(int(10 ** digits), int(10 ** (digits + 1)))
         second_number = random.randrange(int(10 ** digits), int(10 ** (digits + 1)))
-        input_sum     = f"{to_str(first_number)} + {to_str(second_number)}"
-        resultant_str = f"Input:\n{input_sum}\nTarget:\n"
+        
+        input_first = integer_to_str(
+            first_number, 
+            separator=separator,
+            separate_digits=separate_digits, 
+        )
+        
+        input_second = integer_to_str(
+            second_number, 
+            separator=separator,
+            separate_digits=separate_digits, 
+        )
+
+        input_sum = f"{input_first} + {input_second}"
+
+        resultant_str = (
+            f"Input:\n" +
+            f"{input_sum}\n" +
+            f"Target:\n"
+        )
 
         scratch_pad = None
         if include_scratchpad:
@@ -72,12 +100,19 @@ def gen_examples(
             carry       = 0
             running_sum = ""
 
-            for first_digit, second_digit in reversed(list(zip(
-                to_list(first_number), to_list(second_number)
-            ))):
+            for first_digit, second_digit in reversed(list(
+                more_itertools.zip_equal(
+                    split_num_to_digits(first_number), 
+                    split_num_to_digits(second_number),
+                ))):
             
                 dig_sum      = int(first_digit) + int(second_digit) + carry
-                running_sum  = f"{dig_sum % 10}{running_sum}"
+                
+                if separate_digits:
+                    running_sum  = f"{dig_sum % 10}{separator}{running_sum}"
+                else:
+                    running_sum  = f"{dig_sum % 10}{running_sum}"
+
                 maybe_prev_c = f" + 1 (Previous carry)" if carry else ""
                 carry        = int(dig_sum >= 10)
                 scratch_pad += (
@@ -90,13 +125,21 @@ def gen_examples(
             scratch_pad   += "</scratch>\n"
             resultant_str += scratch_pad
             
-        resultant_str += to_str(first_number + second_number)
+        resultant_str += integer_to_str(
+            first_number + second_number, 
+            separator=separator,
+            separate_digits=separate_digits, 
+        )
         resultant_str += "\n\n"
-        complete_str.append(resultant_str)
+        complete_str.append(resultant_str,)
 
         obj = dict(
             input      = input_sum, 
-            answer     = to_str(first_number + second_number),
+            answer     = integer_to_str(
+                first_number + second_number,
+                separator=separator,
+                separate_digits=separate_digits, 
+            ),
             num_digits = digits,
             scratchpad = scratch_pad,
         )
@@ -113,7 +156,9 @@ def main(
     max_digits          = 5,
     n_samples           = 2000,
     include_scratchpad  = True,
-
+    separate_digits     = True,
+    separator           = " ",
+    
     # For few-shots
     randomized_digits   = False,
     examples_per_prompt = 1, # Num. shots per pool
@@ -151,6 +196,7 @@ def main(
 
                 # Potentially add few-shot scratchpads if not randomized digits
                 if fixed_examples and not randomized_digits:
+                    assert False
                     few_shot_str, few_shot_list_dict = gen_examples(
                         n_examples         = context_examples,
                         digits             = digits,
@@ -172,6 +218,7 @@ def main(
                     n_gen_examples = 1 if fixed_examples else examples_per_prompt
 
                     if fixed_examples:
+                        assert False
                         complete_str += "".join(random.sample(
                             few_shot_str, examples_per_prompt - 1
                         ))
@@ -184,6 +231,8 @@ def main(
                         randomized_digits  = False,
                         min_digit          = None,
                         max_digit          = None,
+                        separate_digits    = separate_digits,
+                        separator          = separator,
                     )
                     
                     for sample_dict in sample_list_dicts:

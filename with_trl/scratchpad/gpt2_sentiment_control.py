@@ -225,7 +225,7 @@ def main(
             ]
 
             #### get response from gpt2
-            output = lib_trl_utils.batched_unroll(
+            output, scores = lib_trl_utils.batched_unroll(
                 generation_kwargs=generation_kwargs,
                 query_tensors=query_tensors,
                 ppo_trainer=ppo_trainer,

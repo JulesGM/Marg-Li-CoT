@@ -12,6 +12,16 @@ class Dataset(abc.ABC, torch.utils.data.Dataset):
         raise NotImplementedError()
 
 
+class IterableDataset(abc.ABC, torch.utils.data.IterableDataset):
+    @abc.abstractmethod
+    def get_extractor(self) -> libs_extraction.lib_base.Extractor:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def use_few_shots(self):
+        raise NotImplementedError()
+
+
 class FewShotMixin(abc.ABC):
     @classmethod
     @abc.abstractclassmethod

@@ -180,8 +180,12 @@ class EvalLoop:
             ), (f"{metric_name}_extract_gen" for metric_name in metrics 
             ), (f"{metric_name}_extract_ref" for metric_name in metrics)
         ))
+
         wandb_table = lib_utils.WandbTableRepair(
-            wandb_kwargs= dict(columns=list(wandb_table_keys)))
+            columns         = wandb_table_keys,
+            table_name      = f"us_{split}_EvalLoop",
+            wandb_kwargs    = dict(columns=list(wandb_table_keys))
+        )
 
         self._accelerated_model    = accelerated_model
         self._accelerator          = accelerator
@@ -204,7 +208,7 @@ class EvalLoop:
         assert use_few_shots is self._raw_dataset.use_few_shots, (
             use_few_shots, self._raw_dataset.use_few_shots)
         
-    def __call__(self):
+    def __call__(self, global_step: int):
         """
         
         1. Unroll
@@ -237,7 +241,7 @@ class EvalLoop:
                 ############################################################
                 # Unroll
                 ############################################################
-                output = lib_trl_utils.batched_unroll(
+                output, scores = lib_trl_utils.batched_unroll(
                     accelerated_model    = self._accelerated_model,
                     accelerator          = self._accelerator,
                     dataset_name         = self._dataset_type,
@@ -344,33 +348,40 @@ class EvalLoop:
                 for metric_name, metric_values in filtered_metrics_values.items():
                     if isinstance(metric_values, dict):
                         metrics_mean.update({
-                            f"us/set_{self._split.value}/{metric_name}_{k}/mean":
+                            f"{metric_name}_{k}-mean":
                             v.mean().item()
                             for k, v in metric_values.items()
                         })
                         metrics_std.update({
-                            f"us/set_{self._split.value}/{metric_name}_{k}/std":
+                            f"{metric_name}_{k}-std":
                             v.std().item()
                             for k, v in metric_values.items()
                         })
+
                     else:
                         if metric_values:
                             metrics_mean.update({
-                                f"us/set_{self._split.value}/{metric_name}/mean": 
+                                f"{metric_name}-mean": 
                                 metric_values.mean().item(),
                             })
                             metrics_std.update({
-                                f"us/set_{self._split.value}/{metric_name}/std": 
+                                f"{metric_name}-std": 
                                 metric_values.std().item(),
                             })
 
-                assert all(key.startswith(f"{lib_constant.WANDB_NAMESPACE}/") for key in metrics_mean)
-                assert all(key.startswith(f"{lib_constant.WANDB_NAMESPACE}/") for key in metrics_std)
-                wandb.log(
-                    {
-                        f"{lib_constant.WANDB_NAMESPACE}/set_{self._split.value}/reward_mean": reward.mean().item(),
-                        f"{lib_constant.WANDB_NAMESPACE}/set_{self._split.value}/reward_std" : reward.std().item(),
-                        f"{lib_constant.WANDB_NAMESPACE}/set_{self._split.value}/table"      : self._wandb_table.get_loggable_object(),
-                    } | metrics_mean | metrics_std
+                ###############################################################
+                # Log
+                ###############################################################
+                to_log = dict(
+                    reward_mean = reward.mean().item(),
+                    reward_std  = reward.std().item(),
+                    table       = self._wandb_table.get_loggable_object(),
+                    **metrics_mean,
+                    **metrics_std,
                 )
+                to_log = {
+                    f"{lib_constant.WANDB_NAMESPACE}_{self._split.value}/{k}": 
+                    v for k, v in to_log.items()
+                }
+                wandb.log(to_log, global_step=global_step)
 

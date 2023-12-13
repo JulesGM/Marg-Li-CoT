@@ -385,7 +385,18 @@ class ValueModelPretrainer:
             vf_losses .detach().cpu(),
         )
 
-    def _show_table(self, *, tokens, values, advantages, returns, rewards, losses, masks, cv_set, global_step):
+    def _show_table(
+            self, *, 
+            tokens, 
+            values, 
+            advantages, 
+            returns, 
+            rewards, 
+            losses, 
+            masks, 
+            cv_set, 
+            global_step,
+        ):
         
         title = f"({cv_set.value}) Value Table:"
         
@@ -402,9 +413,14 @@ class ValueModelPretrainer:
     
 
         if old_wandb_table is not None:
-            self._wandb_table[cv_set] = wandb.Table(columns=[str(i) for i in range(max_len)], data=old_wandb_table.data)
+            self._wandb_table[cv_set] = wandb.Table(
+                columns=[str(i) for i in range(max_len)], 
+                data=old_wandb_table.data,
+            )
         else:
-            self._wandb_table[cv_set] = wandb.Table(columns=[str(i) for i in range(max_len)],)
+            self._wandb_table[cv_set] = wandb.Table(
+                columns=[str(i) for i in range(max_len)],
+            )
 
         assert len(tokens) == len(values    ), (len(tokens), len(values    ))
         assert len(tokens) == len(advantages), (len(tokens), len(advantages))
@@ -430,7 +446,10 @@ class ValueModelPretrainer:
         # A separator of sorts
         self._wandb_table[cv_set].add_data(*["###" for _ in range(max_len)])
         self._console.print(rich_table)
-        wandb.log({f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/table": self._wandb_table[cv_set]}, step=global_step)
+        wandb.log(
+            {f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/table": self._wandb_table[cv_set]}, 
+            step=global_step,
+        )
 
     def step(
         self,
@@ -525,7 +544,10 @@ class ValueModelPretrainer:
                 }, step=global_step)
 
                 for k, v in metrics_outputs.items():
-                    wandb.log({f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/{k}": v}, step=global_step)
+                    wandb.log(
+                        {f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/{k}": v}, 
+                        step=global_step,
+                    )
 
             ###########################################################################
             # Print Rewards

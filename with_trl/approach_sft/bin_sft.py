@@ -460,7 +460,8 @@ class ForwardLogger:
             idx = random.randint(0, len(batch) - 1)
             self._table.add_data(epoch, self._any_tokenizer.decode(batch[idx]))
             wandb.log(
-                {f"{lib_constant.WANDB_NAMESPACE}/{self._cv_set.value}/forward_logger": self._table.get_loggable_object()}, 
+                {f"{lib_constant.WANDB_NAMESPACE}/{self._cv_set.value}_forward_logger": 
+                 self._table.get_loggable_object()}, 
                 step=global_step,
             )
 
@@ -703,7 +704,10 @@ def main(
         train_dataset_iterator = iter(dataloaders[lib_utils.CVSets.TRAIN])
 
         if RANK == 0:
-            wandb.log({f"{lib_constant.WANDB_NAMESPACE}/epoch": epoch_idx}, step=global_step)
+            wandb.log(
+                {f"{lib_constant.WANDB_NAMESPACE}/epoch": epoch_idx}, 
+                step=global_step,
+            )
 
         """
         We want to evaluate every few batches. We:

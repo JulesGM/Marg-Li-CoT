@@ -105,17 +105,24 @@ class BatchedUnrollReturn:
 
 @dataclasses.dataclass
 class DataListContainer:
-    tok_ref_query:         list = dataclasses.field(default_factory=list)
-    tok_ref_answer:        list = dataclasses.field(default_factory=list)
-    tok_ref_scratchpad:    list = dataclasses.field(default_factory=list)
-    detok_ref_query:       list = dataclasses.field(default_factory=list)
-    detok_ref_answer:      list = dataclasses.field(default_factory=list)
-    detok_ref_scratchpad:  list = dataclasses.field(default_factory=list)
-    extra_information:     list = dataclasses.field(default_factory=list)
+    tok_ref_query:        list = dataclasses.field(default_factory=list)
+    tok_ref_answer:       list = dataclasses.field(default_factory=list)
+    tok_ref_scratchpad:   list = dataclasses.field(default_factory=list)
+    detok_ref_query:      list = dataclasses.field(default_factory=list)
+    detok_ref_answer:     list = dataclasses.field(default_factory=list)
+    detok_ref_scratchpad: list = dataclasses.field(default_factory=list)
+    difficulty_level:    list = dataclasses.field(default_factory=list)
+    extra_information:    list = dataclasses.field(default_factory=list)
 
     def __len__(self):
-        one_len = len(self.tok_ref_query)
-        assert all(len(getattr(self, k)) == one_len for k in vars(self).keys())
+        lengths = {k: len(getattr(self, k)) for k in vars(self).keys()}
+        iterator = iter(lengths.values())
+        one_len = next(iterator)
+
+        # `all` defaults to True if the iterator is empty, 
+        # which works in this case.
+        assert all(v == one_len for v in iterator), lengths
+        
         return len(self.tok_ref_query)
 
     @classmethod
@@ -180,7 +187,8 @@ class DataItemContainer:
     detok_ref_query:       str
     detok_ref_answer:      Optional[str]
     detok_ref_scratchpad:  Optional[str]
-    extra_information: Optional[list]
+    difficulty_level:      Optional[int]
+    extra_information:     Optional[list]
 
     def items(self):
         return vars(self).items()

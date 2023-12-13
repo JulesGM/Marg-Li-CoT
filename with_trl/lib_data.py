@@ -77,11 +77,14 @@ def prep_dataset_rl(
     split: str,
     use_few_shots: int,
     arithmetic_dataset_root_folder_dir: Optional[str],
-    extractor_arithmetic_ignore_one_line,
+    extr_arith_ignore_one_line,
+    use_curriculum,
 ) -> libs_data.lib_base.Dataset:
     split = lib_utils.CVSets(split)
 
-    if answer_only and not dataset_name == DatasetChoices.COMMONSENSEQA_MC:
+    if answer_only and not dataset_name in {
+        DatasetChoices.COMMONSENSEQA_MC, DatasetChoices.ARITHMETIC
+    }:
         raise NotImplementedError()
 
     if dataset_name == DatasetChoices.GSM8K:
@@ -129,6 +132,7 @@ def prep_dataset_rl(
     elif dataset_name == DatasetChoices.ARITHMETIC:
         dataset = libs_data.lib_arithmetic.Arithmetic(
             dataset_root_folder_dir=arithmetic_dataset_root_folder_dir,
+            answer_only     = answer_only,
             any_tokenizer   = any_tokenizer,
             eos_token       = any_tokenizer.eos_token,
             pad_token       = any_tokenizer.pad_token,
@@ -138,7 +142,8 @@ def prep_dataset_rl(
             shuffle_once    = False,
             split           = split,
             use_few_shots   = True,
-            extractor_ignore_one_line = extractor_arithmetic_ignore_one_line,
+            use_curriculum  = use_curriculum,
+            extractor_ignore_one_line = extr_arith_ignore_one_line,
         )
 
     else:
