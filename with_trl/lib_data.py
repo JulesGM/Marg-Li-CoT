@@ -33,7 +33,7 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", "0"))
 class DatasetChoices(str, enum.Enum):
     ASDIV = "asdiv"
     GSM8K = "gsm8k"
-    COMMONSENSEQA_MC = "commonsenseqa_mc"
+    COMMONSENSEQA_MC = "cqa"
     SENTIMENT = "sentiment"
     ARITHMETIC = "arithmetic"
 
@@ -123,7 +123,6 @@ def prep_dataset_rl(
         )
 
     elif dataset_name == DatasetChoices.SENTIMENT:
-        assert False
         dataset = libs_data.lib_sentiment.SentimentData(
             any_tokenizer=any_tokenizer, 
             split=split,

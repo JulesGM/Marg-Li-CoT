@@ -12,19 +12,18 @@ DETERMINISTIC = False
 if DETERMINISTIC:
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-import collections
-import enum
-import getpass
+import dataclasses
 import itertools
 import logging
 import pathlib
 import random
-import typing
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import accelerate
 import datasets
 import fire
+import hydra
+import omegaconf
 import more_itertools as mit
 import numpy as np
 import peft
@@ -48,9 +47,7 @@ import trl
 import trl_fork
 import wandb
 import accelerate.utils
-from tqdm import tqdm
 
-import lib_base_classes
 import lib_data
 import lib_eval
 import lib_trl_utils
@@ -78,205 +75,103 @@ torch.backends.cuda.matmul.allow_tf32 = not DETERMINISTIC
 torch.backends.cudnn.allow_tf32 = not DETERMINISTIC
 torch.use_deterministic_algorithms(DETERMINISTIC)
 
-DEFAULT_LOG_STATS_VERBOSE = True
-DEFAULT_REWARD_VERBOSE = False
-
-##############################################################################
-##############################################################################
-DEFAULT_USE_FEW_SHOTS = True
-DEFAULT_GEN_KWARGS = dict(
-    min_new_tokens       = 5,
-    num_return_sequences = 14,
-    num_beams            = 14,
-
-    ##########################################
-    synced_gpus        = os.getenv("ACCELERATE_DEEPSPEED_ZERO_STAGE", "") == "3",
-    temperature        = 1.,
-    # top_k              = 0.0,
-    # top_p              = 1.0,
-    use_cache          = True,
-    repetition_penalty = 1,
-    ##########################################
-)
-
-DEFAULT_KL_PENALTY_MODE = "kl"
-
 CS = lib_trl_utils.CurriculumSchedule
 CE = lib_trl_utils.CurriculumSchedule.CE
 
 
-DEFAULT_CURRICULUM_SCHEDULE = [
-    (0,   {
-        1: 1.,
-    }),
-    # (100, {0: 0.66, 1: 0.34}),
-    # (200, {0: 0.50, 1: 0.50}),
-]
+@dataclasses.dataclass
+class Args:
 
-DEFAULT_USE_CURRICULUM = True
-DEFAULT_TRL_LIBRARY_MODE = lib_utils.TrlLibraryMode.TRL
-DEFAULT_TASK_NAME: str = lib_utils.Task.MAIN
-DEFAULT_EVAL_EVERY: int = 0
-DEFAULT_VALUE_MODEL_PRETRAIN_AMOUNT: int = 1
+    @dataclasses.dataclass
+    class Model:
+        batch_size:             int
+        inference_batch_size:   int
+        mini_batch_size:        int
+        model_name:             str
 
-class TrainingState(enum.Enum):
-        REGULAR_TRAINING = "regular_training"
-        VALUE_MODEL_PRETRAINING = "value_model_pretraining"
+    def __post_init__(self):
+        if self.curriculum_schedule:
+            self.curriculum_schedule = CS(
+                [CE(x) for x in self.curriculum_schedule]
+            )
 
-
-if DEFAULT_TASK_NAME == lib_utils.Task.MAIN:
-    DEFAULT_REWARD_TYPE = lib_utils.RewardChoices.EXACT_MATCH
-    DEFAULT_DATASET_NAME = lib_data.DatasetChoices.ARITHMETIC
-    DEFAULT_WANDB_PROJECT: str = f"rl_{DEFAULT_DATASET_NAME.value}"
-
-    # -------------------------------------------------------
-    #########################################################
-    DEFAULT_GEN_KWARGS["do_sample"] = False
-    # DEFAULT_MODEL_NAME = "EleutherAI/gpt-j-6B"; DEFAULT_BATCH_SIZE: int = 2; DEFAULT_MINI_BATCH_SIZE: int = 1
-    DEFAULT_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"; DEFAULT_BATCH_SIZE: int = 2; DEFAULT_MINI_BATCH_SIZE: int = 1
-    # DEFAULT_MODEL_NAME = "EleutherAI/pythia-70m-deduped"; DEFAULT_BATCH_SIZE: int = 2; DEFAULT_MINI_BATCH_SIZE: int = 2
+        self.answer_only_path    = pathlib.Path(self.answer_only_path)
+        self.dataset_name        = lib_data.DatasetChoices(self.dataset_name)
+        self.generation_kwargs   = self.generation_kwargs
+        self.model               = Args.Model(**self.model)
+        self.precision           = lib_utils.ValidPrecisions(self.precision)
+        self.peft_config         = peft.LoraConfig(**self.peft_config)
+        self.task_name           = lib_utils.Task(self.task_name)
+        self.wandb_dir           = pathlib.Path(self.wandb_dir)
+        self.arithmetic_dataset_root_folder_dir = pathlib.Path(self.arithmetic_dataset_root_folder_dir)
+        self.inference_generation_kwargs        = self.inference_generation_kwargs
     
-    DEFAULT_ANSWER_ONLY = True 
-    DEFAULT_GEN_KWARGS["max_new_tokens"] = 10 if DEFAULT_ANSWER_ONLY else 200
+    answer_only_path:    pathlib.Path
+    curriculum_schedule: CS | None
+    dataset_name:        str
+    generation_kwargs:   transformers.GenerationConfig
+    model:               Model
+    peft_config:         peft.LoraConfig
+    task_name:           lib_utils.Task
+    wandb_dir:           pathlib.Path
+    arithmetic_dataset_root_folder_dir: pathlib.Path
+    inference_generation_kwargs:        transformers.GenerationConfig
 
-    DEFAULT_INFERENCE_BATCH_SIZE: int = DEFAULT_BATCH_SIZE
-    DEFAULT_GRADIENT_ACCUMULATION_STEPS: int = 1
-    DEFAULT_CAUSAL_QUESTION_PREFIX: str = None
-    DEFAULT_CAUSAL_QUESTION_SUFFIX: str = None
-    DEFAULT_PEFT_QLORA_MODE = False
-    DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16
-
-    DEFAULT_ANSWER_ONLY_PATH = (
-        # "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/cond-on-answers/commonsenseqa.chatgpt"
-        "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/not-cond-on-answers/commonsenseqa.chatgpt"
-    )
-    #########################################################
-    # -------------------------------------------------------
-
-
-    DEFAULT_PEFT_DO_ALL_LIN_LAYERS = True
-    assert DEFAULT_EVAL_EVERY == 0 or DEFAULT_EVAL_EVERY >= (
-        DEFAULT_GRADIENT_ACCUMULATION_STEPS // WORLD_SIZE
-    ), (
-        f"DEFAULT_EVAL_EVERY ({DEFAULT_EVAL_EVERY}) must be >= "
-        f"DEFAULT_GRADIENT_ACCUMULATION_STEPS "
-        f"({DEFAULT_GRADIENT_ACCUMULATION_STEPS})"
-    )
-
-    DEFAULT_INFERENCE_GEN_KWARGS = DEFAULT_GEN_KWARGS.copy()
-    DEFAULT_INFERENCE_GEN_KWARGS["num_beams"] = 1
-    DEFAULT_INFERENCE_GEN_KWARGS["num_return_sequences"] = 1
-    DEFAULT_INFERENCE_GEN_KWARGS["do_sample"] = False
-    # We could use a custom batch size too.
+    name:                        str
+    learning_rate:               float
+    answer_only:                 bool
+    answer_only_max_length:      int
+    input_max_length:            int
+    eval_every:                  int
+    eval_subset_size:            int
+    gradient_accumulation_steps: int
+    just_metrics:                bool
+    kl_penalty_mode:             str
+    peft_do_all_lin_layers:      bool
+    use_curriculum:              bool
+    use_peft:                    bool
+    use_few_shots:               bool
+    precision:                   torch.dtype | str
+    
+    reward_type:                 Optional[str]
+    wandb_project:               str
 
 
-elif DEFAULT_TASK_NAME == lib_utils.Task.SENTIMENT:
-    assert False
-    DEFAULT_WANDB_PROJECT: str = "sentiment"
-    DEFAULT_GEN_KWARGS["max_new_tokens"] = 20
-    DEFAULT_GEN_KWARGS["min_new_tokens"] = 4
-    DEFAULT_GEN_KWARGS["num_return_sequences"] = 1
-    DEFAULT_GEN_KWARGS["do_sample"] = True
-    DEFAULT_EVAL_BATCH_SIZE: int = 24
-    DEFAULT_MINI_BATCH_SIZE: int = 24
-    DEFAULT_BATCH_SIZE: int = 24
-    DEFAULT_GRADIENT_ACCUMULATION_STEPS: int = 1
+@hydra.main(config_path="config", config_name="arithmetic", version_base="1.3")
+def main(cfg):
 
-    DEFAULT_PEFT_QLORA_MODE = True
-    DEFAULT_REWARD_TYPE: typing.Optional[str] = None
-
-    DEFAULT_PRECISION = lib_utils.ValidPrecisions.bfloat16
-    # DEFAULT_MODEL_NAME: str                   = "huggyllama/llama-65b"
-    DEFAULT_MODEL_NAME: str = "tiiuae/falcon-40b-instruct"
-    DEFAULT_CAUSAL_QUESTION_PREFIX: str = ""
-    DEFAULT_CAUSAL_QUESTION_SUFFIX: str = ""
-
-    DEFAULT_DATASET_NAME = lib_data.DatasetChoices.SENTIMENT
-    DEFAULT_INFERENCE_BATCH_SIZE: int = 96
-    DEFAULT_INFERENCE_GEN_KWARGS = DEFAULT_GEN_KWARGS.copy()
-
-else:
-    raise ValueError(f"Unknown task name: {DEFAULT_TASK_NAME}")
-
-
-##############################################################################
-##############################################################################
-DEFAULT_EVAL_QTY: int = 1200
-DEFAULT_NUM_EPOCHS: int = 10
-DEFAULT_USE_PEFT: bool = True
-
-DEFAULT_LEARNING_RATE: float = 1.41e-4
-
-DEFAULT_PEFT_CONFIG = dict(
-    bias           = "none",
-    inference_mode = False,
-    lora_dropout   = 0.,
-    lora_alpha     = 16,
-    r              = 16,
-)
-
-DEFAULT_INPUT_MAX_LENGTH = 115
-# get username with os
-
-if RANK == 0:
-    DEFAULT_WANDB_DIR = pathlib.Path("/tmp") / f"{getpass.getuser()}_{os.getpid()}"
-else:
-    DEFAULT_WANDB_DIR = None
-DEFAULT_ARITHMETIC_DATASET_ROOT_FOLDER_DIR = "/home/mila/g/gagnonju/Marg-Li-CoT/with_trl/libs_data/arithmetic/"
-
-
-def main(
-    name: Optional[str],
-    *,
-    answer_only:                                 bool = DEFAULT_ANSWER_ONLY,
-    answer_only_path:                             str = DEFAULT_ANSWER_ONLY_PATH,
-    arithmetic_dataset_root_folder_dir                = DEFAULT_ARITHMETIC_DATASET_ROOT_FOLDER_DIR,
-    batch_size:                                   int = DEFAULT_BATCH_SIZE,
-    causal_question_prefix:                       str = DEFAULT_CAUSAL_QUESTION_PREFIX,
-    causal_question_suffix:                       str = DEFAULT_CAUSAL_QUESTION_SUFFIX,
-    curriculum_schedule                               = DEFAULT_CURRICULUM_SCHEDULE,
-    dataset_name:                                 str = DEFAULT_DATASET_NAME,
-    extr_arith_ignore_one_line:                  bool = True,
-    eval_every:                                   int = DEFAULT_EVAL_EVERY,
-    eval_subset_size:                             int = DEFAULT_EVAL_QTY,
-    generation_kwargs:                 dict[str, Any] = DEFAULT_GEN_KWARGS,
-    gradient_accumulation_steps:                  int = DEFAULT_GRADIENT_ACCUMULATION_STEPS,
-    input_max_length:                             int = DEFAULT_INPUT_MAX_LENGTH,
-    inference_gen_kwargs:              dict[str, Any] = DEFAULT_INFERENCE_GEN_KWARGS,
-    inference_batch_size:                         int = DEFAULT_INFERENCE_BATCH_SIZE,
-    just_metrics:                                bool = False,
-    kl_penalty_mode                                   = DEFAULT_KL_PENALTY_MODE,
-    learning_rate:                              float = DEFAULT_LEARNING_RATE,
-    mini_batch_size:                              int = DEFAULT_MINI_BATCH_SIZE,
-    model_name:                                   str = DEFAULT_MODEL_NAME,
-    peft_config_dict:        Optional[dict[str, Any]] = DEFAULT_PEFT_CONFIG,
-    peft_do_all_lin_layers:                      bool = DEFAULT_PEFT_DO_ALL_LIN_LAYERS,
-    precision                                         = DEFAULT_PRECISION,
-    reward_type: None | str | lib_utils.RewardChoices = DEFAULT_REWARD_TYPE,
-    task_name:                                    str = DEFAULT_TASK_NAME,
-    trl_library_mode:        lib_utils.TrlLibraryMode = DEFAULT_TRL_LIBRARY_MODE,
-    use_curriculum:                              bool = DEFAULT_USE_CURRICULUM,
-    use_peft:                                    bool = DEFAULT_USE_PEFT,
-    use_few_shots:                                int = DEFAULT_USE_FEW_SHOTS,
-    wandb_dir:                                    str = DEFAULT_WANDB_DIR,
-    wandb_project:                                str = DEFAULT_WANDB_PROJECT,
-):
-    args = locals().copy()
-    precision = lib_utils.ValidPrecisions(precision)  # type: ignore
+    args = omegaconf.OmegaConf.to_object(cfg)
+    precision = lib_utils.ValidPrecisions(cfg.precision)  # type: ignore
 
     # Display command line args
     if RANK == 0:
         lib_utils.readable(args, "Command line args")
 
     # Check some command line args
-    assert kl_penalty_mode in {"kl", "abs", "mse", "full"}, kl_penalty_mode
-    task_name = lib_utils.Task(task_name)
-    dataset_name = lib_data.DatasetChoices(dataset_name)
-    trl_library_mode = lib_utils.TrlLibraryMode(trl_library_mode)
-    trl_library = lib_utils.TRL_LIBRARIES[trl_library_mode]
-    
-    if use_curriculum:
+    assert cfg.kl_penalty_mode in {"kl", "abs", "mse", "full"}, cfg.kl_penalty_mode
+    batch_size = cfg.model.batch_size
+    dataset_name = lib_data.DatasetChoices(cfg.dataset_name)
+    inference_batch_size: transformers.GenerationConfig = cfg.model.inference_batch_size
+    task_name = lib_utils.Task(cfg.task_name)
+
+    # Make the output shorted if we use answer_only
+    if cfg.answer_only:
+        assert not task_name == lib_utils.Task.SENTIMENT, task_name
+        cfg.generation_kwargs.max_new_tokens = 10
+        cfg.inference_generation_kwargs.max_new_tokens = 10
+
+    generation_kwargs = omegaconf.OmegaConf.to_object(cfg.generation_kwargs)
+    inference_generation_kwargs: transformers.GenerationConfig = omegaconf.OmegaConf.to_object(cfg.inference_generation_kwargs)
+    trl_library = trl
+
+    if cfg.use_curriculum:
+        # We could do progressively longer sequences.
+        assert not task_name == lib_utils.Task.SENTIMENT, task_name
+
+        curriculum_schedule = omegaconf.OmegaConf.to_object(
+            cfg.curriculum_schedule)
         assert curriculum_schedule
+
         if not isinstance(curriculum_schedule, CS):
             curriculum_schedule = CS(literals=curriculum_schedule)
         else:
@@ -306,22 +201,10 @@ def main(
     ###########################################################################
     # Find the type of model we are using
     ###########################################################################
-    hf_config = transformers.AutoConfig.from_pretrained(  # type: ignore
-        model_name, 
-    )
-    
-    if hf_config.is_encoder_decoder:
-        assert False
-        assert causal_question_prefix == "", (
-            causal_question_prefix,
-            causal_question_suffix,
-        )
-        assert causal_question_suffix == "", (
-            causal_question_suffix,
-            causal_question_suffix,
-        )
+    hf_config = transformers.AutoConfig.from_pretrained(cfg.model.model_name)
+    assert not hf_config.is_encoder_decoder
 
-    assert peft_config_dict is not None
+    peft_config_dict = omegaconf.OmegaConf.to_object(cfg.peft_config)
     assert "task_type" not in peft_config_dict, peft_config_dict
 
     if not hf_config.is_encoder_decoder:
@@ -329,15 +212,13 @@ def main(
     elif hf_config.is_encoder_decoder:
         peft_config_dict["task_type"] = peft.TaskType.SEQ_2_SEQ_LM
     else:
-        raise ValueError(f"Unknown model type: {model_name}")
+        raise ValueError(f"Unknown model type: {cfg.model.model_name}")
 
-    if not peft_do_all_lin_layers:
+    if not cfg.peft_do_all_lin_layers:
         assert "target_modules" not in peft_config_dict, peft_config_dict
-        peft_config_dict[
-            "target_modules"
-        ] = peft.utils.other.TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[
-            hf_config.model_type
-        ]
+        peft_config_dict["target_modules"] = (
+            peft.utils.other.TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[hf_config.model_type]
+        )
 
     accelerator_kwargs = dict(
         kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(
@@ -347,12 +228,13 @@ def main(
     ppo_config_dict = dict(
         accelerator_kwargs          = accelerator_kwargs,
         batch_size                  = batch_size,
-        gradient_accumulation_steps = gradient_accumulation_steps,
-        learning_rate               = learning_rate,
+        gradient_accumulation_steps = cfg.gradient_accumulation_steps,
+        learning_rate               = cfg.learning_rate,
         log_with                    = "wandb",
-        mini_batch_size             = mini_batch_size,
-        model_name                  = model_name,
-        kl_penalty                  = kl_penalty_mode,   
+        mini_batch_size             = cfg.model.mini_batch_size,
+        model_name                  = cfg.model.model_name,
+        kl_penalty                  = cfg.kl_penalty_mode,
+        
     )
 
     trl_config: trl.PPOConfig = trl_library.PPOConfig(**ppo_config_dict)
@@ -361,19 +243,26 @@ def main(
         lib_utils.readable(vars(trl_config), title="ppo_config")
 
     if task_name == lib_utils.Task.MAIN:
-        reward_type = lib_utils.RewardChoices(reward_type)
+        reward_type = lib_utils.RewardChoices(cfg.reward_type)
+    else:
+        assert task_name == lib_utils.Task.SENTIMENT, task_name
+        reward_type = cfg.reward_type
+        assert reward_type is None, reward_type
 
     if RANK == 0:
-        wandb_dir = pathlib.Path(wandb_dir)
+        if cfg.wandb_dir is None or cfg.wandb_dir == "":
+            wandb_dir = pathlib.Path(os.environ["SLURM_TMPDIR"]) / "wandb"
+        wandb_dir = pathlib.Path(cfg.wandb_dir)
+
         if not wandb_dir.exists():
             wandb_dir.mkdir(parents=True)
             assert wandb_dir.exists(), wandb_dir
             
         wandb.init(
             save_code=True,
-            project=wandb_project,
+            project=cfg.wandb_project,
             entity="julesgm",
-            name=name,
+            name=cfg.name,
             config=dict(
                 generation_kwargs = generation_kwargs,
                 peft_config_dict  = peft_config_dict,
@@ -399,46 +288,29 @@ def main(
         output = lib_trl_utils.init_model(
             model_name             = trl_config.model_name,
             peft_config_dict       = peft_config_dict,
-            # peft_qlora_mode       = peft_qlora_mode,
-            peft_do_all_lin_layers = peft_do_all_lin_layers,
+            peft_do_all_lin_layers = cfg.peft_do_all_lin_layers,
             precision              = precision,
-            trl_library_mode       = trl_library_mode,
-            use_peft               = use_peft,
+            trl_library_mode       = lib_utils.TrlLibraryMode.TRL,
+            use_peft               = cfg.use_peft,
         )
 
         # Deal with fork vs non-fork
         forward_tokenizer    = output["forward_tokenizer"]
         prediction_tokenizer = output["prediction_tokenizer"]
         trainer_kwargs       = {}
+        trainer_kwargs["model"] = output["model"]
 
-        if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
-            trainer_kwargs[       "model"] = output[       "model"]
-        elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-            trainer_kwargs["policy_model"] = output["policy_model"]
-            trainer_kwargs[ "value_model"] = output[ "value_model"]
-        else:
-            raise ValueError(f"Unknown trl_library_mode: {trl_library_mode}")
+        # if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
+        # elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
+        #     trainer_kwargs["policy_model"] = output["policy_model"]
+        #     trainer_kwargs[ "value_model"] = output[ "value_model"]
+        # else:
+        #     raise ValueError(f"Unknown trl_library_mode: {trl_library_mode}")
 
         eos_token_id = forward_tokenizer.eos_token_id
         pad_token_id = forward_tokenizer.pad_token_id
         assert eos_token_id == prediction_tokenizer.eos_token_id
         assert pad_token_id == prediction_tokenizer.pad_token_id
-
-    
-    ###########################################################################
-    # Extract "\n"
-    ###########################################################################
-    # assert not stop_at_line_return
-    # if stop_at_line_return:
-    #     if dataset_name == lib_data.DatasetChoices.ARITHMETIC:
-    #         assert False
-    #     line_return_tok = lib_utils.line_return_token(any_tokenizer=prediction_tokenizer)
-    #     assert "eos_token_id" not in generation_kwargs, generation_kwargs
-    #     assert "eos_token_id" not in inference_gen_kwargs, inference_gen_kwargs
-    #     generation_kwargs   ["eos_token_id"] = line_return_tok
-    #     inference_gen_kwargs["eos_token_id"] = line_return_tok
-        
-    # elif True:
 
     # This is a way to stop decoding.
     line_return_tok = prediction_tokenizer.encode("\n!")[-1]
@@ -448,44 +320,40 @@ def main(
     )
 
     assert "eos_token_id" not in generation_kwargs, generation_kwargs
-    assert "eos_token_id" not in inference_gen_kwargs, inference_gen_kwargs
+    assert "eos_token_id" not in inference_generation_kwargs, inference_generation_kwargs
     generation_kwargs   ["eos_token_id"] = line_return_tok
-    inference_gen_kwargs["eos_token_id"] = line_return_tok
-
-    # else:
-    #     generation_kwargs["eos_token_id"] = eos_token_id
-    #     inference_gen_kwargs["eos_token_id"] = eos_token_id
+    inference_generation_kwargs["eos_token_id"] = line_return_tok
 
     ###########################################################################
     # Load Datasets
     ###########################################################################
     dataset = lib_data.prep_dataset_rl(
         any_tokenizer=forward_tokenizer,
-        answer_only=answer_only,
-        answer_only_path=answer_only_path,
+        answer_only=cfg.answer_only,
+        answer_only_path=cfg.answer_only_path,
         dataset_name=dataset_name,
-        input_max_length=input_max_length,
-        question_prefix=causal_question_prefix,
-        question_suffix=causal_question_suffix,
+        input_max_length=cfg.input_max_length,
+        question_prefix=None,
+        question_suffix=None,
         split=lib_utils.CVSets.TRAIN,
-        use_few_shots=use_few_shots,
-        arithmetic_dataset_root_folder_dir=arithmetic_dataset_root_folder_dir,
-        extr_arith_ignore_one_line=extr_arith_ignore_one_line,
-        use_curriculum=use_curriculum,
+        use_few_shots=cfg.use_few_shots,
+        arithmetic_dataset_root_folder_dir=cfg.arithmetic_dataset_root_folder_dir,
+        extr_arith_ignore_one_line=True,
+        use_curriculum=cfg.use_curriculum,
     )
 
     eval_dataset = lib_data.prep_dataset_rl(
         any_tokenizer=forward_tokenizer,
-        answer_only=answer_only,
-        answer_only_path=answer_only_path,
+        answer_only=cfg.answer_only,
+        answer_only_path=cfg.answer_only_path,
         dataset_name=dataset_name,
-        input_max_length=input_max_length,
-        question_prefix=causal_question_prefix,
-        question_suffix=causal_question_suffix,
+        input_max_length=cfg.input_max_length,
+        question_prefix=None,
+        question_suffix=None,
         split=lib_utils.CVSets.VALID,
-        use_few_shots=use_few_shots,
-        arithmetic_dataset_root_folder_dir=arithmetic_dataset_root_folder_dir,
-        extr_arith_ignore_one_line=extr_arith_ignore_one_line,
+        use_few_shots=cfg.use_few_shots,
+        arithmetic_dataset_root_folder_dir=cfg.arithmetic_dataset_root_folder_dir,
+        extr_arith_ignore_one_line=True,
         use_curriculum=False,
     )
     
@@ -500,12 +368,9 @@ def main(
     ###########################################################################
     # Prep Training
     ###########################################################################
-    data_collator = (
-        lib_utils.collator if task_name == lib_utils.Task.SENTIMENT 
-        else lib_data.data_item_collator
-    )
+    data_collator = lib_data.data_item_collator
 
-    if use_curriculum:
+    if cfg.use_curriculum:
         data_collator_arg = None
         dataset_arg       = None
     else:
@@ -530,13 +395,13 @@ def main(
         pad_token                 = forward_tokenizer.pad_token,
         reward_type               = reward_type,
         task_name                 = task_name,
-        use_peft                  = use_peft,
+        use_peft                  = cfg.use_peft,
     )
     
     policy_model = (
         ppo_trainer.model 
-        if trl_library_mode == lib_utils.TrlLibraryMode.TRL 
-        else ppo_trainer.policy_model
+        # if trl_library_mode == lib_utils.TrlLibraryMode.TRL else 
+        # ppo_trainer.policy_model
     )
 
     train_eval = lib_eval.EvalLoop(
@@ -545,15 +410,15 @@ def main(
         batch_size           = inference_batch_size,
         dataset              = dataset,
         dataset_type         = dataset_name,
-        eval_subset_size     = eval_subset_size,
+        eval_subset_size     = cfg.eval_subset_size,
         forward_tokenizer    = forward_tokenizer,
-        inference_gen_kwargs = inference_gen_kwargs,
+        inference_gen_kwargs = inference_generation_kwargs,
         metrics              = metrics,
         prediction_tokenizer = prediction_tokenizer,
         reward_fn            = reward_fn,
         split                = lib_utils.CVSets.TRAIN,
         task_name            = task_name,
-        use_few_shots        = use_few_shots,
+        use_few_shots        = cfg.use_few_shots,
     )
 
     eval_eval = lib_eval.EvalLoop(
@@ -563,17 +428,17 @@ def main(
         dataset              = eval_dataset,
         dataset_type         = dataset_name,
         forward_tokenizer    = forward_tokenizer,
-        eval_subset_size     = eval_subset_size,
-        inference_gen_kwargs = inference_gen_kwargs,
+        eval_subset_size     = cfg.eval_subset_size,
+        inference_gen_kwargs = inference_generation_kwargs,
         metrics              = metrics,
         prediction_tokenizer = prediction_tokenizer,
         reward_fn            = reward_fn,
         split                = lib_utils.CVSets.VALID,
         task_name            = task_name,
-        use_few_shots        = use_few_shots,
+        use_few_shots        = cfg.use_few_shots,
     )
 
-    if just_metrics:
+    if cfg.just_metrics:
         train_eval(0)
         eval_eval(0)
         return
@@ -582,7 +447,7 @@ def main(
     # Training Loop
     ###########################################################################
     epoch_count = -1
-    if use_curriculum:
+    if cfg.use_curriculum:
         dataloader = torch.utils.data.DataLoader(
             batch_size = batch_size,
             dataset    = dataset, 
@@ -607,7 +472,7 @@ def main(
                 seq=dataloader,
             )
         ):
-            if use_curriculum:
+            if cfg.use_curriculum:
                 dataloader.dataset.set_proportion_difficulties(
                     curriculum_schedule(ppo_trainer.current_step).proportions
                 )
@@ -620,7 +485,7 @@ def main(
             #   - "ref_scratchpad"
             ############################################################
 
-            if eval_every and batch_idx % eval_every == 0:
+            if cfg.eval_every and batch_idx % cfg.eval_every == 0:
                 if RANK == 0: rich.print("[red bold]DOING EVAL: [white]TRAIN SET")
                 train_eval(ppo_trainer.current_step)
                 if RANK == 0: rich.print("[red bold]DOING EVAL: [white]EVAL SET")
@@ -635,10 +500,13 @@ def main(
                 dataset_name                 = dataset_name,
                 generation_kwargs            = generation_kwargs, 
                 policy_model                 = policy_model, 
-                post_process_gen_fewshots_fn = dataset.post_process_gen_fewshots,
+                post_process_gen_fewshots_fn = 
+                    dataset.post_process_gen_fewshots 
+                    if task_name == lib_utils.Task.MAIN 
+                    else None,
                 prediction_tokenizer         = prediction_tokenizer,
                 task_name                    = task_name,
-                use_few_shots                = use_few_shots,
+                use_few_shots                = cfg.use_few_shots,
                 step_information             = dict(
                     trainer_step = ppo_trainer.current_step,
                     batch_idx    = batch_idx,
@@ -676,12 +544,12 @@ def main(
             if RANK == 0: print(f"{RANK} ppo_trainer.step >>>")
 
             step_kwargs = {}
-            if trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-                step_kwargs["answers"] = batch.tok_ref_answer                    
+            # if trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
+            #     step_kwargs["answers"] = batch.tok_ref_answer                    
 
 
             # Log scores per difficulty level
-            if use_curriculum:
+            if cfg.use_curriculum:
                 per_level = {level: [] for level in all_levels}
                 
                 for score in mit.zip_equal(batch.difficulty_level, reward_output.values):
@@ -751,13 +619,12 @@ def main(
             assert current_step == ppo_trainer.current_step, (
                 current_step, ppo_trainer.current_step)
             
-
             lib_trl_utils.print_table(
                 call_source       = "main_loop",
                 extra_columns     = reward_output.logging_columns,
                 generation_kwargs = generation_kwargs,
                 log_header        = f"(e{epoch}-b{batch_idx}) ",
-                name              = str(name),
+                name              = str(cfg.name),
                 qty               = 5,
                 queries           = batch.detok_ref_query,
                 responses         = outputs.response_text,
@@ -769,4 +636,4 @@ def main(
 
 if __name__ == "__main__":
     lib_utils.print_accelerate_envs()
-    fire.Fire(main)
+    main()

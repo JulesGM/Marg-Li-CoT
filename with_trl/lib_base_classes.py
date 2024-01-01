@@ -229,9 +229,8 @@ class Reward:
     def __call__(
         self,
         *,
-        queries: list[str],
+        batch: list[str],
         responses: list[str],
-        ref_answers: list[str],
     ) -> RewardOutput:
         raise NotImplementedError()
 

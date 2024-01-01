@@ -88,19 +88,14 @@ class Task(str, enum.Enum):
     MAIN = "main"
 
 
-class ValidPrecisions(enum.Enum):
-    _4bit = "int4"
-    _8bit = "int8"
-    bfloat16 = torch.bfloat16
-    float16 = torch.float16
-    float32 = torch.float32
-
-    def __eq__(self, value: object) -> bool:
-        if not isinstance(value, ValidPrecisions):
-            raise TypeError(f"Cannot compare {type(self)} with {type(value)}")
-
-        return super().__eq__(value)
-
+def ValidPrecisions(precision):
+    return dict(
+        _4bit="int4",
+        _8bit="int8",
+        bfloat16=torch.bfloat16,
+        float16=torch.float16,
+        float32=torch.float32,
+    )[precision]
 
 
 def readable(obj, title="", outer_kwargs=None, is_inner=False):

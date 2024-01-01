@@ -6,7 +6,7 @@ import torch
 import transformers
 
 import lib_base_classes
-
+import lib_utils
 LOGGER = logging.getLogger(__name__)
 
 
@@ -30,17 +30,13 @@ class SentimentRewardFn(lib_base_classes.Reward):
     def __call__(
         self,
         *,
-        queries,
         responses,
-        ref_answers=None,
-        task_list=None,
+        batch: lib_base_classes.DataListContainer,
     ) -> lib_base_classes.RewardOutput:
-        if task_list is None:
-            task_list = ["[positive]"] * len(queries)
+        task_list = ["[positive]"] * len(batch)
 
-        assert ref_answers is None, "ref_answers should be None with task 'sentiment'"
         reward_values = _compute_reward(
-            query_no_ctrl=queries,
+            query_no_ctrl=batch.detok_ref_query,
             reward_kwargs=self._reward_kwargs,
             generated=responses,
             reward_fn=self._pipeline,
@@ -54,6 +50,8 @@ class SentimentRewardFn(lib_base_classes.Reward):
         return lib_base_classes.RewardOutput(
             values=reward_values,
             name="sentiment",
+            extracted_gen=responses,
+            extracted_ref=None,
             logging_columns=optional_kwargs,
         )
 
@@ -131,9 +129,12 @@ def prep_dataset_rl(
     txt_in_len: int, 
     split: str,
 ):
-    assert any_tokenizer.pad_token == any_tokenizer.eos_token
+    split = lib_utils.CVSets(split)
 
-    dataset = typing.cast(datasets.Dataset, datasets.load_dataset("imdb", split=split))
+    dataset = typing.cast(datasets.Dataset, datasets.load_dataset(
+        "imdb", 
+        split="train" if split == lib_utils.CVSets.TRAIN else "test",
+    ))
     dataset = dataset.rename_columns({"text": "review", "label": "sentiment"})
     dataset = dataset.filter(lambda x: len(x["review"]) > 500, batched=False)
     dataset = dataset.map(lambda x: {"review": x["review"][:1000]}, batched=False)
@@ -164,10 +165,11 @@ def prep_dataset_sft(
         minlen_tok=None,
     ):
     LOGGER.warning("Not tested.")
+    split = lib_utils.CVSets(split)
 
     assert tokenizer.pad_token == tokenizer.eos_token
     dataset = typing.cast(
-        datasets.Dataset, datasets.load_dataset("imdb", split=split))
+        datasets.Dataset, datasets.load_dataset("imdb", split=split.value))
     
     if minlen_char:
         dataset = dataset.filter(lambda x: len(x["text"]) > minlen_char, batched=False)

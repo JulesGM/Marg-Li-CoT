@@ -1,0 +1,4 @@
+model_name: "mistralai/Mistral-7B-Instruct-v0.1"
+batch_size: 2
+inference_batch_size: 2
+mini_batch_size: 1

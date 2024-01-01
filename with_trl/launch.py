@@ -36,7 +36,13 @@ def kill_wandb_servers():
     ))
 
 
-def main(name, one=False, config_file=SCRIPT_DIR / "accelerate_ddp_no.yaml"):
+def main(
+    name, 
+    one=False, 
+    task_name="sentiment", 
+    config_file=SCRIPT_DIR / "accelerate_ddp_no.yaml",
+):
+    
     args = locals().copy()
     rhl = RHL()
 
@@ -57,7 +63,6 @@ def main(name, one=False, config_file=SCRIPT_DIR / "accelerate_ddp_no.yaml"):
         )
     )
     
-
     gpu_count = count_gpus()
     if not gpu_count:
         rich.print("[red bold on white] No gpus. Cancelling.")
@@ -87,7 +92,8 @@ def main(name, one=False, config_file=SCRIPT_DIR / "accelerate_ddp_no.yaml"):
 
     command += [
         SCRIPT_PATH,
-        name,
+        f"name={shlex.join([name])}",
+        f"--config-name={shlex.join([task_name])}",
     ]
     
     command = list(map(str, command))

@@ -1,0 +1,7 @@
+min_new_tokens: 5
+max_new_tokens: 100
+num_beams: 14
+num_return_sequences: 14
+repetition_penalty: 1
+temperature: 1.
+use_cache: True

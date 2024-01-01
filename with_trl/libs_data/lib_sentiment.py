@@ -1,3 +1,4 @@
+import os
 
 import torch
 import torch.utils.data
@@ -5,6 +6,10 @@ import torch.utils.data
 import lib_base_classes
 import lib_sentiment_specific
 import libs_data
+
+
+LOCAL_RANK = os.environ.get("LOCAL_RANK", 0)
+
 
 class SentimentData(libs_data.lib_base.Dataset):
     def __init__(self, any_tokenizer, split):
@@ -28,8 +33,14 @@ class SentimentData(libs_data.lib_base.Dataset):
             detok_ref_answer=None,
             detok_ref_scratchpad=None,
 
-            obj_ref_equations=None,
+            difficulty_level=None,
+            extra_information=None,
         )
-    
+        
     def get_extractor(self) -> None:
-        raise NotImplementedError()
+        return lambda x: x
+    
+    @property
+    def use_few_shots(self):
+        return False
+    

@@ -103,8 +103,10 @@ def generate(
             difficulty_levels=batch.difficulty_level,
         )
     else:
-        assert False
+        # If we're on the sentiment task,
+        # we return num sequences = 1.
         assert task_name == lib_utils.Task.SENTIMENT, task_name
+        assert scores is None, scores
         assert (
             generation_kwargs["num_return_sequences"] == 1
         ), generation_kwargs["num_return_sequences"]
@@ -437,7 +439,7 @@ def load_then_peft_ize_model(
     *,
     peft_config_dict,
     peft_do_all_lin_layers: bool,
-    precision: lib_utils.ValidPrecisions,
+    precision,
     model_name: str,
     use_peft: bool,
     forward_tokenizer: transformers.PreTrainedTokenizer,
@@ -451,7 +453,7 @@ def load_then_peft_ize_model(
     config = transformers.AutoConfig.from_pretrained(model_name)  # type: ignore
     if just_device_map:
         assert not use_peft, "not written with that in mind"
-        assert precision == lib_utils.ValidPrecisions.bfloat16, precision
+        assert precision == torch.bfloat16, precision
 
 
     ###########################################################################
@@ -465,7 +467,7 @@ def load_then_peft_ize_model(
     else:
         assert not (
             (config.model_type == "t5")
-            and (precision == lib_utils.ValidPrecisions.float16)
+            and (precision == torch.float16)
         ), "fp16 doesn't work with t5"
 
         if use_peft:
@@ -477,13 +479,12 @@ def load_then_peft_ize_model(
     # -> Precision specific
     ###########################################################################
     if precision in (
-        lib_utils.ValidPrecisions._4bit,
-        lib_utils.ValidPrecisions._8bit,
+        "_4bit",
+        "_8bit",
     ):
-        
         quantization_config = transformers.BitsAndBytesConfig(
-                load_in_4bit=precision == lib_utils.ValidPrecisions._4bit,
-                load_in_8bit=precision == lib_utils.ValidPrecisions._8bit,
+                load_in_4bit=precision == "_4bit",
+                load_in_8bit=precision == "_8bit",
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=torch.bfloat16,
@@ -494,8 +495,8 @@ def load_then_peft_ize_model(
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
             device_map   = {"": torch.device(int(LOCAL_RANK))},
-            load_in_4bit = precision == lib_utils.ValidPrecisions._4bit,
-            load_in_8bit = precision == lib_utils.ValidPrecisions._8bit,
+            load_in_4bit = precision == "_4bit",
+            load_in_8bit = precision == "_8bit",
             quantization_config = quantization_config,
             low_cpu_mem_usage   = os.environ.get("SLURM_JOB_PARTITION", "") == "main",
         )
@@ -511,13 +512,13 @@ def load_then_peft_ize_model(
         assert len(devices) == 1, devices
 
     else:
-        assert isinstance(precision.value, torch.dtype), (
-            f"{type(precision.value) = }")
+        assert isinstance(precision, torch.dtype), (
+            f"{type(precision) = }")
         
         pretrained_model = transformers_cls.from_pretrained(
             model_name,
             device_map   = "auto" if just_device_map else None,
-            torch_dtype  = precision.value,
+            torch_dtype  = precision,
         )
         assert not just_device_map or all(
             x.device.type == "cuda" 
@@ -549,8 +550,8 @@ def load_then_peft_ize_model(
     # Peft-ize the model
     ###########################################################################
     if use_peft:
-        if (precision == lib_utils.ValidPrecisions._4bit or 
-            precision == lib_utils.ValidPrecisions._8bit
+        if (precision == "_4bit" or 
+            precision == "_8bit"
         ):
             pretrained_model = peft.prepare_model_for_kbit_training(
                 pretrained_model,
@@ -558,7 +559,7 @@ def load_then_peft_ize_model(
         
         if peft_do_all_lin_layers:
             lora_config.target_modules = lib_peft_utils.find_all_linear_names(
-                precision.value, 
+                precision, 
                 pretrained_model,
             )
 
@@ -700,9 +701,8 @@ def init_model(
 
 
     if precision is None:
-        precision = lib_utils.ValidPrecisions.float32
+        precision = torch.bfloat16
 
-    precision = lib_utils.ValidPrecisions(precision)
     config = transformers.AutoConfig.from_pretrained(  # type: ignore
         model_name,
         trust_remote_code=True,
@@ -719,8 +719,6 @@ def init_model(
     ###########################################################################
     # HF Raw Model Stuff
     ###########################################################################
-
-
     pretrained_model = load_then_peft_ize_model(
         adapter_name="policy" if lib_utils.TrlLibraryMode.TRL_FORK else "default",
         forward_tokenizer      = forward_tokenizer,
@@ -736,18 +734,8 @@ def init_model(
     ###########################################################################
     # TRL Model
     ###########################################################################
-    # if not config.is_encoder_decoder:
-    #     if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
-    #         trl_cls = trl.models.AutoModelForCausalLMWithValueHead
-    #     elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-    #         policy
-    # else:
-    #     assert False
-    #     assert not (
-    #         (config.model_type == "t5")
-    #         and (precision == lib_utils.ValidPrecisions.float16)
-    #     ), "fp16 doesn't work with t5"
-    #     trl_cls = trl.models.AutoModelForSeq2SeqLMWithValueHead
+    # This is just a sanity check, feel free to remove.
+    assert precision == torch.bfloat16, precision 
 
     if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
         model = trl.AutoModelForCausalLMWithValueHead.from_pretrained(
@@ -758,7 +746,6 @@ def init_model(
             model.pretrained_model.gradient_checkpointing_enable)
 
     elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-        import ipdb; ipdb.set_trace() # TODO JULESGM: FIX
         assert False
         trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES += (MultiAdapterWrapper,)
         print(trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES)
@@ -804,12 +791,12 @@ def init_model(
         
 
     if precision in (
-        lib_utils.ValidPrecisions.float16,
-        lib_utils.ValidPrecisions.bfloat16,
+        torch.float16,
+        torch.bfloat16,
     ):
         dtype = (
             torch.float16
-            if precision == lib_utils.ValidPrecisions.float16
+            if precision == torch.float16
             else torch.bfloat16)
         
         if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
@@ -878,7 +865,8 @@ class CurriculumSchedule:
         assert not (entries and literals), (entries, literals)
         if not entries:
             assert isinstance(literals, list), literals
-            assert all(isinstance(x, tuple) for x in literals), literals
+            assert all(isinstance(x, (list, tuple)) for x in literals), literals
+            assert all(len(x) == 2 for x in literals), literals
             entries = [self.CE(*x) for x in literals]
             del literals
 
@@ -956,68 +944,65 @@ def batched_unroll(
     use_few_shots,
 ) -> lib_base_classes.BatchedUnrollReturn:
     
-    model: transformers.PreTrainedModel = typing.cast(  # type: ignore
-        transformers.PreTrainedModel,  # type: ignore
-        accelerator.unwrap_model(accelerated_model),
-    )
-
-    if not model.config.is_encoder_decoder:
-        assert prediction_tokenizer.padding_side == "left", (
-            prediction_tokenizer.padding_side)
-
+    assert prediction_tokenizer.padding_side == "left", (
+        prediction_tokenizer.padding_side)
+    
+    # Pad.
     tokenized = prediction_tokenizer.pad(
-        dict(
-            input_ids=typing.cast(
-                transformers.tokenization_utils.EncodedInput,
-                query_tensors,
-            )
-        ),
+        dict(input_ids=query_tensors),
         return_tensors="pt",
         padding=True,
     ).to(accelerator.device)
 
+    # Generate.
+    model = accelerator.unwrap_model(accelerated_model)
+    assert not model.config.is_encoder_decoder
     model_outputs = model.generate(
         **tokenized,
         **generation_kwargs,
-        pad_token_id = prediction_tokenizer.pad_token_id,
+        pad_token_id=prediction_tokenizer.pad_token_id,
         output_scores=True,
         return_dict_in_generate=True, 
     )
+
+    # Format outputs.
     responses = model_outputs.sequences
-
-    assert not model.config.is_encoder_decoder
-
     in_seq_len = tokenized["input_ids"].shape[1]
     responses = responses[:, in_seq_len:]
-
     raw_responses = responses
     if task_name == lib_utils.Task.MAIN:
-        if (
-            dataset_name == lib_data.DatasetChoices.COMMONSENSEQA_MC or 
-            dataset_name == lib_data.DatasetChoices.ARITHMETIC
-        ) and use_few_shots:
+        if use_few_shots:
             responses = post_process_gen_fewshots_fn(
                 raw_gen_outputs = responses, 
                 any_tokenizer   = prediction_tokenizer,
             )
-        elif use_few_shots:
-            raise NotImplemented
-            assert not hasattr(dataset_obj, "post_process_gen_fewshots"), (
-                type(dataset_obj).mro())
+    else:
+        assert post_process_gen_fewshots_fn is None
 
     outputs = lib_base_classes.BatchedUnrollReturn(
-        response_tensors=list(responses),
-        raw_response_tensors=list(raw_responses),
-        any_tokenizer=prediction_tokenizer,
+        any_tokenizer        = prediction_tokenizer,
+        raw_response_tensors = list(raw_responses),
+        response_tensors     = list(responses),
     )
+    
+    ###########################################################################
+    # Exit early if we're on the sentiment task, as 
+    # we only have one returned sequence.
+    ###########################################################################
+    if task_name == lib_utils.Task.SENTIMENT:
+        return outputs, None
 
     ###########################################################################
-    batch_size       = tokenized.input_ids.shape[0]
-    output_length    = model_outputs.sequences.shape[-1]
-    responses        = model_outputs.sequences       .reshape(batch_size, -1, output_length)
+    # We have multiple returned sequences: Create the table
+    ###########################################################################
+    # Prep info for the table
+    batch_size    = tokenized.input_ids.shape[0]
+    output_length = model_outputs.sequences.shape[-1]
+    responses     = model_outputs.sequences.reshape(
+        batch_size, -1, output_length)
     sequences_scores = model_outputs.sequences_scores.reshape(batch_size, -1)
-    ###########################################################################
 
+    # Create the table
     table = rich.table.Table(
         title="Batch Unroll", 
         show_lines=True,
