@@ -1,7 +1,5 @@
 #!/usr/bin/env python
-import pytorch_lightning as pl
 from pytorch_lightning.plugins.environments import SLURMEnvironment
-import datetime
 import torch
 import os
 

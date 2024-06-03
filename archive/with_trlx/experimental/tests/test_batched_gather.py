@@ -1,10 +1,7 @@
 import accelerate
 import torch
 import fire
-import rich
-import rich.logging
 import logging
-import os
 import general_utils
 
 LOGGER = logging.getLogger(__name__)

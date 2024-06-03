@@ -1,11 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
-import collections
-import copy
 import logging
 import os
 import time
-from typing import Optional, Union
+from typing import Union
 
 import datasets
 import deepspeed
@@ -229,7 +227,7 @@ def main():
     ####################################################################################
     # Instantiate dataset
     ####################################################################################
-    info_rank_0(f"[green bold]LOADING DATA GSM8K")
+    info_rank_0("[green bold]LOADING DATA GSM8K")
     dataset = datasets.load_dataset("gsm8k", "main", split="train")
 
     ####################################################################################
@@ -272,7 +270,7 @@ def main():
 
     engines = {}
     optimizers = {}
-    info_rank_0(f"[red bold]Starting LOOP")
+    info_rank_0("[red bold]Starting LOOP")
     if NO_DEEPSPEED_MODE:
         engines = {k: v.cuda() for k, v in models.items()}
         optimizers = {
@@ -307,7 +305,7 @@ def main():
                     dist_init_required=idx == 0,
                 )
 
-    LOGGER.info(f"[red bold]Exiting LOOP")
+    LOGGER.info("[red bold]Exiting LOOP")
 
     # optimizer = OptimizerMerger(list(models.values()))
 

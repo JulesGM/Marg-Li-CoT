@@ -3,10 +3,8 @@
 import matplotlib
 matplotlib.use("TkAgg")
 
-import enum
 
 import itertools
-import os
 from pathlib import Path
 import re
 import time

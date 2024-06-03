@@ -1,5 +1,4 @@
 import builtins
-import io
 import pickle
 import zipfile
 

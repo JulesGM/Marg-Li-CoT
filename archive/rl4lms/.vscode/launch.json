@@ -1,0 +1,34 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "rl4lms no args",
+            "type": "python",
+            "request": "launch",
+            "program": "rl4lms/bin_rl4lms_experimentation.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [],
+            "env": {
+                // "CUDA_LAUNCH_BLOCKING": "1"
+            },
+            "preLaunchTask": "delete_results_folder",
+        },
+        {
+            "name": "flan t5 no args",
+            "type": "python",
+            "request": "launch",
+            "program": "rl4lms/bin_flan_t5_gsm8k.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [],
+            "env": {
+                // "CUDA_LAUNCH_BLOCKING": "1"
+            }
+        },
+    
+    ]
+}

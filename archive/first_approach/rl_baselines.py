@@ -1,6 +1,4 @@
 import torch
-import numpy as np
-import general_utils as utils       
 
 class AC:
     def __init__(self, policy, value, device, lambda_=None):

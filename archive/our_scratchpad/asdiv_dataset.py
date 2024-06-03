@@ -1,21 +1,10 @@
 
-import collections
 
-import itertools
-import math
-import more_itertools
 from pathlib import Path
-import random
 import re
 import xml
 
-import datasets
-import matplotlib.pyplot as plt
-import numpy as np
-import rich
-import rich.table
 import torch
-from tqdm import tqdm
 import wget
 
 

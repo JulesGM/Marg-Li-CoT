@@ -63,20 +63,14 @@
 # This step takes **~2h** on a P6000 GPU with the above specified settings.
 
 
-import os
-import random
 import sys
-import time
 from pathlib import Path
 from random import choices
 
-import datasets
 import fire
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
-import transformers
 import trl
 import wandb
 from tqdm import tqdm

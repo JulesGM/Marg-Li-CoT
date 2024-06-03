@@ -1,6 +1,5 @@
 import collections
 import enum
-import transformers
 
 
 class RefiningModes(str, enum.Enum):

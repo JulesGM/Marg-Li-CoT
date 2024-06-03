@@ -5,14 +5,8 @@ import re
 from typing import *
 import typing
 
-from beartype import beartype
-import datasets
 import numpy as np
-import pandas as pd
 import rich
-import torch
-import tqdm
-import transformers
 
 import general_utils as utils
 import lib_data
@@ -140,7 +134,7 @@ class ScratchpadAnswerAccuracy:
             f"{num_nones_parsed / len(generated_texts):0.1%}\n")
 
         assert len(em_value) == len(generated_texts) == len(reference_texts), (
-            f"\n" + 
+            "\n" + 
             f"{len(generated_texts)   = }\n" + 
             f"{len(reference_texts)   = }\n" + 
             f"{len(em_value)          = }")

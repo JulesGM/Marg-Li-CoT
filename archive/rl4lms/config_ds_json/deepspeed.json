@@ -1,0 +1,29 @@
+{
+    "micro_batch_size_per_gpu": "auto",
+    "micro_batch_per_gpu": "auto",
+    "train_batch_size": "auto",
+    "steps_per_print": 1,
+    "bf16": {
+        "enabled": true
+    },
+    "wandb": {
+        "team": "julesgm",
+        "project": "supervised_learning",
+        "enabled": true
+    },
+
+    "wall_clock_breakdown": true,
+    "gradient_accumulation_steps": 1,
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": "auto",
+            "betas": [
+                0.9,
+                0.999
+            ]
+        },
+        "grad_accum_dtype": "bfloat16"
+    },
+    "grad_accum_dtype": "bfloat16"
+}

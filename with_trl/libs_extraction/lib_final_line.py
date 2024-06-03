@@ -1,4 +1,4 @@
-from libs_extraction import lib_base
+from . import lib_base
 
 class FinalLineExtractor(lib_base.Extractor):
     def __init__(self, pad_token, ignore_one_line):
@@ -7,9 +7,6 @@ class FinalLineExtractor(lib_base.Extractor):
         self._ignore_one_line = ignore_one_line
 
     def __call__(self, text):
-        assert self._pad_token not in text, (
-            "Text contains padding tokens.")
-        
         if self._ignore_one_line:
             attempt = text.strip().rsplit("\n", 2)
             

@@ -89,14 +89,14 @@ def gen_examples(
         input_sum = f"{input_first} + {input_second}"
 
         resultant_str = (
-            f"Input:\n" +
+            "Input:\n" +
             f"{input_sum}\n" +
-            f"Target:\n"
+            "Target:\n"
         )
 
         scratch_pad = None
         if include_scratchpad:
-            scratch_pad = f"<scratch>\n"
+            scratch_pad = "<scratch>\n"
             carry       = 0
             running_sum = ""
 
@@ -113,7 +113,7 @@ def gen_examples(
                 else:
                     running_sum  = f"{dig_sum % 10}{running_sum}"
 
-                maybe_prev_c = f" + 1 (Previous carry)" if carry else ""
+                maybe_prev_c = " + 1 (Previous carry)" if carry else ""
                 carry        = int(dig_sum >= 10)
                 scratch_pad += (
                     f"{first_digit} + {second_digit}{maybe_prev_c} , " +

@@ -1,7 +1,5 @@
 print("Doing imports.")
-import collections
 import contextlib
-import itertools
 import logging
 import os
 import random
@@ -9,7 +7,6 @@ import random
 import accelerate
 import datasets
 import fire
-import numpy as np
 import rich
 import rich.logging
 import time
@@ -77,7 +74,7 @@ def main(
     # Init model, tokenizer and data
     info(f"Loading model `{hf_name}`.")
     model = hf_class.from_pretrained(hf_name)
-    info(f"Done loading model.")
+    info("Done loading model.")
     tokenizer = transformers.AutoTokenizer.from_pretrained(hf_name)
     all_data = datasets.load_dataset("gsm8k", "main", split="train")["question"][:qty]
     all_tokenized = tokenizer(all_data, return_tensors="pt", padding=True)
@@ -127,9 +124,9 @@ def main(
         question_text = tokenizer.decode(question).replace("<pad>", "") 
         question_output = tokenizer.decode(output).replace("<pad>", "") 
         text.append(
-            f"[bold blue]Question:[white]\n" +
+            "[bold blue]Question:[white]\n" +
             f"{question_text.strip()}\n" +
-            f"[/][bold blue]Answer:[white]\n" +
+            "[/][bold blue]Answer:[white]\n" +
             f"{question_output.strip()}\n[/]"
         )
     info("\n" + "\n".join(text))

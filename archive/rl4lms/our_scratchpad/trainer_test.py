@@ -1,5 +1,4 @@
 import transformers
-import torch
 import deepspeed
 
 

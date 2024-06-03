@@ -16,16 +16,12 @@ import enum
 import logging
 import os
 import random
-import re
 import time
 import typing
-from pathlib import Path
 
 import accelerate
-import datasets
 import fire
 import general_utils as utils
-import matplotlib.pyplot as plt
 import more_itertools
 import numpy as np
 import rich
@@ -294,7 +290,8 @@ def eval_on_dataloader(
             for x in batch_entry]
             for batch_entry in output
         ]
-        split_lambda = lambda x: split_fn(x, accelerator.process_index)
+        def split_lambda(x):
+            return split_fn(x, accelerator.process_index)
         answer_decoded = [list(map(split_lambda, x)) for x in raw_decoded]
 
         for (
@@ -349,7 +346,7 @@ def eval_on_dataloader(
 
     assert per_process_good_bad, (
         per_process_good_bad is None, 
-        len(per_process_good_bad) if not per_process_good_bad is None else None  # Don't take the len if it's None
+        len(per_process_good_bad) if per_process_good_bad is not None else None  # Don't take the len if it's None
     )
 
     all_good_bad = accelerator.gather(torch.tensor(per_process_good_bad).to(accelerator.device)).tolist()
@@ -359,7 +356,7 @@ def eval_on_dataloader(
 
     assert all_good_bad, (
         all_good_bad is None, 
-        len(all_good_bad) if not all_good_bad is None else None
+        len(all_good_bad) if all_good_bad is not None else None
     )
     
     accuracy = np.mean(all_good_bad)
@@ -368,11 +365,11 @@ def eval_on_dataloader(
         LOGGER.info(args)
         LOGGER.info(
             "\n" * 2 +
-            f"#" * 80 + 
+            "#" * 80 + 
             "\n" +
             f"[bold green]Split:    {split_name}\n" +
             f"[bold green]Accuracy: {accuracy:.1%}\n" +
-            f"#" * 80 + 
+            "#" * 80 + 
             "\n" * 2
         )
 
@@ -445,7 +442,7 @@ def run(
         tokenizer_name_or_path,
     )
     with one_by_one(accelerator):
-        LOGGER.info(f"[bold blue]Done loading tokenizer.")
+        LOGGER.info("[bold blue]Done loading tokenizer.")
 
     if which_dataset_to_use == DatasetChoices.asdiv:
         dataset_train = dataset_asdiv.ZeroShotASDivTextGenPool.prepare("train")
@@ -488,7 +485,7 @@ def run(
         if context:
             LOGGER.info(f"[bold blue]Few-shot Context (N={n_shots})[/]:\n" + context)
         else:
-            LOGGER.info(f"[bold blue]No few-shot context.[/]")
+            LOGGER.info("[bold blue]No few-shot context.[/]")
 
     ###############################################################################
     # Load the model

@@ -4,7 +4,6 @@ import deepspeed
 import fire
 import rich
 import rich.logging
-import torch
 import transformers
 
 LOGGER = logging.getLogger(__name__)

@@ -1,0 +1,14 @@
+beartype
+datasketch
+editdistance
+fire
+h5py
+h5py
+lorem
+more_itertools
+natsort
+pretty_traceback
+text2digits
+rich
+tqdm
+wget

@@ -12,16 +12,11 @@ Some notes:
 """
 
 print("Importing modules.")
-import collections
-import dataclasses
-import enum
-import itertools
 import json  # type: ignore[import]
 import math
 import os
 from pathlib import Path
 import random
-import re
 import sys
 import time
 from typing import *
@@ -450,7 +445,7 @@ def _load_data(
             cv_path = dataset_path / f"{set_}.jsonl"
             
             with jsonl.open(cv_path) as f:
-                CONSOLE.print_zero_rank(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
+                CONSOLE.print_zero_rank("\n[bold]Loading a dataset file: [/bold]", str(cv_path))
                 raw_data = list(f)
                 CONSOLE.print_zero_rank(f"\n[bold]Done loading a dataset file: [/bold] {cv_path}, took {time.perf_counter() - start:0.2f}s", )
 
@@ -463,7 +458,7 @@ def _load_data(
         elif mode == constants.DataModes.HDF5_PRETOK:
             cv_path = dataset_path / f"{set_}.h5"
             
-            CONSOLE.print_zero_rank(f"\n[bold]Loading a dataset file: [/bold]", str(cv_path))
+            CONSOLE.print_zero_rank("\n[bold]Loading a dataset file: [/bold]", str(cv_path))
             with h5py.File(cv_path, "r") as f:
                 keys_to_do = [key for key in f if not key.endswith("_text")]
                 for key in keys_to_do:
@@ -640,7 +635,7 @@ def _setup_tokenizer(hf_name: str, is_gpt2_model) -> transformers.PreTrainedToke
         )
         
         utils.setattr_must_exist(tokenizer, "padding_side", "left")        
-        CONSOLE.print_zero_rank(f"Tokenizer loaded.")
+        CONSOLE.print_zero_rank("Tokenizer loaded.")
         return tokenizer
     else:
         raise ValueError(f"Unsupported tokenizer mode: {TOKENIZER_MODE}")
@@ -672,7 +667,7 @@ def _initialize_base_model(
     # Random Model
     ###########################################################################
     if model_mode == constants.ModelModes.RANDOM :
-        CONSOLE.print_zero_rank(f"\n[bold]USING A NON PRETRAINED MODEL.")
+        CONSOLE.print_zero_rank("\n[bold]USING A NON PRETRAINED MODEL.")
 
         config = transformers.AutoConfig.from_pretrained(hf_name)
         utils.setattr_must_exist(config, "vocab_size", len(tokenizer.vocab))  # type: ignore[attr-defined]
@@ -681,7 +676,7 @@ def _initialize_base_model(
         # Random model with custom config
         ###########################################################################
         if custom_model_config is not None:
-            CONSOLE.print_zero_rank(f"\n[bold]USING CUSTOM MODEL CONFIGURATION.")
+            CONSOLE.print_zero_rank("\n[bold]USING CUSTOM MODEL CONFIGURATION.")
             for k, v in custom_model_config.items():
                 utils.setattr_must_exist(config, k, v)
 
@@ -692,7 +687,7 @@ def _initialize_base_model(
     # Pretrained model
     ###########################################################################
     elif model_mode == constants.ModelModes.PRETRAINED:
-        CONSOLE.print_zero_rank(f"\n[bold GREEN]USING A PRETRAINED MODEL.")
+        CONSOLE.print_zero_rank("\n[bold GREEN]USING A PRETRAINED MODEL.")
         base_model = transformers.GPT2LMHeadModel.from_pretrained(hf_name)
 
     else:
@@ -764,7 +759,7 @@ def _compute_batch_size_defaults(
 
 @beartype
 def _make_config_path(checkpoints_root_dir: Path, run_name: str, wandb_run_id: str) -> Path:
-    return checkpoints_root_dir / run_name / wandb_run_id / f"last.json"
+    return checkpoints_root_dir / run_name / wandb_run_id / "last.json"
 
 
 
@@ -995,7 +990,7 @@ def main(
 
     if TOKENIZER_MODE == constants.TokenizerModes.ARITHMETIC:
         assert DATA_MODE == constants.DataModes.JSONL, (
-            f"We only support JSONL for arithmetic tokenizer, as things "
+            "We only support JSONL for arithmetic tokenizer, as things "
             "are pre-tokenized in the h5 mode. {DATA_MODE}"
         )
 

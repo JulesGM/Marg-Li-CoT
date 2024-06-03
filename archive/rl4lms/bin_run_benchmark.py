@@ -25,13 +25,9 @@ import general_utils as utils
 import pretty_traceback
 import rich
 import rich.logging
-import torch
 import transformers
 import yaml
 
-import dataset_gsm8k
-import metric
-import policy
 
 datasets.logging.set_verbosity_error()
 transformers.logging.set_verbosity_error()

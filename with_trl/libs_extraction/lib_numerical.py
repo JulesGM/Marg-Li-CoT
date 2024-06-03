@@ -1,20 +1,18 @@
 import logging
 import math
 import re
-import typing
-from typing import Any, Optional, Union
+from typing import Optional
 
 import more_itertools
-import numpy as np
 import text2digits
 
-import lib_utils
-import libs_extraction.lib_base
+from with_trl import lib_utils
+from . import lib_base
 
 LOGGER = logging.getLogger(__name__)
 
 
-class ConvToNum(libs_extraction.lib_base.Extractor):
+class ConvToNum(lib_base.Extractor):
     """Converts words to numbers.
     
     As a BaseExtractor, __call__ returns a single answer, and compare compares two answers.
@@ -61,12 +59,12 @@ class ConvToNum(libs_extraction.lib_base.Extractor):
 
         LOGGER.log(
             level,
-            f"\n[green bold]Converted words to numbers.\n"
+            "\n[green bold]Converted words to numbers.\n"
             + (f"change_stats: {change_str}\n" if change_stats else "")
             + f"{initial}\n"
-            + f"[green]-> with words ->[white]\n"
+            + "[green]-> with words ->[white]\n"
             + f"{text_diff}\n"
-            + f"[green]-> with numbers ->[white]\n"
+            + "[green]-> with numbers ->[white]\n"
             + f"{converted_diff}\n"
             + (
                 ""

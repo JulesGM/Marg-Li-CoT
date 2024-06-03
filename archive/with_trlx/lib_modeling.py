@@ -1,19 +1,10 @@
 
-import gc
-import inspect
-from copy import deepcopy
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Union
 
-import numpy as np
 import peft
 import torch
-import torch.nn as nn
 import transformers
-from torchtyping import TensorType
 from transformers.modeling_outputs import ModelOutput
-from transformers.models.bloom import modeling_bloom
-from transformers.models.opt import modeling_opt
 
 from trlx.models.modeling_base import PreTrainedModelWrapper
 from trlx.utils.modeling import (
@@ -21,7 +12,6 @@ from trlx.utils.modeling import (
     make_head,
 )
 from trlx.models.modeling_ppo import (
-    AutoModelForSeq2SeqLMWithValueHead,
     Seq2SeqLMOutputWithValue,
     PreTrainedModelWrapper
 )

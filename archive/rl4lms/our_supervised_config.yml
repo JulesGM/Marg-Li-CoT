@@ -1,0 +1,59 @@
+alg:
+  generation_kwargs:
+    do_sample: False
+    max_new_tokens: 200
+    min_length: 0
+    post_processing_fn: null
+    repetition_penalty: 2.0
+
+  id: supervised
+  model_name: google/flan-t5-xl
+  torch_dtype: bfloat16
+
+  model_type: seq2seq
+  training_args:
+    learning_rate: 0.0001
+    logging_steps: 100
+    lr_scheduler_type: cosine
+    num_train_epochs: 100000
+    
+    per_device_train_batch_size: 15
+    save_total_limit: 1
+    weight_decay: 0.1
+    bf16: true
+
+datapool:
+  args:
+    # answer_prompt: 'The anwser is: '
+    path: "gsm8k_gpt3_caden/outputs/data_goods.jsonl"
+    max_answer_len: null # 192
+    max_question_len: null # 112
+    max_sum_squares: null # 41957
+    tokenizer_or_name_or_path: google/flan-t5-base
+
+  id: silver_supervised_gsm8k_text_gen_pool #supervised_gsm8k_text_gen_pool
+
+tokenizer:
+  model_name: google/flan-t5-base
+  pad_token_as_eos_token: false
+  padding_side: left
+  truncation_side: right
+
+train_evaluation:
+  supervised_deepspeed: "/home/mila/g/gagnonju/Marg-Li-CoT/rl4lms/config_ds_json/deepspeed.json"
+  # supervised_deepspeed: "/home/mila/g/gagnonju/Marg-Li-CoT/rl4lms/config_ds_json/zero_3.json"
+  supervised_output_dir: "/home/mila/g/gagnonju/Marg-Li-CoT/rl4lms/rl4lms_supervised_ckpt"
+  eval_batch_size: 30
+  metrics:
+  - args: {}
+    id: word_math_int_scratchpad_answer_accuracy
+  - args: {}
+    id: meteor
+  - id: rouge
+  - args: {}
+    id: bleu
+  # - args:
+  #     language: en
+  #   id: bert_score
+  - args: {}
+    id: diversity

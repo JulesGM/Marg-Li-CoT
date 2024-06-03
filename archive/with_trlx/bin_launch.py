@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 import os
 import itertools
-import shlex
-import sys
 import fire
 import rich
 import subprocess

@@ -8,7 +8,6 @@ import collections
 import enum
 import multiprocessing.pool as mp_pool
 from pathlib import Path
-import shutil
 import time
 import hashlib
 
@@ -101,11 +100,11 @@ class FakePool:
             return self._result
     
     def apply_async(self, func, args, kwargs):
-        rich.print(f"\n[bold]FakePool.[/bold]")
+        rich.print("\n[bold]FakePool.[/bold]")
         rich.print(f"func: {func}")
-        rich.print(f"args:")
+        rich.print("args:")
         gu.print_list(args)
-        rich.print(f"kwargs:")
+        rich.print("kwargs:")
         gu.print_dict(kwargs)
         return self._FakeAsyncResult(func(*args, **kwargs))
 
@@ -168,7 +167,7 @@ def main(
                 jobs.append(pool.apply_async(convert_jsonl_data_to_h5py, (), shared_kwargs))
             elif h5_hf_name is None or h5_hf_name != hf_name:
                 rich.print(f"\"{path_h5}\" exists but tokenizer name does not match. `{hf_name}` in args, `{h5_hf_name}` in current h5 file.")
-                decision = input(f"Do you want to recreate it? [y/n]")
+                decision = input("Do you want to recreate it? [y/n]")
                 if decision.lower() == "y":
                     jobs.append(pool.apply_async(convert_jsonl_data_to_h5py, (), shared_kwargs))
             else:

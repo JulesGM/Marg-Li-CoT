@@ -1,14 +1,9 @@
 import bisect
-import collections
-import copy
 import logging
 
-import fire
-import numpy as np
 import rich
 import rich.logging
 import time
-import torch
 import transformers
 import re
 
@@ -149,11 +144,11 @@ def extract_match_tokens(*, regexes, strings, tokenizer, tokenizer_kwargs=None, 
                     # f"[bold blue]l_b_left:[/]          {lb_left}"    + "\n"+
                     # f"[bold blue]r_b_right:[/]         {rb_right}"   + "\n"+
                     # f"[bold blue]r_b_left:[/]          {rb_left}"    + "\n" +
-                    f"[bold blue]l_b:[/]               " + str([(i, int(b)) for i, b in enumerate(l_b)]) + "\n" +
-                    f"[bold blue]r_b:[/]               " + str([(i, int(b)) for i, b in enumerate(r_b)]) + "\n" +
-                    f"[bold blue]both boundaries:[/]   " + str([(i, (int(l), int(r))) for i, (l, r) in enumerate(zip(l_b, r_b))]) + "\n" +
-                    f"[bold blue]tokens:[/]            " + str([(i, tokenizer.decode([t], skip_special_tokens=False)) for i, t in enumerate(toks)]) + "\n" +
-                    f"[bold blue]token ids:[/]         " + str([(i, int(t)) for i, t in enumerate(toks)]) + "\n" +
+                    "[bold blue]l_b:[/]               " + str([(i, int(b)) for i, b in enumerate(l_b)]) + "\n" +
+                    "[bold blue]r_b:[/]               " + str([(i, int(b)) for i, b in enumerate(r_b)]) + "\n" +
+                    "[bold blue]both boundaries:[/]   " + str([(i, (int(l), int(r))) for i, (l, r) in enumerate(zip(l_b, r_b))]) + "\n" +
+                    "[bold blue]tokens:[/]            " + str([(i, tokenizer.decode([t], skip_special_tokens=False)) for i, t in enumerate(toks)]) + "\n" +
+                    "[bold blue]token ids:[/]         " + str([(i, int(t)) for i, t in enumerate(toks)]) + "\n" +
                     "-" * 40 + "\n"
                 )
                 assert start_idx <= end_idx, f"{start_idx = } {end_idx = }"

@@ -7,17 +7,13 @@ import textwrap
 from collections import abc
 from typing import *
 
-import accelerate
-import datasets
 import general_utils as utils
 import more_itertools
 import numpy as np
-import pandas as pd
 import rich
 import rich.console
 import text2digits
 import torch
-import tqdm
 import transformers
 from beartype import beartype
 
@@ -97,7 +93,7 @@ def flan_t5_answer_joiner(
 
     assert isinstance(tokenizer, transformers.PreTrainedTokenizerBase), type(tokenizer)
 
-    joiner_tokens = tokenizer.encode(f". Answer: ", add_special_tokens=False,)
+    joiner_tokens = tokenizer.encode(". Answer: ", add_special_tokens=False,)
 
     output = scratchpad + joiner_tokens + answer + [tokenizer.eos_token_id]
 
@@ -268,18 +264,18 @@ class ScratchpadAnswerReward(rl4lms_reward.RewardFunction, torch.nn.Module):
                     rae.update(0)
                     raenz.update(len(encoded_generated_scratchpad))
                     self._log(
-                        f"Scratchpad length (no zero)",
+                        "Scratchpad length (no zero)",
                         f"{raenz.mean():.1f} +- {raenz.std():.1f}",
                     )
                 else:
                     rae.update(1)
                     self._log(
-                        f"Got an empty scratchpad. ", f"{rae.mean():.1%} or {int(rae.sum())}/{len(rae)}"
+                        "Got an empty scratchpad. ", f"{rae.mean():.1%} or {int(rae.sum())}/{len(rae)}"
                     )
 
                 ral = self._running_average_length_sp
                 ral.update(len(encoded_generated_scratchpad))
-                self._log(f"Scratchpad length", f"{ral.mean():.1f} +- {ral.std():.1f}")
+                self._log("Scratchpad length", f"{ral.mean():.1f} +- {ral.std():.1f}")
 
 
                 # -------------------------------------------------------------

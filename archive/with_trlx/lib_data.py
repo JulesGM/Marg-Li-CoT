@@ -11,9 +11,6 @@ import xml
 from pathlib import Path
 
 # import datasketch
-import editdistance
-import general_utils
-import itertools
 import more_itertools
 import numpy as np
 import rich
@@ -87,12 +84,12 @@ class ConvToNum:
 
         LOGGER.log(
             level,
-            f"\n[green bold]Converted words to numbers.\n" +
+            "\n[green bold]Converted words to numbers.\n" +
             (f"change_stats: {change_str}\n" if change_stats else "") +
             f"{initial}\n" +
-            f"[green]-> with words ->[white]\n" +
+            "[green]-> with words ->[white]\n" +
             f"{text_diff}\n" +
-            f"[green]-> with numbers ->[white]\n" +
+            "[green]-> with numbers ->[white]\n" +
             f"{converted_diff}\n" +
             (
                 "" if converted != final else 
@@ -344,7 +341,7 @@ class ApproxMatcher:
             rich.table.Column(header="Num chars", style="white"),
             rich.table.Column(header="Num BPE",   style="white"),
             show_lines=True,
-            title=f"PREFIX MATCHED",
+            title="PREFIX MATCHED",
             box=rich.box.ROUNDED,
         )
         

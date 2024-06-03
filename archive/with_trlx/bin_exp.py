@@ -26,7 +26,6 @@ import random
 from pathlib import Path
 from typing import *
 
-import accelerate
 import datasets
 import fire
 import general_utils
@@ -199,7 +198,6 @@ def stats_for_key(
     """
     stuff = collections.Counter()
     shortest = []
-    field_options = ("inputs", "labels")
 
     for entry in ds:
         # 1. Extract the text of the inputs or of the labels

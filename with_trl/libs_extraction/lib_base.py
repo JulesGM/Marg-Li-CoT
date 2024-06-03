@@ -1,6 +1,5 @@
 import abc
 
-
 class Extractor(abc.ABC):
     @abc.abstractmethod
     def __call__(self, text):

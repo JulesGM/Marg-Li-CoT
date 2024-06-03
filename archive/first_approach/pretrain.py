@@ -213,7 +213,6 @@ class PreTrain(pl.LightningModule):
 
 
     def train_dataloader(self):        
-        mode = constants.PipelineModes.MLE_TRAINING, 
 
         return torch.utils.data.DataLoader(
             self._datasets[constants.PipelineModes.MLE_TRAINING],

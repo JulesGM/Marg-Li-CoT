@@ -1,8 +1,6 @@
 import fire
 import os
-import rich
 import torch
-import general_utils
 
 
 def main(backend="nccl"):

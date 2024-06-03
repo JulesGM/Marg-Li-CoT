@@ -1,11 +1,9 @@
 import collections
 import logging
 import os
-import random
 import re
 import typing
 
-import accelerate
 import general_utils
 import more_itertools
 import numpy as np
@@ -14,7 +12,6 @@ import transformers
 
 import lib_bisect_tokens
 import lib_data
-import lib_metric
 
 LOGGER = logging.getLogger(__name__)
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])

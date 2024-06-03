@@ -1,8 +1,8 @@
 import re
-import libs_extraction.lib_base
+from with_trl.libs_extraction import lib_base
 
 
-class MultipleChoiceRegexExtractor(libs_extraction.lib_base.Extractor):
+class MultipleChoiceRegexExtractor(lib_base.Extractor):
     def __init__(self, choices):
         self._choices = choices
         self._pat = re.compile(r"\w+")
@@ -58,7 +58,7 @@ class MultipleChoiceRegexExtractor(libs_extraction.lib_base.Extractor):
 
 
 
-class MultipleChoiceRfindExtractor(libs_extraction.lib_base.Extractor):
+class MultipleChoiceRfindExtractor(lib_base.Extractor):
     def __init__(self, choices):
         for choice in choices:
             assert isinstance(choice, str), type(choice).mro()
@@ -107,7 +107,7 @@ class MultipleChoiceRfindExtractor(libs_extraction.lib_base.Extractor):
     __call__ = parse_one
 
 
-class MultipleChoiceSTARExtractor(libs_extraction.lib_base.Extractor):
+class MultipleChoiceSTARExtractor(lib_base.Extractor):
     def __init__(self, choices, eos_token_text):
         self._eos_token_text = eos_token_text
         self._choices = choices
@@ -140,5 +140,5 @@ class MultipleChoiceSTARExtractor(libs_extraction.lib_base.Extractor):
 
 
 if __name__ == "__main__":
-    import ipdb; 
+    import ipdb 
     ipdb.set_trace()

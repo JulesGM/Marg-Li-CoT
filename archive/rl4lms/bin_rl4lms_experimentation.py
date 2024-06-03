@@ -1,38 +1,23 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import datetime
 import enum
-import json
 import logging
 import os
-import pickle
-import re
-import sys
 import types
-from pathlib import Path
 from typing import *
 
 import datasets
 import general_utils
 import general_utils as utils
-import numpy as np
 import pretty_traceback
 import rich
 import rich.console
 import torch
 import transformers
-import yaml
-from text2digits import text2digits
-from tqdm import tqdm
 
-import dataset_asdiv
-import dataset_gsm8k
-import metric
-import policy
 import reward
 import rl4lms.envs.text_generation.logging_utils as rl4lms_logging_utils
-import rl4lms.envs.text_generation.registry as rl4lms_registry
 import rl4lms.envs.text_generation.training_utils as rl4lms_training_utils
 from bin_deepspeed_experim import make_deepspeed_config
 
@@ -129,10 +114,8 @@ _shared_pol_args = {
 }
 
 
-POL_BASIC = lambda _: {
-    "id": "seq2seq_lm_actor_critic_policy",
-    "args": _shared_pol_args,
-}
+def POL_BASIC(_):
+    return {"id": "seq2seq_lm_actor_critic_policy", "args": _shared_pol_args}
 
 
 reward_parallelism_mode = None
@@ -146,32 +129,12 @@ else:
     raise NotImplementedError
 
 
-POL_CUSTOM = lambda reward_model_inst: {
-    "id": "precision_control_seq2seq_lm_actor_critic_policy",
-    "args": {
-        "from_pretrained_kwargs": {"torch_dtype": POLICY_DTYPE},
-        "head_kwargs": {"dtype": POLICY_DTYPE},
-        "same_model_for_value": True,
-        "ref_model": reward_model_inst,
-    }
-    | _shared_pol_args,
-}
+def POL_CUSTOM(reward_model_inst):
+    return {"id": "precision_control_seq2seq_lm_actor_critic_policy", "args": {"from_pretrained_kwargs": {"torch_dtype": POLICY_DTYPE}, "head_kwargs": {"dtype": POLICY_DTYPE}, "same_model_for_value": True, "ref_model": reward_model_inst} | _shared_pol_args}
 
 
-POL_DEEPSPEED = lambda _: {
-    "id": "deepspeed_experimentation_policy",
-    "args": {
-        "ds_configs": make_deepspeed_config(
-            batch_size=N_ENVS_TRAIN,
-            wandb_config={
-                "enabled": True,
-                "team": "julesgm",
-                "project": "rl4lms-deepspeed",
-            },
-        )
-    }
-    | _shared_pol_args,
-}
+def POL_DEEPSPEED(_):
+    return {"id": "deepspeed_experimentation_policy", "args": {"ds_configs": make_deepspeed_config(batch_size=N_ENVS_TRAIN, wandb_config={"enabled": True, "team": "julesgm", "project": "rl4lms-deepspeed"})} | _shared_pol_args}
 
 
 POLICY_MAP = {
@@ -223,7 +186,7 @@ def clean_config_for_wandb(config_node: Any) -> Any:
 def main():
 
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
-    global_rank = int(os.getenv("RANK", "0"))
+    int(os.getenv("RANK", "0"))
     world_size = int(os.getenv("WORLD_SIZE", "1"))
 
     logging.basicConfig(

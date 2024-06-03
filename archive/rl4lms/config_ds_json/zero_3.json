@@ -1,0 +1,53 @@
+{
+    "micro_batch_size_per_gpu": "auto",
+    "micro_batch_per_gpu": "auto",
+    "train_batch_size": "auto",
+    "steps_per_print": 1,
+    "bf16": {
+        "enabled": "auto"
+    },
+    "f16": {
+        "enabled": "auto"
+    },
+
+    "wandb": {
+        "team": "julesgm",
+        "project": "supervised_learning",
+        "enabled": true
+    },
+
+    "wall_clock_breakdown": true,
+    "gradient_accumulation_steps": 1,
+    "optimizer": {
+        "type": "Adam",
+        "params": {
+            "lr": 0.0001,
+            "betas": [
+                0.9,
+                0.999
+            ]
+        },
+        "grad_accum_dtype": "bfloat16"
+    },
+    "zero_optimization": {
+        "stage": 3,
+        "overlap_comm": true,
+        
+        "stage3_prefetch_bucket_size": "auto",
+        "stage3_param_persistence_threshold": "auto",
+        "stage3_gather_16bit_weights_on_model_save": true,
+
+        "contiguous_gradients": true,
+        "reduce_bucket_size": "auto",
+        
+        "sub_group_size": 1000000000.0,
+        "stage3_max_reuse_distance": 1000000000.0,
+        "stage3_max_live_parameters": 1000000000.0,
+        
+        "offload_param": {
+            "device": "cpu",
+            "pin_memory": true
+        }
+    },
+    "grad_accum_dtype": "bfloat16"    
+}

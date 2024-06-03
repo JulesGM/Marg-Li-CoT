@@ -124,14 +124,14 @@ def build_match_stat_matrixes(scratchpad_matches, value_matches):
     p_good_sp = p_good_sp_good_va + p_good_sp_baad_va
     p_baad_sp = p_baad_sp_good_va + p_baad_sp_baad_va
 
-    p_good_sp_knowing_good_va = p_good_sp_good_va / p_good_va  # p(good_sp | good_va, x)
-    p_good_sp_knowing_baad_va = p_good_sp_baad_va / p_baad_va  # p(good_sp | baad_va, x)
-    p_baad_sp_knowing_good_va = p_baad_sp_good_va / p_good_va  # p(baad_sp | good_va, x)
-    p_baad_sp_knowing_baad_va = p_baad_sp_baad_va / p_baad_va  # p(baad_sp | baad_va, x)
+    p_good_sp_good_va / p_good_va  # p(good_sp | good_va, x)
+    p_good_sp_baad_va / p_baad_va  # p(good_sp | baad_va, x)
+    p_baad_sp_good_va / p_good_va  # p(baad_sp | good_va, x)
+    p_baad_sp_baad_va / p_baad_va  # p(baad_sp | baad_va, x)
 
 
-    p_baad_va_knowing_good_sp = p_good_sp_baad_va / p_good_sp  # p(baad_va | good_sp, x)
-    p_baad_va_knowing_baad_sp = p_baad_sp_baad_va / p_baad_sp  # p(baad_va | baad_sp, x)
+    p_good_sp_baad_va / p_good_sp  # p(baad_va | good_sp, x)
+    p_baad_sp_baad_va / p_baad_sp  # p(baad_va | baad_sp, x)
 
     # Most important stat
     p_good_va_knowing_good_sp = p_good_sp_good_va / p_good_sp  # p(good_va | good_sp, x)
@@ -164,7 +164,7 @@ def fix_model_params_in_place(model):
 
 
 def shared_validation_step(lightning_module, batch, batch_idx, chainer):
-    utils.rich_print_zero_rank(f"\n\n[red bold]VALIDATION STEP!")
+    utils.rich_print_zero_rank("\n\n[red bold]VALIDATION STEP!")
     utils.check_equal("cuda", lightning_module._model.device.type)
     assert "labels" in batch, "Labels must be in batch. We must mask the input section with -100"
     mode: Final[str] = constants.PipelineModes.VALIDATION
@@ -324,7 +324,7 @@ def print_predictions(*, inputs, masks, generated_decoded, labels, all_generated
         CONSOLE.print(f"[bold {color}]\[gen-generated][/] {gen}")
         CONSOLE.print(f"[bold]\[gen-all-labels] {all_l}")
         CONSOLE.print(f"[bold]\[gen-all-gen] {all_g}")
-        CONSOLE.print(f"[bold]" + "=" * 80)
+        CONSOLE.print("[bold]" + "=" * 80)
 
 
 def special_gather(

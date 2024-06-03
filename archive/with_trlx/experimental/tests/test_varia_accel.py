@@ -2,13 +2,11 @@ import accelerate
 import datasets
 import transformers
 import torch
-import numpy as np
 
 import logging
 import rich.logging
 import fire
 
-import itertools
 import os
 
 import general_utils
