@@ -11,22 +11,16 @@ DETERMINISTIC = False
 if DETERMINISTIC:
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-import contextlib
-import datetime
 import enum
 import itertools as it
-import json
 import logging
 import pathlib
 import random
-import shutil
 import sys
-from typing import Any, Optional, Union
 
 import accelerate
 import datasets
 import fire
-import more_itertools as mit
 import numpy as np
 import peft
 import rich
@@ -246,7 +240,7 @@ def forward_pass(
     ############################################################################
     if is_encoder_decoder:
         assert False
-        input_ids = model_inputs["decoder_input_ids"]
+        model_inputs["decoder_input_ids"]
         attention_mask = model_inputs["decoder_attention_mask"]
     else:
         attention_mask = model_inputs["attention_mask"]

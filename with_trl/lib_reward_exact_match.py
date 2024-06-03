@@ -1,7 +1,6 @@
 import logging
 
 import numpy as np
-import rich
 import torch
 
 import lib_base_classes

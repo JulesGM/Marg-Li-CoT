@@ -28,7 +28,7 @@ def main(in_path=SCRIPT_DIR, out_root=SCRIPT_DIR, dry=False):
 
         rich.print("Dir is:")
         rich.print(f"\t - {dir_}")
-        rich.print(f"Files are:")
+        rich.print("Files are:")
         for file_ in files:
             rich.print(f"\t - {file_}")
         

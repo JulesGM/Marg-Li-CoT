@@ -1,11 +1,8 @@
-import collections
 import logging
 import os
-import random
 import re
 import typing
 
-import accelerate
 import general_utils
 import more_itertools
 import numpy as np
@@ -19,7 +16,6 @@ import transformers
 
 import lib_base_classes
 import lib_bisect_tokens
-import lib_data
 import lib_utils
 
 LOGGER = logging.getLogger(__name__)
@@ -97,7 +93,7 @@ class ScratchpadRewardFn(lib_base_classes.Reward):
         metric_fn: typing.Callable,
     ):
         super().__init__()
-        raise NotImplemented("Fix the extractor stuff")
+        raise NotImplementedError("Fix the extractor stuff")
 
         # ----------------------------------------------------------------
         # Set Attributes
@@ -250,7 +246,7 @@ class ScratchpadRewardFn(lib_base_classes.Reward):
                 )
 
             with timer(
-                f"> Computing the logits with the ref model for the reward."
+                "> Computing the logits with the ref model for the reward."
                 + f"{question_tok['input_ids'].shape = }",
                 **timer_flags,
             ):

@@ -1,14 +1,7 @@
-import collections
-import itertools
-import math
-import random
 import re
 import xml
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import more_itertools
-import numpy as np
 import rich
 import rich.table
 import torch
@@ -131,7 +124,7 @@ class ASDivInteger(torch.utils.data.Dataset):
 
 
 def _build_dataset_integer(split):
-    return ASDivInteger(cache_path=f"asdiv.xml", quiet=True,)
+    return ASDivInteger(cache_path="asdiv.xml", quiet=True,)
 
 
 class ZeroShotASDivTextGenPool:

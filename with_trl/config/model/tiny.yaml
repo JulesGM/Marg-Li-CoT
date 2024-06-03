@@ -1,4 +1,6 @@
 model_name: "EleutherAI/pythia-70m-deduped"
-batch_size: 2
-inference_batch_size: 2
-mini_batch_size: 2
+inference_batch_size: 1
+mini_batch_size: 1
+generation_batch_size: 16
+
+gradient_accumulation_steps: 1

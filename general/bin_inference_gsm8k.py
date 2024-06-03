@@ -19,19 +19,14 @@ import collections
 import enum
 import itertools
 import logging
-from pathlib import Path
 import random
-import re
-import sys
 import time
 import typing
 
 import accelerate
 from dataclasses import dataclass
-import datasets
 import fire
 import general_utils as utils
-import matplotlib.pyplot as plt
 import more_itertools
 import numpy as np
 import rich
@@ -429,7 +424,7 @@ def log_generations(
 
     rich.print(table)
     rich.print(lines_kwargs)
-    rich.print(f"#" * 80)
+    rich.print("#" * 80)
 
 
 def eval(
@@ -512,7 +507,7 @@ def eval(
 
     assert per_process_good_bad, (
         per_process_good_bad is None, 
-        len(per_process_good_bad) if not per_process_good_bad is None else None  # Don't take the len if it's None
+        len(per_process_good_bad) if per_process_good_bad is not None else None  # Don't take the len if it's None
     )
 
     per_process_good_bad = torch.tensor(per_process_good_bad).to(accelerator.device)
@@ -525,7 +520,7 @@ def eval(
 
     assert all_good_bad, (
         all_good_bad is None, 
-        len(all_good_bad) if not all_good_bad is None else None
+        len(all_good_bad) if all_good_bad is not None else None
     )
     
     accuracy = np.mean(all_good_bad)
@@ -534,11 +529,11 @@ def eval(
         LOGGER.info(args)
         LOGGER.info(
             "\n" * 2 +
-            f"#" * 80 + 
+            "#" * 80 + 
             "\n" +
             f"[bold green]Split:    {split_name}\n" +
             f"[bold green]Accuracy: {accuracy:.1%}\n" +
-            f"#" * 80 + 
+            "#" * 80 + 
             "\n" * 2
         )
 
@@ -615,7 +610,7 @@ def init_tokenizer_and_datasets(
             tokenizer.pad_token = tokenizer.eos_token
         
     with one_by_one(accelerator):
-        LOGGER.info(f"[bold blue]Done loading tokenizer.")
+        LOGGER.info("[bold blue]Done loading tokenizer.")
 
     
     print(f"Doing data: {which_dataset_to_use}")
@@ -672,7 +667,7 @@ def init_tokenizer_and_datasets(
         if context:
             LOGGER.info(f"[bold blue]Few-shot Context (N={n_shots})[/]:\n" + context)
         else:
-            LOGGER.info(f"[bold blue]No few-shot context.[/]")
+            LOGGER.info("[bold blue]No few-shot context.[/]")
     
     collator = Collator(
         tokenizer=tokenizer, 

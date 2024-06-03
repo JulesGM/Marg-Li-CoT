@@ -1,18 +1,16 @@
 import logging
-import math
 import os
 import re
 import typing
-from typing import Any, Optional, Union
+from typing import Optional
 
-import general_utils as utils
 import more_itertools
 import multiset
 import numpy as np
 
-import lib_base_classes
-import libs_extraction
-import lib_utils
+from with_trl import lib_base_classes
+from with_trl import libs_extraction
+from with_trl import lib_utils
 
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
@@ -29,6 +27,8 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
     def __init__(self, extractor, pad_token):
         self._extractor = extractor
         self._pad_token = pad_token
+        assert self._pad_token is not None, self._pad_token
+        assert self._extractor is not None, self._extractor
 
     def _make_comparable(
         self, match: re.Match, original_text: typing.Optional[str] = None
@@ -109,7 +109,7 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
                     extracted_gen, extracted_ref)))
             else:
                 LOGGER.debug(
-                    f"[bold yellow]gen is None:[/] " +
+                    "[bold yellow]gen is None:[/] " +
                     f"{raw_gen = } {extracted_gen = }")
                 em_values.append(0.0)
         return em_values, parsed
@@ -162,7 +162,7 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
         )
 
         assert len(em_values) == len(generated_texts) == len(reference_answer_texts), (
-            f"\n"
+            "\n"
             + f"{len(generated_texts)   = }\n"
             + f"{len(reference_answer_texts)   = }\n"
             + f"{len(em_values)          = }"

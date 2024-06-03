@@ -4,7 +4,7 @@ import collections.abc
 import logging
 import re
 import typing
-from typing import Any, Optional, Union
+from typing import Optional
 
 import more_itertools
 import rich

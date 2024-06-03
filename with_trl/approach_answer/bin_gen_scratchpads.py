@@ -19,19 +19,15 @@ import os
 # os.environ["NCCL_DEBUG"] = "WARN"
 ###############################################################################
 
-import json
 import logging
 import pathlib
 import sys
-from typing import Any, Optional, Union
+from typing import Any
 
 import accelerate
 import datasets
 import fire
-import h5py
 import more_itertools as mit
-import numpy as np
-import peft
 import rich
 import rich.markup
 import rich.traceback
@@ -212,7 +208,7 @@ def gathered_batch_gen(
     # We don't pad locally to save on transfer qties.
     ###########################################################################
     if do_distillation:
-        clean_logits = lib_approach_utils.pad_logits_across_processes(
+        lib_approach_utils.pad_logits_across_processes(
             accelerator=accelerator,
             logits=clean_logits, 
             fill_value=float("nan"), 

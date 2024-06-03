@@ -1,9 +1,7 @@
 """Base classes for metrics and rewards."""
 from __future__ import annotations
 
-import abc
 import dataclasses
-import enum
 import typing
 from dataclasses import dataclass
 from typing import Optional
@@ -17,7 +15,12 @@ from beartype import beartype
 
 @beartype
 class BatchedUnrollReturn:
-    def __init__(self, *, response_tensors, raw_response_tensors, any_tokenizer):
+    def __init__(
+            self, *, 
+            response_tensors, 
+            # raw_response_tensors, 
+            any_tokenizer,
+        ):
         """
         The exctractors expect there to be no padding tokens in the response.
 
@@ -28,20 +31,11 @@ class BatchedUnrollReturn:
         """
         
         self._response_tensors = response_tensors
-        self._raw_response_tensors = raw_response_tensors
+        # self._raw_response_tensors = raw_response_tensors
 
         self._response_text = any_tokenizer.batch_decode(
             self.response_tensors, skip_special_tokens=True,
         )
-
-        if (self._raw_response_tensors is None or 
-            self._raw_response_tensors is response_tensors):
-            self._raw_response_text = self._response_text
-            self._raw_response_tensors = self._response_tensors
-        else:
-            self._raw_response_text = any_tokenizer.batch_decode(
-                self._raw_response_tensors,
-            )
 
 
     @property
@@ -52,22 +46,6 @@ class BatchedUnrollReturn:
     def response_text(self):
         return self._response_text
 
-    @property
-    def raw_response_tensors(self):
-        return self._raw_response_tensors
-    
-    @property
-    def raw_response_text(self):
-        return self._raw_response_text
-    
-    @raw_response_tensors.setter
-    def raw_response_tensors(self, value):
-        raise RuntimeError("Cannot set raw_response_tensors")
-    
-    @raw_response_text.setter
-    def raw_response_text(self, value):
-        raise RuntimeError("Cannot set raw_response_text")
-
     @response_text.setter
     def response_text(self, value):
         raise RuntimeError("Cannot set response_text")
@@ -75,7 +53,6 @@ class BatchedUnrollReturn:
     @response_tensors.setter
     def response_tensors(self, value):
         raise RuntimeError("Cannot set response_tensors")
-
 
     def __len__(self):
         assert len(self.response_tensors) == len(self.response_text), (
@@ -105,13 +82,14 @@ class BatchedUnrollReturn:
 
 @dataclasses.dataclass
 class DataListContainer:
-    tok_ref_query:        list = dataclasses.field(default_factory=list)
-    tok_ref_answer:       list = dataclasses.field(default_factory=list)
-    tok_ref_scratchpad:   list = dataclasses.field(default_factory=list)
+    # tok_ref_query:        list = dataclasses.field(default_factory=list)
+    # tok_ref_answer:       list = dataclasses.field(default_factory=list)
+    # tok_ref_scratchpad:   list = dataclasses.field(default_factory=list)
+
     detok_ref_query:      list = dataclasses.field(default_factory=list)
     detok_ref_answer:     list = dataclasses.field(default_factory=list)
     detok_ref_scratchpad: list = dataclasses.field(default_factory=list)
-    difficulty_level:    list = dataclasses.field(default_factory=list)
+    difficulty_level:     list = dataclasses.field(default_factory=list)
     extra_information:    list = dataclasses.field(default_factory=list)
 
     def __len__(self):
@@ -123,7 +101,7 @@ class DataListContainer:
         # which works in this case.
         assert all(v == one_len for v in iterator), lengths
         
-        return len(self.tok_ref_query)
+        return len(self.detok_ref_query)
 
     @classmethod
     def from_list_of_items(cls, list_items):
@@ -147,16 +125,19 @@ class DataListContainer:
     def shuffle(self):
         indices = np.random.permutation(len(self))
         for k, v in vars(self).items():
-            vars(self)[k] = [v[i] for i in indices]
+            self.to_dict()[k] = [v[i] for i in indices]
 
     def keys(self):
-        return vars(self).keys()
+        return self.to_dict().keys()
 
     def values(self):
-        return vars(self).values()
+        return self.to_dict().values()
 
     def items(self):
-        return vars(self).items()
+        return self.to_dict().items()
+    
+    def to_dict(self):
+        return vars(self)
     
     def append(self, item_container=None, **kwargs):
 
@@ -176,28 +157,39 @@ class DataListContainer:
             getattr(self, k).append(v)
     
 
-
-
 @dataclasses.dataclass
 class DataItemContainer:
     # detok are str, tok are torch.Tensor
-    tok_ref_query:         torch.Tensor
-    tok_ref_answer:        Optional[torch.Tensor]
-    tok_ref_scratchpad:    Optional[torch.Tensor]
+
+    # tok_ref_query:         torch.Tensor
+    # tok_ref_answer:        Optional[torch.Tensor]
+    # tok_ref_scratchpad:    Optional[torch.Tensor]
+    
     detok_ref_query:       str
     detok_ref_answer:      Optional[str]
     detok_ref_scratchpad:  Optional[str]
+
     difficulty_level:      Optional[int]
     extra_information:     Optional[list]
 
     def items(self):
-        return vars(self).items()
+        return self.to_dict().items()
 
     def keys(self):
-        return vars(self).keys()
+        return self.to_dict().keys()
     
     def values(self):
-        return vars(self).values()
+        return self.to_dict().values()
+
+    def to_dict(self):
+        return vars(self)
+
+    def __post_init__(self):
+        for k, v in vars(self).items():
+            if k.startswith("tok_ref_"):
+                if v is not None and not isinstance(v, torch.Tensor):
+                    setattr(self, k, torch.tensor(v))
+
 
 
 FloatSequence = typing.Union[list[float], torch.Tensor, np.ndarray]

@@ -1,6 +1,6 @@
 _target_: transformers.GenerationConfig
 do_sample: False
-min_new_tokens: 5
+min_new_tokens: 1
 num_beams: 1
 num_return_sequences: 1
 repetition_penalty: 1

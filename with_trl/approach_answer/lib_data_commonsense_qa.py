@@ -2,13 +2,12 @@ import logging
 import os
 import pathlib
 import sys
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import datasets
 import more_itertools
 import rich.traceback
 import transformers
-import tqdm
 
 rich.traceback.install()
 
@@ -62,7 +61,7 @@ def _prep_hf_ds(*, sample, few_shots_text, give_model_answer):
         few_shots_query = (
             f"{few_shots_text}\n\n" +
             f"Q: {sample['question']}\n" +
-            f"Answer Choices:\n" +
+            "Answer Choices:\n" +
             f"{choices}\n" +
             f"A: {ref_answer}\nReasoning: "
         )
@@ -70,9 +69,9 @@ def _prep_hf_ds(*, sample, few_shots_text, give_model_answer):
         few_shots_query = (
         f"{few_shots_text}\n\n" +
         f"Q: {sample['question']}\n" +
-        f"Answer Choices:\n" +
+        "Answer Choices:\n" +
         f"{choices}\n" +
-        f"A:"
+        "A:"
     )
 
     # Build the output sample

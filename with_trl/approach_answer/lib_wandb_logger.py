@@ -1,5 +1,3 @@
-import typing
-from typing import Any, Optional, Union
 
 import more_itertools as mit
 import rich
@@ -72,6 +70,6 @@ class WandbLoggingState:
 
         except Exception as e:
             rich.print(f"[red bold]{e}")
-            rich.print(f"Wandb logging failed. Continuing without logging.")
+            rich.print("Wandb logging failed. Continuing without logging.")
 
     __call__ = log

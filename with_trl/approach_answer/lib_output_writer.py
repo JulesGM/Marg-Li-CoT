@@ -1,8 +1,7 @@
    
 import itertools as it
 import pathlib
-import typing
-from typing import Any, Optional, Union
+from typing import Any
 
 import h5py
 import numpy as np

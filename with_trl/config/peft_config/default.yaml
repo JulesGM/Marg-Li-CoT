@@ -1,5 +1,5 @@
 bias: "none"
 inference_mode: False
 lora_dropout: 0.
-lora_alpha: 16
-r: 16
+lora_alpha: 256
+r: 256

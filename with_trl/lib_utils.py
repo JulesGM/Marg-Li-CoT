@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import math
 import enum
+import inspect
 import jsonlines as jl
 import os
 import pathlib
@@ -15,13 +16,12 @@ import numpy as np
 import rich
 import rich.table
 import torch
-import transformers
 from tqdm import tqdm
 import trl
-import trl_fork
+# import trl_fork
 import wandb
 
-import lib_base_classes
+from with_trl import lib_base_classes
 
 RANK = int(os.environ.get("RANK", 0))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
@@ -35,12 +35,12 @@ class Datasets(str, enum.Enum):
 
 class TrlLibraryMode(enum.Enum):
     TRL = "trl"
-    TRL_FORK = "trl_fork"
+    # TRL_FORK = "trl_fork"
 
 
 TRL_LIBRARIES = {
     TrlLibraryMode.TRL: trl,
-    TrlLibraryMode.TRL_FORK: trl_fork,
+    # TrlLibraryMode.TRL_FORK: trl_fork,
 }
 
 
@@ -96,6 +96,20 @@ def ValidPrecisions(precision):
         float16=torch.float16,
         float32=torch.float32,
     )[precision]
+
+
+def named_barrier(name):
+    if WORLD_SIZE == 1:
+        return
+    print(f"rank {RANK}: {name} waiting for barrier")
+    torch.distributed.barrier()
+    output_list = [None for _ in range(WORLD_SIZE)]
+    torch.distributed.all_gather_object(output_list, name)
+    assert all(x == name for x in output_list), output_list
+
+def get_linenumber():
+    cf = inspect.currentframe()
+    return cf.f_back.f_lineno
 
 
 def readable(obj, title="", outer_kwargs=None, is_inner=False):
@@ -218,13 +232,13 @@ def print_accelerate_envs():
 
         for k in keys:
             if "accelerate" in k.lower():
-                form_k = k.replace(
-                    "DEEPSPEED",
-                    "[green]DEEPSPEED[/]",
-                )
 
                 table.add_row(
-                    rich.markup.escape(str(form_k)), 
+                    rich.markup.escape(str(k)
+                    ).replace(
+                        "DEEPSPEED",
+                        "[bold green]DEEPSPEED[/]",
+                    ), 
                     rich.markup.escape(str(os.environ[k]))
                 )
 
@@ -360,7 +374,7 @@ def is_valid_simple_filename(filename):
     assert isinstance(filename, str), type(filename)
     
     for char in filename:
-        if not char.isalnum() and not char in "_-":
+        if not char.isalnum() and char not in "_-":
             return False
         
     return True
@@ -370,10 +384,10 @@ class WandbTableRepair:
     def __init__(
             self, *, 
             columns:         list[str],
+            table_name:      str,
             new_table_mode:  bool                     = False,
             run_output_path: str | pathlib.Path       = None,
             save_to_file:    bool                     = False,
-            table_name:      str,
             wandb_on:        bool                     = False,
             wandb_kwargs:    Optional[dict[str, Any]] = None, 
         ):
@@ -473,22 +487,16 @@ class WandbAndRichTable:
     def __init__(
             self, *, 
             columns, 
-            new_table_mode,
             table_name,
-            run_output_path,
+            # run_output_path,
             rich_kwargs  = None, 
-            wandb_kwargs = None,
         ):
         
         if rich_kwargs is None:
             rich_kwargs = {}
 
-        if wandb_kwargs is None:
-            wandb_kwargs = {}
-
         self._columns      = columns
         self._rich_kwargs  = rich_kwargs
-        self._wandb_kwargs = wandb_kwargs
         
         if "title" not in self._rich_kwargs:
             self._rich_kwargs["title"] = table_name
@@ -498,25 +506,24 @@ class WandbAndRichTable:
             **self._rich_kwargs,
         )
         
-        self._run_output_path = run_output_path
-
-        self._wandb_table = WandbTableRepair(
-            columns         = columns,
-            new_table_mode  = new_table_mode,
-            run_output_path = run_output_path,
-            table_name      = table_name, 
-            wandb_kwargs    = wandb_kwargs,
-            wandb_on        = True,
-        )
+        # self._run_output_path = run_output_path
+        # self._wandb_table = WandbTableRepair(
+        #     columns         = columns,
+        #     new_table_mode  = new_table_mode,
+        #     run_output_path = run_output_path,
+        #     table_name      = table_name, 
+        #     wandb_kwargs    = wandb_kwargs,
+        #     wandb_on        = True,
+        # )
 
     def add_row(self, *args, **kwargs):
         self._rich_table .add_row (*args, **kwargs)
-        self._wandb_table.add_data(*args, **kwargs)
+        # self._wandb_table.add_data(*args, **kwargs)
     
     def get_loggable_object(self):
         rich.print(self._rich_table)
         self._rich_table = rich.table.Table(*self._columns, **self._rich_kwargs)
-        return self._wandb_table.get_loggable_object()
+        # return self._wandb_table.get_loggable_object()
     
 
 def compute_and_gather_metrics(

@@ -1,7 +1,8 @@
-min_new_tokens: 5
+min_new_tokens: 1
 max_new_tokens: 100
-num_beams: 14
-num_return_sequences: 14
-repetition_penalty: 1
 temperature: 1.
 use_cache: True
+low_memory: False
+num_beams: 50
+num_return_sequences: ${generation_kwargs.num_beams}
+do_sample: True

@@ -1,19 +1,20 @@
+from __future__ import annotations
+import abc
 import bisect
 import collections
+import copy
 import contextlib
 import dataclasses
+import enum
 import itertools
 import math
-import more_itertools as mit
 import os
 import pathlib
-import random
 import sys
 import typing
-from typing import Any, Iterator, Optional, Tuple, Union
+from typing import Optional, Union
 
 import accelerate
-import datasets
 import more_itertools
 import numpy as np
 import peft
@@ -24,41 +25,291 @@ import rich.markup
 import rich.panel
 import rich.table
 import torch
-from torch.nn.parameter import Parameter
 import transformers
 import transformers.tokenization_utils
 import trl
 import trl.core
 import trl.models
-import trl_fork
-import trl_fork.core
-import trl_fork.models
-import wandb
-from beartype import beartype
+import tqdm
+
 
 SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 
 sys.path.append(str(SCRIPT_DIR.parent))
 
-import lib_base_classes
-import lib_constant
-import lib_data
-import lib_utils
-import lib_peft_utils
+from with_trl import lib_base_classes
+from with_trl import lib_utils
+from with_trl import lib_peft_utils
 
 RANK = int(os.environ.get("RANK", "0"))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
+
+class FixedPPOConfig(trl.PPOConfig):
+    """Fixes the serialization of the config object.
+    
+    Out of the box, TRL tries to log it's config object as a json string, but
+    doesn't do a good job at all of serializing some of the objects.
+        
+    This class fixes that.
+
+    """
+    def to_dict(self):
+        new_self = copy.deepcopy(self)
+        deepspeed_plugin_key = "deepspeed_plugin"
+        kwargs_handlers_key = "kwargs_handlers"
+        hf_ds_config = "hf_ds_config"
+        accelerator_kwargs = new_self.accelerator_kwargs
+
+        if deepspeed_plugin_key in accelerator_kwargs:
+            accelerator_kwargs[deepspeed_plugin_key] = vars(
+                accelerator_kwargs[deepspeed_plugin_key]) | {
+                    "__class__": accelerate.utils.DeepSpeedPlugin.__name__
+                }
+            deepspeed_plugin = accelerator_kwargs[deepspeed_plugin_key]
+            deepspeed_plugin[hf_ds_config] = vars(
+                deepspeed_plugin[hf_ds_config]) | {
+                    "__class__": deepspeed_plugin[hf_ds_config].__class__.__name__
+                }
+        
+        kwargs_handlers = accelerator_kwargs[kwargs_handlers_key]
+        for i, entry in enumerate(kwargs_handlers):
+            if isinstance(entry, accelerate.utils.DistributedDataParallelKwargs):
+                kwargs_handlers[i] = vars(entry) | {
+                    "__class__": accelerate.utils.DistributedDataParallelKwargs.__name__
+                }
+
+        return super(FixedPPOConfig, new_self).to_dict()
+
+
+# @dataclasses.dataclass
+# class Args:
+
+#     @dataclasses.dataclass
+#     class Model:
+#         batch_size:             int
+#         inference_batch_size:   int
+#         mini_batch_size:        int
+#         model_name:             str
+
+#     def __post_init__(self):
+#         if self.curriculum_schedule:
+#             self.curriculum_schedule = CurriculumSchedule(
+#                 [CurriculumSchedule.CurriculumEntry(x) for x in self.curriculum_schedule]
+#             )
+
+#         self.answer_only_path    = pathlib.Path(self.answer_only_path)
+#         self.dataset_name        = lib_data.DatasetChoices(self.dataset_name)
+#         self.generation_kwargs   = self.generation_kwargs
+#         self.model               = Args.Model(**self.model)
+#         self.precision           = lib_utils.ValidPrecisions(self.precision)
+#         self.peft_config         = peft.LoraConfig(**self.peft_config)
+#         self.task_name           = lib_utils.Task(self.task_name)
+#         self.wandb_dir           = pathlib.Path(self.wandb_dir)
+#         self.arithmetic_dataset_root_folder_dir = pathlib.Path(self.arithmetic_dataset_root_folder_dir)
+#         self.inference_generation_kwargs        = self.inference_generation_kwargs
+    
+#     answer_only_path:    pathlib.Path
+#     curriculum_schedule: CurriculumSchedule | None
+#     dataset_name:        str
+#     generation_kwargs:   transformers.GenerationConfig
+#     model:               Model
+#     peft_config:         peft.LoraConfig
+#     task_name:           lib_utils.Task
+#     wandb_dir:           pathlib.Path
+#     arithmetic_dataset_root_folder_dir: pathlib.Path
+#     inference_generation_kwargs:        transformers.GenerationConfig
+
+#     name:                        str
+#     learning_rate:               float
+#     answer_only:                 bool
+#     answer_only_max_length:      int
+#     input_max_length:            int
+#     eval_every:                  int
+#     eval_subset_size:            int
+#     gradient_accumulation_steps: int
+#     just_metrics:                bool
+#     kl_penalty_mode:             str
+#     peft_do_all_lin_layers:      bool
+#     use_curriculum:              bool
+#     use_peft:                    bool
+#     use_few_shots:               bool
+#     precision:                   torch.dtype | str
+    
+#     reward_type:                 Optional[str]
+#     wandb_project:               str
+
+
+class AccuracyMaintainer(abc.ABC):
+    @abc.abstractmethod
+    def __init__(self, limit_to_respect):
+        assert isinstance(limit_to_respect, float), type(limit_to_respect)
+        assert limit_to_respect >= 0, limit_to_respect
+        assert limit_to_respect <= 1, limit_to_respect
+        
+    @abc.abstractmethod
+    def get_stats(self) -> dict:
+        pass
+
+    @abc.abstractmethod
+    def __call__(self, *args, **kwargs) -> None:
+        pass
+
+
+
+class MaxLevelGlobalAvgAcc(AccuracyMaintainer):
+    def __init__(self, limit_to_respect: float):
+        super().__init__(limit_to_respect)
+        
+        self._max_level = None
+        self._max_level_sum = None
+        self._max_level_count = None
+        self._limit_to_respect = limit_to_respect
+        self._latest_distribution = None
+
+    def _max_level_avg(self):
+        return self._max_level_sum / self._max_level_count
+
+
+    def get_stats(self) -> dict:
+        return dict(
+            max_level=self._max_level,
+            max_level_acc=self._max_level_avg(),
+            max_level_sum=self._max_level_sum,
+            max_level_count=self._max_level_count,
+            limit_to_respect=self._limit_to_respect,
+            latest_distribution=self._latest_distribution,
+        )
+    
+    def __call__(self, batch_difficulty_level, reward_output_values) -> bool:
+        """
+        
+        For the hardest problems, only add them if we have enough good answers.
+        
+        We should probably do this for each level.
+
+        """
+
+        received_max_level = max(batch_difficulty_level)
+        assert self._max_level is None or received_max_level >= self._max_level, (
+            received_max_level, self._max_level)
+        # The curriculum must have a strictly increasing max level
+
+        indices_ok = []
+        for idx, level in enumerate(batch_difficulty_level):
+            
+            if level == received_max_level:
+                reward_output = reward_output_values[idx]
+                assert reward_output == 0. or reward_output == 1., reward_output
+                is_good = bool(reward_output)
+
+                ok_to_add_bad = (
+                    # Prevent divisions by zero in _max_level_avg by short-circuiting
+                    (not self._max_level_count)
+                    or
+                    (self._max_level_avg() < self._limit_to_respect)
+                )
+
+                if is_good or ok_to_add_bad:
+                    if self._max_level is None or received_max_level > self._max_level:
+                        self._max_level = received_max_level
+                        self._max_level_sum = 1
+                        self._max_level_count = int(is_good)
+
+                    elif received_max_level == self._max_level:
+                        self._max_level_sum += 1
+                        self._max_level_count += int(is_good)
+                    
+                    indices_ok.append(idx)
+            else:
+                indices_ok.append(idx)
+        
+        stats = collections.defaultdict(list)
+        
+        for idx in indices_ok:
+            stats[level].append(reward_output_values[idx])
+        
+        self._latest_distribution = stats
+
+        return indices_ok, stats
+        
+
+# class CurriculumPonderedGlobalAvgAcc(AccuracyMaintainer):
+#     """
+#     Heuristic of some kind. Feels a bit silly.
+    
+#     """
+#     def __init__(self, limit_to_respect: float):
+#         super().__init__(limit_to_respect)
+#         assert False, "Not implemented"
+
+#         self._sums = {}
+#         self._counts = {}
+#         self._limit_to_respect = limit_to_respect
+#         self._latest_normalized_curriculum = None
+
+#     def _curriculum_avg(self):
+#         assert self._sums.keys() == self._counts.keys(), ()
+#         weight_sum = sum(self._latest_normalized_curriculum.values())
+#         assert math.isclose(weight_sum, 1.), weight_sum
+
+#         return sum(
+#             [self._sums[key] * self._latest_curriculum[key] / self._counts[key] for key in self._sums]
+#         )
+    
+
+#     def set_curriculum(self, curriculum: dict[int, float]) -> None:
+#         sum_curr = sum(curriculum.values())
+#         self._latest_normalized_curriculum = {k: v / sum_curr for k, v in curriculum.items()}
+
+    
+#     def get_stats(self) -> dict:
+#         return dict(
+#             sums=self._sums,
+#             counts=self._counts,
+#             latest_normalized_curriculum=self._latest_normalized_curriculum,
+#             limit_to_respect=self._limit_to_respect,
+#             skips_in_a_row=self._skips_in_a_row,
+#         )
+
+#     def __call__(self, level, is_good) -> bool:
+        
+#         assert isinstance(is_good, bool), type(is_good)
+#         assert isinstance(level, int), type(level)
+#         assert self._latest_normalized_curriculum, self._latest_normalized_curriculum
+
+#         if level not in self._sums:
+#             self._sums  [level] = 0
+#             self._counts[level] = 0
+
+#         self._sums  [level] += int(is_good)
+#         self._counts[level] += 1
+        
+#         do_skip = self._max_level_avg() < self._limit_to_respect
+#         self._update_skips_in_a_row(do_skip)
+#         return not do_skip
+
+
+class Maintainers(str, enum.Enum):
+    MAX_LEVEL_GLOBAL_AVG_ACC = "MaxLevelGlobalAvgAcc"
+    # CURRICULUM_PONDERED_GLOBAL_AVG_ACC = "CurriculumPonderedGlobalAvgAcc"
+
+
+MAINTAINER_NAME_TO_CLASS = {
+    Maintainers.MAX_LEVEL_GLOBAL_AVG_ACC: MaxLevelGlobalAvgAcc,
+    # Maintainers.CURRICULUM_PONDERED_GLOBAL_AVG_ACC: CurriculumPonderedGlobalAvgAcc,
+}
+
+
 def generate(
         *, 
-        accelerator,
         answer_extractor,
         batch,
-        batch_size,
-        dataset_name,
+        batch_size: int,
+        generation_batch_size: int,
         generation_kwargs,
-        policy_model,
+        ppo_trainer,
         post_process_gen_fewshots_fn,
         prediction_tokenizer,
         task_name,
@@ -78,17 +329,20 @@ def generate(
     
     print(f"[RANK: {RANK}] lib_trl_utils.batched_unroll: ({step_information = }) >>>")
     raw_gen_outputs, scores = batched_unroll(
-        accelerated_model = policy_model,
-        accelerator       = accelerator,
-        dataset_name      = dataset_name, 
-        difficulty_levels = batch.difficulty_level,
-        generation_kwargs = generation_kwargs,
+        ref_text                     = batch.detok_ref_answer,
+        difficulty_levels            = batch.difficulty_level,
+        generation_batch_size        = generation_batch_size,
+        generation_kwargs            = generation_kwargs,
         post_process_gen_fewshots_fn = post_process_gen_fewshots_fn,
         prediction_tokenizer         = prediction_tokenizer,
-        query_tensors     = batch.tok_ref_query,
-        task_name         = task_name, 
-        use_few_shots     = use_few_shots,
+        query_tensors                = batch.tok_ref_query,
+        task_name                    = task_name, 
+        trainer                      = ppo_trainer,
+        use_few_shots                = use_few_shots,
     )
+
+    lib_utils.named_barrier(f"{__file__}: {lib_utils.get_linenumber()}")
+
     print(f"{RANK} lib_trl_utils.batched_unroll <<<")
 
     if task_name == lib_utils.Task.MAIN:
@@ -102,6 +356,7 @@ def generate(
             answer_extractor=answer_extractor,
             difficulty_levels=batch.difficulty_level,
         )
+
     else:
         # If we're on the sentiment task,
         # we return num sequences = 1.
@@ -117,14 +372,11 @@ def generate(
             batch_size,
         )
 
+    lib_utils.named_barrier(f"{__file__}: {lib_utils.get_linenumber()}")
+
     outputs = lib_base_classes.BatchedUnrollReturn(
         response_tensors=unpad(
             responses=outputs.response_tensors,
-            eos_token_id=prediction_tokenizer.eos_token_id,
-            pad_token_id=prediction_tokenizer.pad_token_id,
-        ),
-        raw_response_tensors=unpad(
-            outputs.raw_response_tensors,
             eos_token_id=prediction_tokenizer.eos_token_id,
             pad_token_id=prediction_tokenizer.pad_token_id,
         ),
@@ -136,20 +388,6 @@ def generate(
 
 def rich_escape(value):
     return rich.markup.escape(str(value))
-
-IntSequence = typing.TypeVar(
-    "IntSequence",
-    list[int],
-    torch.LongTensor,
-)
-
-
-IntSequenceContainer = typing.TypeVar(
-    "IntSequenceContainer",
-    torch.LongTensor,
-    list[torch.LongTensor],
-    list[list[int]],
-)
 
 
 def check_qty_of_token_id(
@@ -200,22 +438,13 @@ def keep_good_one_generation(
             return_tensors="pt", 
             padding=True,
     )["input_ids"].reshape(batch_size, num_return_seq, -1)
-
-    raw_response_tensors = torch.cat(
-        generations.raw_response_tensors,
-        dim=0,
-    ).reshape(batch_size, num_return_seq, -1)
-
-    del generations
     assert isinstance(ref_answers[0][0], str), type(ref_answers[0][0])
-
     selections = []
 
     table = rich.table.Table(
         "Difficulty Level",
         "Ref Comparable", 
         "Generated answers", 
-        "Lengths", 
         "Ratio Good",
         title=f"(RANK={RANK}) keep_good_one_generation", 
         show_lines=True,
@@ -224,7 +453,6 @@ def keep_good_one_generation(
     ratios_good = []
 
     for b_idx in range(batch_size):
-        
         # Extract the reference answer
         ref_comparable = answer_extractor(ref_answers[b_idx])
         assert ref_comparable is not None, ref_answers[b_idx]
@@ -235,27 +463,24 @@ def keep_good_one_generation(
         ratio_good_beams = np.mean(np.array(is_good_beams, dtype=np.float32))
         values_to_counts = collections.Counter(x for x in gen_answ_beams)
 
-        # Count the length of the generated tokens
-        lengths = collections.Counter(len(x) for x in response_tensors[b_idx])
-        length = more_itertools.one(lengths.keys())
-
+        # Inner table with the different extracted generations        
         inner_table = rich.table.Table(
             expand        = True,
             show_edge     = False,
             show_footer   = False,
             title_justify = "center",
         )
-        inner_table.add_column(  "Gen", justify="left")
-        inner_table.add_column("Count", justify="left")
+        inner_table.add_column("Extracted Gen.", justify="left")
+        inner_table.add_column(         "Count", justify="left")
 
         for val, count in values_to_counts.most_common():
-            inner_table.add_row(val, str(count))
+            color = "[green]" if val == ref_comparable else ""
+            inner_table.add_row(f"{color}`{val}`", f"{color}{count}")
         
         table.add_row(
             rich_escape(difficulty_levels[b_idx]),
-            rich_escape(ref_comparable),
+            f"`{rich_escape(ref_comparable)}`",
             inner_table,
-            rich_escape(length),
             f"[green]{ratio_good_beams:0.2%}[/] or " + 
             f"[green]{np.sum(is_good_beams)}[/]/[green]{len(is_good_beams)}[/]",
         )
@@ -263,21 +488,35 @@ def keep_good_one_generation(
         if any(is_good_beams):
             # Return the good with the max other reward
             good_idx = [i for i, g in enumerate(is_good_beams) if g]
+            
             if other_rewards:
-                good_rewards = other_rewards["scores"][b_idx][torch.tensor(good_idx)]
-                selection = torch.argmax(good_rewards)
+                other_reward_tensor = torch.tensor(other_rewards["scores"][b_idx])
+                good_rewards = other_reward_tensor[torch.tensor(good_idx)]                
+
+                assert good_rewards.ndim == 1, (
+                    f"{good_rewards.ndim = }, "
+                    f"{good_rewards = }, "
+                    f"{good_idx = }"
+                )
+                
+                selection = good_idx[np.argmax(good_rewards)]
+                assert other_reward_tensor[selection] == torch.max(good_rewards)
+
             else:
                 assert False
                 good_idx_id = torch.randint(0, len(good_idx), (1,))
                 selection = good_idx[good_idx_id]
         else:
-            # Return the one with the max other reward
+            # Sample
             if other_rewards:
-                selection = torch.argmax(other_rewards["scores"][b_idx])
+                selection = torch.distributions.Categorical(
+                    torch.tensor(other_rewards["scores"][b_idx]).softmax(-1)
+                ).sample()
             else:
-                selection = torch.randint(0, num_return_seq, (1,))[0]
+                assert False
+                selection = np.random.randint(0, num_return_seq, (1,))[0]
                 
-        selections.append(selection)
+        selections .append(       selection)
         ratios_good.append(ratio_good_beams)
 
     ratio_avg = np.mean(ratios_good)
@@ -287,26 +526,21 @@ def keep_good_one_generation(
         f"At least one good ratio: {at_least_one_good:0.2%}"
     )
 
-    rich.print(table)
+    if RANK == 0:
+        rich.print(table)
 
     selections = torch.tensor(selections)
-
     assert selections.shape == (batch_size,), f"{selections.shape = } {batch_size = }"
-
     output_generations_tensors = []
-    output_raw_generation_tensors = []
+
     for idx in range(batch_size):
         output_generations_tensors.append(
             response_tensors[idx][selections[idx]].detach().clone().to(device)
-        )
-        output_raw_generation_tensors.append(
-            raw_response_tensors[idx][selections[idx]].detach().clone().to(device)
         )
 
     return lib_base_classes.BatchedUnrollReturn(
         any_tokenizer=prediction_tokenizer,
         response_tensors=output_generations_tensors,
-        raw_response_tensors=output_raw_generation_tensors,
     )
 
 def print_table(
@@ -322,7 +556,6 @@ def print_table(
     responses: list[str],
     rewards: list[float],
 ):
-    
     if extra_columns is None:
         extra_columns = {}
 
@@ -341,6 +574,7 @@ def print_table(
         *extra_columns.keys(),
         show_lines=True,
         title=(
+            f"{RANK = } - " + 
             f"{rich_escape(name)} - " +
             f"{rich_escape(log_header)} - " +
             f"<{call_source}>.lib_trl_utils.print_table(...): Samples:"
@@ -437,131 +671,88 @@ def print_trainable_parameters(
 
 def load_then_peft_ize_model(
     *,
-    peft_config_dict,
+    adapter_name: str,
+    forward_tokenizer: transformers.PreTrainedTokenizer,
+    just_device_map: bool,
+    model_name: str,
+    peft_config,
     peft_do_all_lin_layers: bool,
     precision,
-    model_name: str,
-    use_peft: bool,
-    forward_tokenizer: transformers.PreTrainedTokenizer,
     prediction_tokenizer: transformers.PreTrainedTokenizer,
-    just_device_map: bool,
-    adapter_name: str,
+    trust_remote_code: bool,
+    use_peft: bool,
 ):
+    
     if use_peft:
-        lora_config = peft.LoraConfig(**peft_config_dict)
+        lora_config = peft_config
 
-    config = transformers.AutoConfig.from_pretrained(model_name)  # type: ignore
     if just_device_map:
         assert not use_peft, "not written with that in mind"
-        assert precision == torch.bfloat16, precision
-
 
     ###########################################################################
     # Model Class Specific Options
     ###########################################################################
-    if not config.is_encoder_decoder:
-        if use_peft:
-            assert lora_config.task_type == peft.TaskType.CAUSAL_LM, lora_config.task_type
-        transformers_cls = transformers.AutoModelForCausalLM  # type: ignore
-
-    else:
-        assert not (
-            (config.model_type == "t5")
-            and (precision == torch.float16)
-        ), "fp16 doesn't work with t5"
-
-        if use_peft:
-            assert lora_config.task_type == peft.TaskType.SEQ_2_SEQ_LM
-        transformers_cls = transformers.AutoModelForSeq2SeqLM  # type: ignore
+    if use_peft:
+        assert lora_config.task_type == peft.TaskType.CAUSAL_LM, lora_config.task_type
+    transformers_cls = transformers.AutoModelForCausalLM  # type: ignore
 
     ###########################################################################
     # Init the Pre-Trained Model
     # -> Precision specific
     ###########################################################################
-    if precision in (
-        "_4bit",
-        "_8bit",
-    ):
-        quantization_config = transformers.BitsAndBytesConfig(
-                load_in_4bit=precision == "_4bit",
-                load_in_8bit=precision == "_8bit",
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-            )
-        
-        pretrained_model = transformers_cls.from_pretrained(
-            model_name,
-            device_map   = {"": torch.device(int(LOCAL_RANK))},
-            load_in_4bit = precision == "_4bit",
-            load_in_8bit = precision == "_8bit",
-            quantization_config = quantization_config,
-            low_cpu_mem_usage   = os.environ.get("SLURM_JOB_PARTITION", "") == "main",
-        )
-        
-        # Make sure that there is only one device
-        # & Make sure that it is a cuda device
-        devices = set()
-        for name, parameter in pretrained_model.named_parameters():
-            assert parameter.device.type == "cuda", (
-                f"{name = }\n" f"{parameter.device = }"
-            )
-            devices.add(parameter.device.index)
-        assert len(devices) == 1, devices
-
-    else:
-        assert isinstance(precision, torch.dtype), (
-            f"{type(precision) = }")
-        
-        pretrained_model = transformers_cls.from_pretrained(
-            model_name,
-            device_map   = "auto" if just_device_map else None,
-            torch_dtype  = precision,
-        )
-        assert not just_device_map or all(
-            x.device.type == "cuda" 
-            for x in pretrained_model.parameters()
-        )
+    assert isinstance(precision, torch.dtype) or precision == "auto", (
+        f"{type(precision) = }")
+    
+    pretrained_model = transformers_cls.from_pretrained(
+        model_name,
+        device_map        = "auto" if just_device_map else None,
+        torch_dtype       = precision,
+        pad_token_id      = prediction_tokenizer.pad_token_id,
+        eos_token_id      = prediction_tokenizer.eos_token_id,
+        trust_remote_code = trust_remote_code,
+    )
+    assert not just_device_map or all(
+        x.device.type == "cuda" 
+        for x in pretrained_model.parameters()
+    )
 
     ###########################################################################
     # Fix tokenizers for causal models
     ###########################################################################
-    if not config.is_encoder_decoder:
-        config.pad_token_id = prediction_tokenizer.pad_token_id
-
-        # Fix pretrained model to handle the new pad token
-        assert len(forward_tokenizer) == len(prediction_tokenizer), (
-            f"{len(forward_tokenizer) = }\n" 
-            f"{len(prediction_tokenizer) = }"
-        )
-        assert forward_tokenizer.pad_token_id == prediction_tokenizer.pad_token_id, (
-            f"{forward_tokenizer.pad_token_id = }\n"
-            f"{prediction_tokenizer.pad_token_id = }"
-        )
-        assert forward_tokenizer.pad_token == prediction_tokenizer.pad_token, (
-            f"{forward_tokenizer.pad_token = }\n"
-            f"{prediction_tokenizer.pad_token = }"
-        )
-        pretrained_model.resize_token_embeddings(len(forward_tokenizer))
+    # Fix pretrained model to handle the new pad token
+    assert len(forward_tokenizer) == len(prediction_tokenizer), (
+        f"{len(forward_tokenizer) = }\n" 
+        f"{len(prediction_tokenizer) = }"
+    )
+    assert forward_tokenizer.pad_token_id == prediction_tokenizer.pad_token_id, (
+        f"{forward_tokenizer.pad_token_id = }\n"
+        f"{prediction_tokenizer.pad_token_id = }"
+    )
+    assert forward_tokenizer.pad_token == prediction_tokenizer.pad_token, (
+        f"{forward_tokenizer.pad_token = }\n"
+        f"{prediction_tokenizer.pad_token = }"
+    )
+    assert forward_tokenizer.eos_token_id == prediction_tokenizer.eos_token_id, (
+        forward_tokenizer.eos_token_id, prediction_tokenizer.eos_token_id
+    )
+    
 
     ###########################################################################
     # Peft-ize the model
     ###########################################################################
     if use_peft:
-        if (precision == "_4bit" or 
-            precision == "_8bit"
-        ):
-            pretrained_model = peft.prepare_model_for_kbit_training(
-                pretrained_model,
-            )
-        
         if peft_do_all_lin_layers:
+            assert False
             lora_config.target_modules = lib_peft_utils.find_all_linear_names(
                 precision, 
                 pretrained_model,
             )
+        
+        if "microsoft/phi-2" == model_name:
+            lora_config.target_modules = [
+                "Wqkv",
+                "out_proj",
+        ]   
 
         pretrained_model = peft.get_peft_model(
             pretrained_model,
@@ -571,22 +762,19 @@ def load_then_peft_ize_model(
 
     return pretrained_model
 
-def load_tokenizers(model_name, config):
-    forward_tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore
-        model_name)
-    prediction_tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore
-        model_name)
-    
-    if not config.is_encoder_decoder:
-        for tokenizer in (forward_tokenizer, prediction_tokenizer):
-            if tokenizer.pad_token is None:
-                tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-        
-        prediction_tokenizer.padding_side = "left"
-        forward_tokenizer.padding_side = "right"
+def load_tokenizers(model_name):
+    prediction_tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    forward_tokenizer    = transformers.AutoTokenizer.from_pretrained(model_name, padding_side="right")
 
+    for tokenizer in (forward_tokenizer, prediction_tokenizer):
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    assert forward_tokenizer.eos_token_id == prediction_tokenizer.eos_token_id
+    assert forward_tokenizer.pad_token_id == prediction_tokenizer.pad_token_id
+    
     return dict(
-        forward_tokenizer=forward_tokenizer, 
+        forward_tokenizer   =forward_tokenizer, 
         prediction_tokenizer=prediction_tokenizer,
     )
 
@@ -666,9 +854,9 @@ def init_model(
     *,
     model_name: str,
     peft_do_all_lin_layers: bool,
-    peft_config_dict: Optional[dict[str, typing.Any]],
-    precision=None,
-    trl_library_mode,
+    peft_config: Optional[dict[str, typing.Any]],
+    precision,
+    trust_remote_code,
     use_peft: bool,
 ) -> tuple[
     typing.Union[
@@ -700,19 +888,13 @@ def init_model(
     """
 
 
-    if precision is None:
-        precision = torch.bfloat16
-
-    config = transformers.AutoConfig.from_pretrained(  # type: ignore
-        model_name,
-        trust_remote_code=True,
-    )
+    assert precision, precision
 
     ###########################################################################
     # Tokenizer stuff
     ###########################################################################
-    tmp_tokenizers = load_tokenizers(model_name, config)
-    forward_tokenizer = tmp_tokenizers["forward_tokenizer"]
+    tmp_tokenizers = load_tokenizers(model_name)
+    forward_tokenizer    = tmp_tokenizers["forward_tokenizer"]
     prediction_tokenizer = tmp_tokenizers["prediction_tokenizer"]
     del tmp_tokenizers
 
@@ -720,75 +902,26 @@ def init_model(
     # HF Raw Model Stuff
     ###########################################################################
     pretrained_model = load_then_peft_ize_model(
-        adapter_name="policy" if lib_utils.TrlLibraryMode.TRL_FORK else "default",
+        adapter_name           = "default",
         forward_tokenizer      = forward_tokenizer,
         just_device_map        = False,
         model_name             = model_name,
+        peft_config            = peft_config,
         peft_do_all_lin_layers = peft_do_all_lin_layers,
-        peft_config_dict       = peft_config_dict,
         precision              = precision,
         prediction_tokenizer   = prediction_tokenizer,
+        trust_remote_code      = trust_remote_code,
         use_peft               = use_peft,
     )
 
-    ###########################################################################
-    # TRL Model
-    ###########################################################################
-    # This is just a sanity check, feel free to remove.
-    assert precision == torch.bfloat16, precision 
+    model = trl.AutoModelForCausalLMWithValueHead.from_pretrained(
+        pretrained_model,
 
-    if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
-        model = trl.AutoModelForCausalLMWithValueHead.from_pretrained(
-            pretrained_model,)
-        model.gradient_checkpointing_disable = (
-            model.pretrained_model.gradient_checkpointing_disable)
-        model.gradient_checkpointing_enable = (
-            model.pretrained_model.gradient_checkpointing_enable)
-
-    elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-        assert False
-        trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES += (MultiAdapterWrapper,)
-        print(trl_fork.trainer.ppo_trainer.SUPPORTED_ARCHITECTURES)
-
-        peft_model: peft.PeftModel = pretrained_model
-        peft_config = peft.tuners.lora.LoraConfig(**peft_config_dict)
-
-        # trl_policy_model = trl_fork.AutoModelForCausalLMWithoutValueHead.from_pretrained(
-        #     peft_model)
-
-        trl_value_model = trl_fork.AutoModelForCausalLMWithValueHead.from_pretrained(
-            peft_model,
-        )
-        
-        # JULESGM: FIX trl_policy_model
-        for model in [
-        #    trl_policy_model, 
-            trl_value_model,
-        ]:
-            model.gradient_checkpointing_disable = (
-                model.pretrained_model.gradient_checkpointing_disable)
-
-            model.gradient_checkpointing_enable = (
-                model.pretrained_model.gradient_checkpointing_enable)
-
-        # policy_model = MultiAdapterWrapper(
-        #     trl_model_with_peft=trl_policy_model,
-        #     peft_config=peft_config,
-        #     adapter_name="policy",
-        #     add_adapter=False,
-        # )
-
-        # JULGM: FIX add_adapter=True, adapter_name="value"
-        # value_model = MultiAdapterWrapper(
-        #     trl_model_with_peft=trl_value_model,
-        #     peft_config=peft_config,
-        #     adapter_name="policy", # "value",
-        #     add_adapter=False,
-        # )
-        
-        value_model = trl_value_model
-        policy_model = trl_value_model
-        
+    )
+    model.gradient_checkpointing_disable = (
+        model.pretrained_model.gradient_checkpointing_disable)
+    model.gradient_checkpointing_enable = (
+        model.pretrained_model.gradient_checkpointing_enable)
 
     if precision in (
         torch.float16,
@@ -799,32 +932,16 @@ def init_model(
             if precision == torch.float16
             else torch.bfloat16)
         
-        if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
-            model.v_head.to(dtype=dtype)
-        elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-            value_model.v_head.to(dtype=dtype)
+        model.v_head.to(dtype=dtype)
     
-    if trl_library_mode == lib_utils.TrlLibraryMode.TRL:
-        output = print_trainable_parameters(model, True)
-        assert output > 0
-        return dict(
-            model=model, 
-            forward_tokenizer=forward_tokenizer, 
-            prediction_tokenizer=prediction_tokenizer,
-        )
-    
-    elif trl_library_mode == lib_utils.TrlLibraryMode.TRL_FORK:
-        output = print_trainable_parameters(policy_model, True)
-        assert output > 0
-        return dict(
-            policy_model=policy_model, 
-            value_model=value_model, 
-            forward_tokenizer=forward_tokenizer, 
-            prediction_tokenizer=prediction_tokenizer,
-        )
-    
-    raise ValueError(f"{trl_library_mode = }")
+    output = print_trainable_parameters(model, True)
+    assert output > 0
 
+    return dict(
+        model=model, 
+        forward_tokenizer=forward_tokenizer, 
+        prediction_tokenizer=prediction_tokenizer,
+    )
 
 
 class CurriculumSchedule:
@@ -845,10 +962,10 @@ class CurriculumSchedule:
             sum_ = sum(self.proportions.values()) 
             assert math.isclose(sum_, 1), sum_
             # Check types
-            assert isinstance(self.step, int), type(self.step)
+            assert isinstance(       self.step,  int), type(self.step)
             assert isinstance(self.proportions, dict), type(self.proportions)
             assert all(
-                isinstance(x, int) 
+                isinstance(x,   int) 
                 for x in self.proportions
             ), type(self.proportions)
             assert all(
@@ -873,7 +990,7 @@ class CurriculumSchedule:
         self._entries = entries
         self.check()
     
-    def __call__(self, step: int) -> CE:
+    def __call__(self, step: int) -> CurriculumEntry:
         assert isinstance(step, int), type(step)
 
         # Index of first <= step.
@@ -930,46 +1047,212 @@ class CurriculumSchedule:
             ), type(entry.proportions)
 
 
+def _display_table_return_sequences(
+    *,
+    ref_text_answers,
+    batch_size,
+    difficulty_levels,
+    prediction_tokenizer,
+    query_tensors,
+    responses,
+    sequences_scores,
+):
+     # Prep info for the table
+    assert isinstance(query_tensors, (list, tuple, np.array, torch.Tensor)), type(query_tensors)
+    
+    # Create the table
+    for batch_idx in range(batch_size):
+        table = rich.table.Table(
+            title       = f"{RANK} - Batch Unroll", 
+            show_lines  = True,
+            show_header = False,
+            show_edge   = True,
+            highlight   = True,
+        )
+        sorted_seq_idx = sorted(
+            range(len(sequences_scores[batch_idx])),
+            key     = lambda seq_idx: sequences_scores[batch_idx][seq_idx],
+            reverse = True,
+        )
+
+        output_text   = prediction_tokenizer.batch_decode(
+            responses[batch_idx], 
+            skip_special_tokens=False,
+        )
+
+        if max(sorted_seq_idx) > len(output_text) - 1:
+            raise ValueError(f"{sorted_seq_idx}, {len(output_text) - 1}")
+        
+        sorted_texts  = [output_text                [seq_idx] for seq_idx in sorted_seq_idx]
+        sorted_scores = [sequences_scores[batch_idx][seq_idx] for seq_idx in sorted_seq_idx]
+
+        for (seq_idx, val), score in more_itertools.zip_equal(
+                enumerate(sorted_texts), sorted_scores
+            ):
+            val == ref_text_answers[batch_idx]
+            table.add_row(
+                ("[bold green]Winner[/]\n" if seq_idx == 0 else "") +
+                f"{difficulty_levels[batch_idx] = } \n" + 
+                f"{ref_text_answers [batch_idx] = }",
+                f"{batch_idx                    = } \n" +
+                f"{seq_idx                      = } \n" +
+                f"{score.item()                 = :0.3f}",
+                str(val).strip(),
+            )
+    
+        if RANK == 0:
+            rich.print(table)
+
+
 def batched_unroll(
     *,
-    accelerated_model,
-    accelerator: accelerate.Accelerator,
-    dataset_name,
+    ref_text: list[str],
     difficulty_levels,
+    trainer: trl.PPOTrainer,    
     generation_kwargs: dict[str, typing.Any],
+    generation_batch_size,
     post_process_gen_fewshots_fn,
     prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
     query_tensors: list[torch.Tensor],
-    task_name,
-    use_few_shots,
+    task_name: lib_utils.Task,
+    use_few_shots: bool,
 ) -> lib_base_classes.BatchedUnrollReturn:
     
+    assert prediction_tokenizer.pad_token_id == prediction_tokenizer.eos_token_id, (
+        prediction_tokenizer.pad_token_id, prediction_tokenizer.eos_token_id
+    )
+    # Make sure the generation batch size is not too large.
+    if generation_batch_size is None or generation_batch_size > len(query_tensors):
+        generation_batch_size = len(query_tensors)
+    # We are generating, so we need to set the padding side to the left.
     assert prediction_tokenizer.padding_side == "left", (
         prediction_tokenizer.padding_side)
+    # The following are set in the call. 
+    if "output_scores" in generation_kwargs:
+        del generation_kwargs["output_scores"]
+    if "return_dict_in_generate" in generation_kwargs:
+        del generation_kwargs["return_dict_in_generate"]
     
-    # Pad.
-    tokenized = prediction_tokenizer.pad(
-        dict(input_ids=query_tensors),
-        return_tensors="pt",
-        padding=True,
-    ).to(accelerator.device)
+    # Generate. We have a sub-batch for generation, to allow for larger PPO batch sizes.
+    model = trainer.accelerator.unwrap_model(trainer.model)
+    outputs = collections.defaultdict(list)
+    for i in tqdm.trange(
+        0, 
+        len(query_tensors), 
+        generation_batch_size, 
+        desc="Batched Unroll",
+    ):
 
-    # Generate.
-    model = accelerator.unwrap_model(accelerated_model)
-    assert not model.config.is_encoder_decoder
-    model_outputs = model.generate(
-        **tokenized,
-        **generation_kwargs,
-        pad_token_id=prediction_tokenizer.pad_token_id,
-        output_scores=True,
-        return_dict_in_generate=True, 
-    )
+        # Generate the sequences
+        tokenized = prediction_tokenizer.pad(
+            dict(input_ids=query_tensors[i : i + generation_batch_size]),
+            return_tensors="pt",
+            padding=True,
+            
+        ).to(trainer.accelerator.device)
+        is_training_pre_gen = model.training
+        model_outputs = model.eval().generate(
+            **tokenized,
+            **generation_kwargs,
+            return_dict_in_generate = True, 
+            output_scores           = True,
+            pad_token_id            = prediction_tokenizer.pad_token_id,
+        )
+        model.train(is_training_pre_gen)
+        model_outputs = dict(**model_outputs)
+
+        # Obtain a "sequences_scores" from a "scores" tensor, when scores exists and
+        # sequences_scores doesn't. "scores" is then removed.
+        # Ignores all eos == pad tokens except a single one at the end of the sequence,
+        # if there is one.
+        if "sequences_scores" not in model_outputs:
+            assert prediction_tokenizer.pad_token_id == prediction_tokenizer.eos_token_id, (
+                "This code assumes that the pad token is the eos token.")
+            
+            lm_logits = torch.stack(model_outputs["scores"], dim=1).contiguous()
+            del model_outputs["scores"]
+            
+            # Compute the score masking all of the tokens after the first eos token.
+            # We need to be able to modify the labels, so we clone them.
+            labels = model_outputs["sequences"].clone()[:, -lm_logits.shape[1]:].contiguous()
+            pad_mask = (labels == prediction_tokenizer.pad_token_id).long()
+            for i in range(labels.shape[0]):
+                non_zero = pad_mask[i].nonzero()
+                if len(non_zero):
+                    bound = non_zero[0].item()
+                    labels[i, bound:] = -100
+
+            assert labels.shape[:2] == lm_logits.shape[:2], (labels.shape, lm_logits.shape)
+
+            loss_fct = torch.nn.CrossEntropyLoss()
+            losses = []
+            for i in range(labels.shape[0]):
+                losses.append(loss_fct(lm_logits[i], labels[i],))
+            model_outputs["sequences_scores"] = torch.tensor(losses).to(lm_logits.device)
+            
+        del model_outputs["scores"]
+        assert "scores" not in model_outputs, model_outputs.keys()
+        assert "sequences_scores" in model_outputs, model_outputs.keys()
+
+        model_outputs = {
+            k: v.detach().cpu() 
+            for k, v in model_outputs.items() 
+            if not isinstance(v, tuple)
+        }
+        
+        # Remove the prompt
+        query_len = tokenized["input_ids"].shape[1]
+        model_outputs["sequences"] = model_outputs["sequences"][:, query_len:]
+        
+        # Remove the padding
+        masks = model_outputs["sequences"] == prediction_tokenizer.pad_token_id
+        for id_in_batch in range(len(masks)):
+            mask = masks[id_in_batch]
+            seq = model_outputs["sequences"][id_in_batch]
+            
+            # Keep one eos/pad token if there are any at the end.
+            if prediction_tokenizer.eos_token_id in seq:
+                end = torch.nonzero(mask, as_tuple=False)[0, 0].item() + 1
+            else:
+                end = None
+            new_seq = seq[:end]
+  
+            assert prediction_tokenizer.eos_token_id == prediction_tokenizer.pad_token_id, (
+                prediction_tokenizer.eos_token_id, prediction_tokenizer.pad_token_id,)
+            
+            # CHECKS
+            # We want to make sure that the outputs aren't somehow left padded
+            first_token_is_eos_or_pad = new_seq[0] == prediction_tokenizer.eos_token_id
+
+            # We want to make sure that there is only one eos token at the end.
+            assert not (first_token_is_eos_or_pad and len(new_seq) > 1), (new_seq, )
+            assert new_seq[-2] != prediction_tokenizer.pad_token_id, (
+                new_seq[-2], prediction_tokenizer.pad_token_id,)
+            
+            # There sould be a total of 1 eos/pad tokens at most.
+            qty_eos_tokens = (new_seq == prediction_tokenizer.eos_token_id).long().sum().item()
+            assert qty_eos_tokens <= 1, (new_seq, prediction_tokenizer.eos_token_id,)
+
+            for k, v in model_outputs.items():
+                sample = v[id_in_batch]
+                if   isinstance(sample, torch.Tensor) and sample.ndim >= 1:
+                    outputs[k].append(sample[:end])
+                elif isinstance(sample, torch.Tensor) and sample.ndim == 0:
+                    outputs[k].append(sample)
+                else:
+                    raise ValueError(
+                        (
+                            k, 
+                            (sample.shape, sample.ndim) if isinstance(sample, torch.Tensor) else None, 
+                            type(sample).mro(),
+                        )
+                    )
+
+    outputs = dict(**outputs)  # Convert to regular dict
 
     # Format outputs.
-    responses = model_outputs.sequences
-    in_seq_len = tokenized["input_ids"].shape[1]
-    responses = responses[:, in_seq_len:]
-    raw_responses = responses
+    responses = outputs["sequences"]
+
     if task_name == lib_utils.Task.MAIN:
         if use_few_shots:
             responses = post_process_gen_fewshots_fn(
@@ -979,69 +1262,44 @@ def batched_unroll(
     else:
         assert post_process_gen_fewshots_fn is None
 
-    outputs = lib_base_classes.BatchedUnrollReturn(
-        any_tokenizer        = prediction_tokenizer,
-        raw_response_tensors = list(raw_responses),
-        response_tensors     = list(responses),
+    return_obj = lib_base_classes.BatchedUnrollReturn(
+        any_tokenizer    = prediction_tokenizer,
+        response_tensors = list(responses),
     )
-    
+
     ###########################################################################
     # Exit early if we're on the sentiment task, as 
     # we only have one returned sequence.
     ###########################################################################
-    if task_name == lib_utils.Task.SENTIMENT:
-        return outputs, None
-
-    ###########################################################################
-    # We have multiple returned sequences: Create the table
-    ###########################################################################
-    # Prep info for the table
-    batch_size    = tokenized.input_ids.shape[0]
-    output_length = model_outputs.sequences.shape[-1]
-    responses     = model_outputs.sequences.reshape(
-        batch_size, -1, output_length)
-    sequences_scores = model_outputs.sequences_scores.reshape(batch_size, -1)
-
-    # Create the table
-    table = rich.table.Table(
-        title="Batch Unroll", 
-        show_lines=True,
-        show_header=False,
-        show_edge=True,
-        highlight=True
-    )
-
-    output_text = np.array(outputs.response_text, dtype=object).reshape(
-        (batch_size, -1)
-    )
-
-    for batch_idx in range(batch_size):
+    sequences_scores = None
+    if task_name != lib_utils.Task.SENTIMENT:
+        assert "sequences_scores" in outputs, outputs.keys()
+        batch_size = len(query_tensors)
+        num_seqs = generation_kwargs.get("num_return_sequences", 1)
         
-        sorted_idx = sorted(
-            range(len(sequences_scores[batch_idx])),
-            key     = lambda i: sequences_scores[batch_idx][i],
-            reverse = True,
+        assert num_seqs != 1, "This has not been tested at all"
+
+        responses = np.array(outputs["sequences"], dtype=object).reshape(batch_size, num_seqs)
+        sequences_scores = np.array(
+            outputs["sequences_scores"],
+            dtype=float
+        ).reshape(batch_size, num_seqs)
+        
+        ###########################################################################
+        # We have multiple returned s
+        # equences: Create the table
+        ###########################################################################
+        _display_table_return_sequences(
+            ref_text_answers     = ref_text,
+            batch_size           = batch_size,
+            difficulty_levels    = difficulty_levels,
+            prediction_tokenizer = prediction_tokenizer,
+            query_tensors        = query_tensors,
+            responses            = responses,
+            sequences_scores     = sequences_scores,
         )
-        sorted_texts  = [output_text     [batch_idx][idx] for idx in sorted_idx]
-        sorted_scores = [sequences_scores[batch_idx][idx] for idx in sorted_idx]
 
-        for (seq_idx, val), score in more_itertools.zip_equal(
-            enumerate(sorted_texts), sorted_scores
-        ):
-            
-            score = str(score.item())
-            table.add_row(
-                (f"[bold green]Winner[/]\n" if seq_idx == 0 else "") +
-                f"{difficulty_levels[batch_idx] = } \n"
-                f"{batch_idx = } \n"
-                f"{seq_idx   = } \n"
-                f"{score     = }", 
-                str(val).strip(),
-            )
-
-    rich.print(table)
-
-    return outputs, sequences_scores
+    return return_obj, sequences_scores
 
 
 def unpad(responses, pad_token_id, eos_token_id):
@@ -1058,10 +1316,13 @@ def unpad(responses, pad_token_id, eos_token_id):
         # We might have cut it off if pad_token_id == eos_token_Id,
         # so we need to add it if it's not there.
         if modified and (
-            not response.shape[0] or response[-1] != eos_token_id
+            not response.shape[0] or 
+            response[-1] != eos_token_id
         ):
-            response = torch.cat(
-                [response, torch.tensor([eos_token_id]).to(response.device)]
-            )
+            response = torch.cat([
+                response, 
+                torch.tensor([eos_token_id]).to(response.device),
+            ])
+            
         final_responses.append(response)
     return final_responses

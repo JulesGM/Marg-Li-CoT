@@ -2,7 +2,6 @@
 # coding: utf-8
 import enum
 import itertools as it
-import logging
 import pathlib
 import time
 import threading
@@ -51,7 +50,7 @@ def _query_one_error_handler(error, thread_name, retry_wait_time):
         f"\n[red on white]{header}:[/] {error}\n"
         f"[red on white]Waiting {retry_wait_time} seconds")
     time.sleep(retry_wait_time)
-    rich.print(f"[green on white]Retrying.\n")
+    rich.print("[green on white]Retrying.\n")
 
 
 def _query_one(
@@ -95,11 +94,11 @@ def _query_one(
         if not is_good:
             if retry_until_good:
                 table = rich.table.Table("Key", "Value", title="Incorrect answer", show_lines=True)
-                table.add_row(f"[bold]Question",       sample['ref_qa_question'])
-                table.add_row(f"[bold]Choices",        sample['ref_qa_choices'])
-                table.add_row(f"[bold]ref_answer",     sample['ref_qa_answer'])
-                table.add_row(f"[bold]model_answer",   output)
-                table.add_row(f"[bold]Temperature",    f"{temperature}")                
+                table.add_row("[bold]Question",       sample['ref_qa_question'])
+                table.add_row("[bold]Choices",        sample['ref_qa_choices'])
+                table.add_row("[bold]ref_answer",     sample['ref_qa_answer'])
+                table.add_row("[bold]model_answer",   output)
+                table.add_row("[bold]Temperature",    f"{temperature}")                
                 rich.print(table)
 
                 rich.print(f"Retrying until good, {num_retries_until_good_so_far}/{num_retry_until_good} retries.")

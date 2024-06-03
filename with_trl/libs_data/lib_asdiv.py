@@ -1,7 +1,5 @@
 import more_itertools
 import pathlib
-import typing
-from typing import Any, Optional, Union
 
 import torch
 import torch.utils.data

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
-from pathlib import Path
+import enum
 import os
+from pathlib import Path
 import shlex
 import subprocess
 
@@ -11,14 +12,26 @@ import rich.markup
 import rich.panel
 
 import rich.table
-from rich.highlighter import ReprHighlighter as RHL
 
 import subprocess
 import nvgpu
 
+
 MODULE = "accelerate"
 SCRIPT_DIR = Path(__file__).absolute().parent
 SCRIPT_PATH = SCRIPT_DIR / "bin_main.py"
+
+
+class MixedPrecision(enum.Enum):
+    NO = "no"
+    BF16 = "bf16"
+    FP16 = "fp16"
+
+
+class ConfigName(enum.Enum):
+    SENTIMENT = "sentiment"
+    ARITHMETIC = "arithmetic"
+    GSM8K = "gsm8k"
 
 
 def count_gpus():
@@ -27,6 +40,7 @@ def count_gpus():
     except subprocess.CalledProcessError:
         return 0
     assert False
+
 
 def kill_wandb_servers():
     print(subprocess.check_output(
@@ -37,21 +51,32 @@ def kill_wandb_servers():
 
 
 def main(
-    name, 
+    *,
     one=False, 
-    task_name="sentiment", 
-    config_file=SCRIPT_DIR / "accelerate_ddp_no.yaml",
+    port=29511,
+    config_name=ConfigName.ARITHMETIC, 
+    accelerate_config_file=SCRIPT_DIR / "accelerate_ds_2.yaml",
+    overloads=None,
+    mixed_precision=None,
+    **rest,
 ):
-    
+
     args = locals().copy()
-    rhl = RHL()
+    assert not rest, rest
+    assert mixed_precision is not None, mixed_precision
+
+    config_name = ConfigName(config_name)
+    mixed_precision = MixedPrecision(mixed_precision)
+    accelerate_config_file = Path(accelerate_config_file)
+    assert accelerate_config_file.exists(), accelerate_config_file
+    port = int(port)
+    assert isinstance(one, bool), one
 
     table = rich.table.Table.grid()
-    
     for k, v in args.items():
         table.add_row(
             "[bold]" + rich.markup.escape(str(k)) + ":",
-            rhl(" " + rich.markup.escape(str(v))),
+            " " + rich.markup.escape(str(v)),
         )
         
     rich.print(
@@ -68,18 +93,19 @@ def main(
         rich.print("[red bold on white] No gpus. Cancelling.")
         return
 
-    config_file = Path(config_file)
-    assert config_file.exists(), config_file
-    # kill_wandb_servers()
-
+    accelerate_config_file = Path(accelerate_config_file)
+    assert accelerate_config_file.exists(), accelerate_config_file
     num_processes = 1 if one else len(nvgpu.gpu_info())
     
     command = [
         "accelerate",
         "launch",
-        "--num_processes", num_processes,
-        "--config_file", config_file,
+        "--main_process_port", str(port),
+        "--num_processes",     num_processes,
+        "--config_file",       accelerate_config_file,
+        "--mixed_precision",   mixed_precision.value,
     ]
+
     if one:
         command += [
             "--no_python",
@@ -92,9 +118,11 @@ def main(
 
     command += [
         SCRIPT_PATH,
-        f"name={shlex.join([name])}",
-        f"--config-name={shlex.join([task_name])}",
+        f"--config-name={shlex.quote(config_name.value)}",
     ]
+
+    if overloads:
+        command += shlex.split(overloads)
     
     command = list(map(str, command))
 
@@ -104,6 +132,7 @@ def main(
         title_align="left",
         highlight=True,
     ))
+
     os.execvp("accelerate", command)
     
 

@@ -1,28 +1,21 @@
 """ Datasets parsing and loading. """
 
-import collections.abc
 import enum
 import logging
 import os
 from pathlib import Path
-import typing
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import datasets
-import more_itertools as mit
-import numpy as np
-import rich
-import rich.box
-import rich.table
 import torch
 import torch.utils
 import torch.utils.data
 import transformers
 
-import lib_base_classes
-import libs_data
-import libs_extraction
-import lib_utils
+from with_trl import lib_base_classes
+from with_trl import libs_data
+from with_trl import libs_extraction
+from with_trl import lib_utils
 
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
@@ -45,6 +38,7 @@ DATASET_KEY_TO_CLASS = {
     DatasetChoices.SENTIMENT: libs_data.lib_sentiment.SentimentData
 }
 
+
 DATASET_KEY_TO_ANSWER_EXTRACTOR = {
     DatasetChoices.ASDIV: libs_extraction.lib_numerical,
     DatasetChoices.GSM8K: libs_extraction.lib_numerical,
@@ -54,8 +48,15 @@ DATASET_KEY_TO_ANSWER_EXTRACTOR = {
 
 
 def data_item_collator(
-    batch: list[lib_base_classes.DataItemContainer]
+    batch_and_indices: list[lib_base_classes.DataItemContainer]
 ) -> lib_base_classes.DataListContainer:
+    
+    batch, indices = zip(*batch_and_indices)
+
+    for i in range(WORLD_SIZE):
+        if i == RANK:
+            print(f"{RANK}: {sorted(indices)}")
+        torch.distributed.barrier()
     
     new_batch = lib_base_classes.DataListContainer()
     for item in batch:
@@ -80,11 +81,9 @@ def prep_dataset_rl(
     extr_arith_ignore_one_line,
     use_curriculum,
 ) -> libs_data.lib_base.Dataset:
+    
     split = lib_utils.CVSets(split)
-
-    if answer_only and not dataset_name in {
-        DatasetChoices.COMMONSENSEQA_MC, DatasetChoices.ARITHMETIC
-    }:
+    if answer_only and dataset_name not in {DatasetChoices.COMMONSENSEQA_MC, DatasetChoices.ARITHMETIC}:
         raise NotImplementedError()
 
     if dataset_name == DatasetChoices.GSM8K:
@@ -115,7 +114,7 @@ def prep_dataset_rl(
         )
 
     elif dataset_name == DatasetChoices.ASDIV:
-        raise NotImplemented
+        raise NotImplementedError
         assert split is None, "split must be None for ASDiv"
         dataset = libs_data.lib_asdiv.ASDiv(
             tokenizer=any_tokenizer,
@@ -130,19 +129,18 @@ def prep_dataset_rl(
 
     elif dataset_name == DatasetChoices.ARITHMETIC:
         dataset = libs_data.lib_arithmetic.Arithmetic(
-            dataset_root_folder_dir=arithmetic_dataset_root_folder_dir,
+            dataset_root_folder_dir = arithmetic_dataset_root_folder_dir,
             answer_only     = answer_only,
             any_tokenizer   = any_tokenizer,
             eos_token       = any_tokenizer.eos_token,
             pad_token       = any_tokenizer.pad_token,
-            question_prefix = None,
-            question_suffix = None,
-            sft_mode = False,
+            sft_mode        = False,
             shuffle_once    = False,
             split           = split,
             use_few_shots   = True,
             use_curriculum  = use_curriculum,
             extractor_ignore_one_line = extr_arith_ignore_one_line,
+            use_cached_dataset = False,
         )
 
     else:

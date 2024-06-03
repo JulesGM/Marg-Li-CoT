@@ -1,0 +1,5 @@
+kl_penalty: "kl" # "kl", "abs", "mse", "full"
+ratio_threshold: 10
+learning_rate: 1.41e-3
+adap_kl_ctrl: False
+init_kl_coef: 0.2

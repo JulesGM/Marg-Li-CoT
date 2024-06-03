@@ -1,7 +1,5 @@
 import os
 
-import torch
-import torch.utils.data
 
 import lib_base_classes
 import lib_sentiment_specific

@@ -1,7 +1,6 @@
 import json
 import wandb
 
-import numpy as np
 import rich
 import rich.markup
 import rich.table

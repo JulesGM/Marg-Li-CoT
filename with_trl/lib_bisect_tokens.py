@@ -1,15 +1,10 @@
 import bisect
-import collections
-import copy
 import logging
 import re
 import time
 
-import fire
-import numpy as np
 import rich
 import rich.logging
-import torch
 import transformers
 
 LOGGER = logging.getLogger(__name__)
@@ -168,13 +163,13 @@ def extract_match_tokens(
                     # f"[bold blue]l_b_left:[/]          {lb_left}"    + "\n"+
                     # f"[bold blue]r_b_right:[/]         {rb_right}"   + "\n"+
                     # f"[bold blue]r_b_left:[/]          {rb_left}"    + "\n" +
-                    f"[bold blue]l_b:[/]               "
+                    "[bold blue]l_b:[/]               "
                     + str([(i, int(b)) for i, b in enumerate(l_b)])
                     + "\n"
-                    + f"[bold blue]r_b:[/]               "
+                    + "[bold blue]r_b:[/]               "
                     + str([(i, int(b)) for i, b in enumerate(r_b)])
                     + "\n"
-                    + f"[bold blue]both boundaries:[/]   "
+                    + "[bold blue]both boundaries:[/]   "
                     + str(
                         [
                             (i, (int(l), int(r)))
@@ -182,7 +177,7 @@ def extract_match_tokens(
                         ]
                     )
                     + "\n"
-                    + f"[bold blue]tokens:[/]            "
+                    + "[bold blue]tokens:[/]            "
                     + str(
                         [
                             (i, tokenizer.decode([t], skip_special_tokens=False))
@@ -190,7 +185,7 @@ def extract_match_tokens(
                         ]
                     )
                     + "\n"
-                    + f"[bold blue]token ids:[/]         "
+                    + "[bold blue]token ids:[/]         "
                     + str([(i, int(t)) for i, t in enumerate(toks)])
                     + "\n"
                     + "-" * 40

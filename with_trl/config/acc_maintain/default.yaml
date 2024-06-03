@@ -1,0 +1,2 @@
+class_name: "MaxLevelGlobalAvgAcc"
+limit_to_respect: .5

@@ -1,16 +1,14 @@
 from __future__ import annotations
 import collections
+import enum
+import itertools as it
 import logging
 import os
 import pathlib
 import random
-import re
-import string
 import subprocess
 import sys
-import time
-import typing
-from typing import Any, Optional, Union
+from typing import Optional
 
 import datasets
 import fire
@@ -20,6 +18,7 @@ import numpy as np
 import rich
 import rich.logging
 import rich.markup
+import rich.rule
 import torch
 import torch.utils.data
 import tqdm
@@ -30,10 +29,9 @@ sys.path.append(str(SCRIPT_DIR.parent))
 import lib_base_classes
 import lib_metric
 import lib_utils
-import libs_extraction.lib_multiple_choice
-import libs_data.lib_base
-import libs_data.data_commonsense_qa_few_shot
-import libs_data.arithmetic.arithmetic_10_shot
+from libs_extraction import lib_final_line
+from libs_data import lib_base
+from libs_data.arithmetic import arithmetic_10_shot
 
 datasets.disable_caching()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -79,11 +77,13 @@ def _tok_detok(*, batch, any_tokenizer, batched, exclusion_set=None):
 
     return output
 
+
 def _count_lines(file):
     return int(subprocess.check_output(
             ["wc", "-l", str(file)], 
             universal_newlines=True
         ).split()[0])
+
 
 class DSIterator:
     def __init__(self, ds, use_curriculum: bool):
@@ -126,8 +126,6 @@ class DSIterator:
 
         """
 
-        assert self._use_curriculum
-
         if self._use_curriculum:
             """
             . Sample a difficulty
@@ -136,17 +134,18 @@ class DSIterator:
             . increment the index, possibly restarting the epoch
 
             """
+
             difficulty = np.random.choice(
                 list(self._proportion_difficulties.keys()),
                 p=list(self._proportion_difficulties.values()),
             )
-            
-            ds_obj = self._ds[difficulty]
-            base_idx = self._indices[difficulty]
-            self._indices[difficulty] += 1
+            ds_obj                      = self._ds      [difficulty]
+            base_idx                    = self._indices [difficulty]
+            self._indices [difficulty] += 1
+
         else:
-            ds_obj = self._ds
-            base_idx = self._idx
+            ds_obj     = self._ds
+            base_idx   = self._idx
             self._idx += 1
             
         # Check that the sharded idx is within bounds
@@ -154,13 +153,18 @@ class DSIterator:
         
         sharded_idx = (base_idx * WORLD_SIZE + RANK) % len(ds_obj)
         value = ds_obj[sharded_idx]
+        
+        return value, sharded_idx
 
-        return value
+
+class TrainModes(enum.Enum):
+    RL = "RL"
+    SFT = "SFT"
 
 
 class Arithmetic(
-    libs_data.lib_base.FewShotMixin,
-    libs_data.lib_base.IterableDataset,
+    lib_base.FewShotMixin,
+    lib_base.IterableDataset,
 ):
     def __init__(
             self, 
@@ -171,38 +175,35 @@ class Arithmetic(
             eos_token: str,
             extractor_ignore_one_line: bool,
             pad_token: str,
-            question_prefix: str, 
-            question_suffix: Optional[str],
             sft_mode: bool,
             shuffle_once: bool,
             split: lib_utils.CVSets,
             use_few_shots: bool,
             use_curriculum: bool,
-            use_cached_dataset: bool = False,
+            use_cached_dataset: bool,
         ):
 
         dataset_root_folder_dir = pathlib.Path(dataset_root_folder_dir)
         self._dataset_root_folder_dir = dataset_root_folder_dir
         assert dataset_root_folder_dir.exists(), dataset_root_folder_dir
+        if sft_mode:
+            self._mode = TrainModes.SFT
+        else:
+            self._mode = TrainModes.RL
+        del sft_mode    
 
-        assert question_prefix is None, f"question_prefix: `{question_prefix}`"
-        assert question_suffix is None, f"question_suffix: `{question_suffix}`"
-        
+        if use_curriculum:
+            assert self._mode != TrainModes.SFT, "sft mode is not compatible with curriculum."
+
         if answer_only:
-            assert not sft_mode, "Not done yet"
+            assert self._mode != TrainModes.SFT, "Not done yet"
 
         self._answer_only = answer_only
-        self._question_prefix = question_prefix
-        self._question_suffix = question_suffix
         self._eos_token = eos_token
         self._use_curriculum = use_curriculum
+        self._curriculum_proportions = None
 
-        self._use_few_shots = use_few_shots
-        if use_few_shots:
-            self._question_prefix = self._prepare_few_shots()
-            self._question_suffix = "<scratch>"
-
-        self._extractor = libs_extraction.lib_final_line.FinalLineExtractor(
+        self._extractor = lib_final_line.FinalLineExtractor(
             pad_token=pad_token,
             ignore_one_line=extractor_ignore_one_line,
         )
@@ -211,23 +212,41 @@ class Arithmetic(
         folder = dataset_root_folder_dir / f"{split.value}_scratch"
         assert folder.exists(), folder
         assert folder.is_dir(), folder
-        glob_pattern = f"*.jsonl"
+        glob_pattern = "*.jsonl"
         target_files = list(folder.glob(glob_pattern))
         assert target_files, (glob_pattern, folder, list(folder.iterdir()))
-
-        if sft_mode:
-            self._setup_sft_mode(target_files)
+        
+        self._max_num_digits = max(int(file.stem) for file in target_files)
+        
+        self._use_few_shots = use_few_shots
+        if use_few_shots:
+            assert not self._mode == 
+            self._few_shot_text = self._prepare_few_shots()
         else:
-            tok_name = any_tokenizer.name_or_path.replace("/", "_")
-            hf_dataset_path = folder / f"{split}_{tok_name}.hf_dataset"
+            self._few_shot_text = None
 
-            if not use_cached_dataset or not hf_dataset_path.exists():
+        #######################################################################
+        if self._mode == TrainModes.SFT:
+            self._setup_sft_mode(target_files)
+        elif self._mode == TrainModes.RL:
+            tok_name = any_tokenizer.name_or_path.replace("/", "_")
+            hf_dataset_path = folder / f"{split}_{tok_name}_{self._answer_only}.hf_dataset"
+            already_exists = (
+                hf_dataset_path.exists() or 
+                list(hf_dataset_path.parent.glob(hf_dataset_path.name + "*"))
+            )
+
+            if not use_cached_dataset or not already_exists:
                 self._prepare_rl_mode_data(target_files, any_tokenizer)
                 if use_cached_dataset:
+                    print("SAVE RL MODE")
                     self._save_rl_mode_dataset(hf_dataset_path)
             else:
                 self._load_cached_rl_mode_dataset(hf_dataset_path)        
-            
+        else:
+            raise ValueError(self._mode)
+        #######################################################################
+
         if shuffle_once:
             self._core.shuffle()
 
@@ -237,25 +256,79 @@ class Arithmetic(
         )
         self._already_started = False
 
+
+    def make_few_shot_toks(self) -> torch.Tensor:
+        if not self._use_curriculum:
+            raise NotImplementedError("Few shot only works with curriculum")
+    
+        assert not self._train_mode == TrainModes.SFT, self._train_mode
+
+        per_digit = {}
+        for num_digits, proportion in self._curriculum_proportions.items():
+            rounded_prop = round(self._few_shot_qty * proportion)
+            indices = np.random.permutation(self._few_shot_qty)[:rounded_prop]
+            per_digit[num_digits] = [self._few_shot_text[num_digits][i] for i in indices]
+        
+        flattened_few_shots = list(it.chain.from_iterable(per_digit.values()))
+        random.shuffle(flattened_few_shots)
+        return "\n".join(flattened_few_shots).strip()
+    
+    @property
+    def training_mode(self):
+        return self._mode
+        
+    @property
+    def few_shot_text(self) -> str:
+        assert False
+        return self._few_shot_text
+
     def _load_cached_rl_mode_dataset(self, hf_dataset_path):
         if RANK == 0:
             rich.print(f"[green bold]Loading hf_dataset from disk:[/]  {hf_dataset_path}")
+        
+        if self._use_curriculum:
+            self._core = {}
+            files = hf_dataset_path.parent.glob(hf_dataset_path.name + "*")
+            for file in files:
+                difficulty = int(file.name.rsplit("_", 1)[-1])
+                data = datasets.load_from_disk(file)
+                self._core[difficulty] = lib_base_classes.DataListContainer.from_list_of_items([
+                    lib_base_classes.DataItemContainer(**data) for data in data
+                ])
+        else:
+            self._core = lib_base_classes.DataListContainer.from_list_of_items([
+                lib_base_classes.DataItemContainer(**data) for data in 
+                datasets.load_from_disk(hf_dataset_path)
+            ])
 
-        self._core = datasets.load_from_disk(hf_dataset_path)
 
-    def _save_rl_mode_dataset(self, hf_dataset_path):
+    def _save_rl_mode_dataset(self, hf_dataset_path: pathlib.Path):
         if RANK == 0:
             rich.print(f"[green bold]Saving hf_dataset to disk:[/] {hf_dataset_path}")
 
-        hf_dataset_obj = datasets.Dataset.from_dict(
-            dict(self._core.items()))
-        hf_dataset_obj.save_to_disk(hf_dataset_path)
-        self._core = hf_dataset_obj
+        print("Converting to basic types")
+
+        if self._use_curriculum:
+            progress = tqdm.tqdm(self._core.items())
+            for dificulty_level, difficulty_data  in progress:
+                assert isinstance(dificulty_level, int), (type(dificulty_level), dificulty_level)
+
+                progress.set_description(f"Converting to basic types: {dificulty_level}")
+                dataset = datasets.Dataset.from_list([x.to_dict() for x in difficulty_data])
+                path = hf_dataset_path.parent / f"{hf_dataset_path.name}_{dificulty_level}"
+                dataset.save_to_disk(path)
+        else:
+            dataset = datasets.Dataset.from_list([x.to_dict() for x in self._core])
+            path = hf_dataset_path.parent / f"{hf_dataset_path.name}"
+            dataset.save_to_disk(path)
+
 
     def _prepare_rl_mode_data(self, target_files, any_tokenizer):
+        rich.print("[bold blue]_prepare_rl_mode_data:[/]", target_files)
+
         self._core = lib_base_classes.DataListContainer()
         target_files.sort(key=lambda x: x.name)
-
+        
         for file in tqdm.tqdm(target_files, desc="Loading files", disable=RANK != 0):
             num = _count_lines(file)
 
@@ -268,39 +341,35 @@ class Arithmetic(
                 ):
                     if self._answer_only:
                         sample["question"] = (
-                            self._question_prefix + "\n" +
-                            "Q: " + sample["input"] + "\n" +
-                            sample["scratchpad"] + "\nA:\n"
+                            f"Q: {sample['input']}\n" +
+                            f"{sample['scratchpad'].strip()}\n" +
+                            "A:"
                         )
                     else:
                         sample["question"] = (
-                            self._question_prefix + "\n" +
-                            "Q: " + sample["input"] + "\n" +
-                            self._question_suffix + "\n"
+                            f"Q: {sample['input']}\n" +
+                            "<scratch>"
                         )
 
                     difficulty_level = sample["num_digits"]
 
-                    sample = _tok_detok(
-                        any_tokenizer = any_tokenizer, 
-                        batch         = sample, 
-                        batched       = False,
-                        exclusion_set = {"num_digits"}
-                    )
+                    # sample = _tok_detok(
+                    #     any_tokenizer = any_tokenizer, 
+                    #     batch         = sample, 
+                    #     batched       = False,
+                    #     exclusion_set = {"num_digits"}
+                    # )
                 
-                    self._core.tok_ref_query     .append(torch.tensor(sample[  "question_tok"]))
-                    self._core.tok_ref_answer    .append(torch.tensor(sample[    "answer_tok"]))
-                    self._core.tok_ref_scratchpad.append(torch.tensor(sample["scratchpad_tok"]))
+                    # self._core.tok_ref_query       .append(None)
+                    # self._core.tok_ref_answer      .append(None)
+                    # self._core.tok_ref_scratchpad  .append(None)
 
-                    self._core.detok_ref_query     .append(sample[  "question_detok_skip"])
-                    self._core.detok_ref_answer    .append(sample[    "answer_detok_skip"])
-                    self._core.detok_ref_scratchpad.append(sample["scratchpad_detok_skip"])
+                    self._core.detok_ref_query     .append(sample[  "question"])
+                    self._core.detok_ref_answer    .append(sample[    "answer"])
+                    self._core.detok_ref_scratchpad.append(sample["scratchpad"])
+                    
                     self._core.extra_information   .append({})
-                    self._core.difficulty_level.append(difficulty_level)
-
-            self._max_num_digits = max(
-                self._core.difficulty_level
-            )
+                    self._core.difficulty_level    .append(difficulty_level)
 
         if self._use_curriculum:
             final = collections.defaultdict(list)
@@ -324,7 +393,6 @@ class Arithmetic(
             desc="Loading files", 
             disable=RANK != 0,
         ):
-            assert not self._question_prefix
             with jsonl.open(file) as f:
                 for sample in tqdm.tqdm(f, desc="Building DictDataset"):
                     scratchpad = sample["scratchpad"] + "\n" + sample["answer"]
@@ -334,46 +402,41 @@ class Arithmetic(
                         ref_qa_scratchpad = scratchpad,
                         num_digits        = int(sample["num_digits"]),
                 ))
-        self._max_num_digits = max(self._core["num_digits"])
 
     @property
     def max_num_digits(self):
         return self._max_num_digits
 
     def _prepare_few_shots(self):
-        text_list = []
+        self._few_shot_qty = 10
+        few_shots = arithmetic_10_shot.make_few_shots(
+            max_digits=self.max_num_digits,
+            num_per=self._few_shot_qty,
+            root=self._dataset_root_folder_dir,
+        )
         
-        for entry in libs_data.arithmetic.arithmetic_10_shot.make_few_shots(
-            self._dataset_root_folder_dir
-        ):
-            text_list.append(
-                f"Q: {entry['input']}\n"
-                f"{entry['scratchpad']}\n"
-                f"A:\n" +
-                str(entry['answer']) + "\n" +
-                f"!\n"
-            )
-        final_text = "\n".join(text_list)        
+        few_shot_text = collections.defaultdict(list)
+        for l, entries in few_shots.items():
+            for entry in entries:
+                few_shot_text[l].append(
+                    f"Q: {entry['input']}\n"
+                    f"{entry['scratchpad'].strip()}\n"
+                    f"A:\n" +
+                    str(entry['answer']) + "\n" +
+                    "!\n"
+                )
 
-        return final_text
+        return few_shot_text
 
     @property
     def use_few_shots(self):
         return self._use_few_shots
 
     def __iter__(self):
-        assert self._already_started is False
+        assert self._already_started is False, f"Already started {self._already_started = }"
         self._already_started = True
 
         return self
-
-    @property
-    def question_prefix(self):
-        return self._question_prefix
-
-    @property
-    def question_suffix(self):
-        return self._question_suffix
 
     def get_extractor(self):
         return self._extractor
@@ -386,12 +449,15 @@ class Arithmetic(
         ]
 
     def set_proportion_difficulties(self, proportions):
+        self._curriculum_proportions = proportions
         self._inner_iterator.set_proportion_difficulties(proportions)
 
     def __next__(self):
         
         assert self._inner_iterator is not None
-        return next(self._inner_iterator)
+        data, idx = next(self._inner_iterator)
+        data.detok_ref_query = self.make_few_shot_toks() + "\n\n" + data.detok_ref_query
+        return data, idx
 
 
 class PerNumberOfDigitsAccuracy(lib_base_classes.Metric):
@@ -487,22 +553,24 @@ def main(n=1):
         "Open-Orca/Mistral-7B-OpenOrca"
     )
     path = (
-        "/home/mila/g/gagnonju/Marg-Li-CoT/with_trl/libs_data/arithmetic/"
+        "/home/mila/g/gagnonju/marglicot/with_trl/libs_data/arithmetic/"
     )
 
     ds = Arithmetic(
-            any_tokenizer=forward_tokenizer,
-            dataset_root_folder_dir=path,
-            pad_token=forward_tokenizer.pad_token,
-            eos_token=forward_tokenizer.eos_token,
-            extractor_ignore_one_line=False,
-            question_prefix=None,
-            question_suffix=None,
-            sft_mode=False,
-            shuffle_once=False,
-            split=lib_utils.CVSets.TRAIN,
-            use_cached_dataset=False,
-            use_few_shots=True,
+            answer_only               = False,
+            dataset_root_folder_dir   = path,
+            eos_token                 = forward_tokenizer.eos_token,
+            extractor_ignore_one_line = False,
+            pad_token                 = forward_tokenizer.pad_token,
+            split                     = lib_utils.CVSets.TRAIN,
+            shuffle_once              = False,
+            
+            sft_mode                  = False,
+            use_few_shots             = False,
+            use_curriculum            = True,
+            use_cached_dataset        = True,
+
+            any_tokenizer             = forward_tokenizer,
         )
     
     # for i in range(n):
@@ -528,6 +596,8 @@ def main(n=1):
     #         "Few Shots", 
     #         rich.markup.escape(str(sample["detok_ref_query"])))
     #     rich.print(table)
+
+    breakpoint()
 
     rich.print(ds[0]["detok_ref_query"])
 

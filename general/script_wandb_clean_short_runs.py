@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 
 Deletes wandb runs that are under a certain duration or that don't have a recorded duration at all.
@@ -215,7 +216,7 @@ def main(
         username     = username,
     )
     
-    with rich.status.Status(f"Building & Displaying Table"):
+    with rich.status.Status("Building & Displaying Table"):
         qty_unchanged, qty_deleted, rows = build_info(
             min_minutes = min_minutes,
             runs        = runs,

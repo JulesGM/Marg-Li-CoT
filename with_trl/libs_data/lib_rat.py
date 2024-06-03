@@ -1,7 +1,6 @@
 """Implements support for the "aqua_rat" dataset.
 """
 
-import collections
 import pathlib
 import re
 import string
@@ -45,7 +44,6 @@ def extract_answer(example):
     letter = example["correct"].strip()
     good_answer_idx = LETTER_MAP[letter]
     answer_text = example["options"][good_answer_idx].replace(",", "")
-    init_answer_text = answer_text
     assert answer_text.startswith(letter + ")")
     
     while answer_text.upper().startswith(letter + ")"):

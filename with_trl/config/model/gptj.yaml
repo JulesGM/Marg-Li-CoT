@@ -1,4 +1,6 @@
 model_name: "EleutherAI/gpt-j-6B"
-batch_size: 2
-inference_batch_size: 2
+inference_batch_size: 1
 mini_batch_size: 1
+generation_batch_size: 1
+
+gradient_accumulation_steps: 1
