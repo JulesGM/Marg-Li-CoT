@@ -21,6 +21,7 @@ import logging
 import accelerate
 import datasets
 import fire
+import hydra
 import git
 import more_itertools as mi
 import numpy as np
@@ -77,16 +78,11 @@ DEFAULT_DATA_DIRECTORY = pathlib.Path(
 )
 
 
-""" Not sure of what this means :) """
-ANSWER_ONLY_MODE = lib_sft_constants.OutputTypes.ANSWER_ONLY
-SCRATCHPAD_MODE = lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER
-
-
 """ This makes me wish we had Hydra setup :) """
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-410m";  DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER;  DEFAULT_TRAIN_BATCH_SIZE = 64;  DEFAULT_EVAL_BATCH_SIZE = 128;                           DEFAULT_USE_PEFT = True;
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B";     DEFAULT_OUTPUT_TYPE = ANSWER_ONLY_MODE;                                            DEFAULT_TRAIN_BATCH_SIZE = 8;   DEFAULT_EVAL_BATCH_SIZE = DEFAULT_TRAIN_BATCH_SIZE * 3;  DEFAULT_USE_PEFT = True;
 # DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B";     DEFAULT_OUTPUT_TYPE = SCRATCHPAD_MODE;                                             DEFAULT_TRAIN_BATCH_SIZE = 8;   DEFAULT_EVAL_BATCH_SIZE = DEFAULT_TRAIN_BATCH_SIZE;      DEFAULT_USE_PEFT = True;
-DEFAULT_MODEL_NAME_OR_PATH = "susnato/phi-2";             DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER;  DEFAULT_TRAIN_BATCH_SIZE = 16;  DEFAULT_EVAL_BATCH_SIZE = 16;                            DEFAULT_USE_PEFT = True
+DEFAULT_MODEL_NAME_OR_PATH = "susnato/phi-2";             DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.ANSWER_ONLY;  DEFAULT_TRAIN_BATCH_SIZE = 16;  DEFAULT_EVAL_BATCH_SIZE = 16;                            DEFAULT_USE_PEFT = True
 DEFAULT_N_BATCHES_PREDICT_TRAIN = 50
 
 
@@ -184,9 +180,9 @@ def predict(
         detok_ref_answer     = batch["extra_info"]["ref_qa_answer"],
         detok_ref_scratchpad = batch["extra_info"].get("ref_qa_scratchpad", None),
 
-        tok_ref_query        = None,
-        tok_ref_answer       = None,
-        tok_ref_scratchpad   = None,
+        # tok_ref_query        = None,
+        # tok_ref_answer       = None,
+        # tok_ref_scratchpad   = None,
 
         difficulty_level     = None,
         extra_information    = None,
@@ -215,7 +211,7 @@ def predict(
     if RANK == 0:
         prediction_batch_obj = lib_base_classes.BatchedUnrollReturn(
                 response_tensors     = predictions,
-                raw_response_tensors = None, 
+                # raw_response_tensors = None, 
                 any_tokenizer        = predict_tokenizer,
             )
         
@@ -255,6 +251,7 @@ def step(
     optimizer: torch.optim.Optimizer,
     log: bool,
     global_step: int,
+    do_train: bool,
 ):
     if cv_set:
         model.train()
@@ -278,7 +275,8 @@ def step(
         global_step = global_step
     )
 
-    if cv_set == lib_utils.CVSets.TRAIN:
+    if do_train:
+        assert cv_set == lib_utils.CVSets.TRAIN, cv_set
         accelerator.backward(loss)
         optimizer.step()
 
@@ -411,7 +409,6 @@ class Evaluator:
             disable = RANK != 0, 
             desc    = "Eval Batches"
         )):
-            
             with torch.no_grad():
                 losses.append(
                     stepper(
@@ -419,6 +416,7 @@ class Evaluator:
                         epoch_idx   = epoch_idx,
                         global_step = global_step,
                         log         = False,
+                        do_train    = False,
                     ).cpu().item()
                 )
                 
@@ -465,11 +463,10 @@ class ForwardLogger:
                 epoch, self._any_tokenizer.decode(batch[idx])
             )
             
-
+@hydra.main(version_base=None, config_path="config", config_name="config")
 def main(
     run_name,
     *,
-    answer_only               = False,
     batch_table_print_qty     = DEFAULT_BATCH_TABLE_PRINT_QTY,
     dataset_choice            = DEFAULT_DATASET,
     data_directory            = DEFAULT_DATA_DIRECTORY,
@@ -599,10 +596,10 @@ def main(
     assert not is_encoder_decoder
 
     dataloaders, small_eval_dl = lib_sft_dataloaders.get_dataloaders(
-        answer_only          = answer_only,
+        answer_only          = False, # Doesn't do anything for sft
         data_directory       = data_directory,
         dataset_choice       = dataset_choice,
-        eval_batch_size      = eval_batch_size,
+        eval_batch_size      = eval_batch_size * WORLD_SIZE,
         extractor_ignore_one_line = extractor_ignore_one_line,
         filter_bads          = filter_out_bad,
         forward_tokenizer    = forward_tokenizer,
@@ -610,15 +607,28 @@ def main(
         output_type          = output_type,
         prediction_tokenizer = prediction_tokenizer,
         qty_eval_small       = qty_eval_small,
-        train_batch_size     = train_batch_size,
+        train_batch_size     = train_batch_size * WORLD_SIZE,
     )
+
 
     ###########################################################################
     # 🏎️ Accelerator business
     ###########################################################################
-    accelerator = accelerate.Accelerator()
-    model, optimizer, dataloaders, small_eval_dl = accelerator.prepare(
-        model, optimizer, dataloaders, small_eval_dl)
+    accelerator = accelerate.Accelerator(split_batches=True)
+    (
+        model, 
+        optimizer, 
+        dataloaders[lib_utils.CVSets.TRAIN], 
+        dataloaders[lib_utils.CVSets.VALID], 
+        small_eval_dl,
+    ) = accelerator.prepare(
+        model, 
+        optimizer, 
+        dataloaders[lib_utils.CVSets.TRAIN], 
+        dataloaders[lib_utils.CVSets.VALID], 
+        small_eval_dl,
+    )
+    
 
     ###########################################################################
     # 🔁 Main Loop
@@ -662,6 +672,7 @@ def main(
         epoch_idx: int,
         global_step: int,
         log,
+        do_train,
     ):
         return step(
             accelerator       = accelerator,
@@ -675,6 +686,7 @@ def main(
             model             = model,
             optimizer         = optimizer,
             log               = log,
+            do_train          = do_train,
         )
 
     def validation_stepper(
@@ -683,7 +695,9 @@ def main(
         epoch_idx,
         global_step,
         log,
+        do_train,
     ):
+        assert not do_train, "Validation stepper should not train."
         return step(
             accelerator       = accelerator,
             batch             = batch,
@@ -696,6 +710,7 @@ def main(
             model             = model,
             optimizer         = optimizer,
             log               = log,
+            do_train          = False,
         )
     
     global_step = 0
@@ -704,9 +719,6 @@ def main(
         disable = RANK != 0, 
         desc    = "Epochs",
     ):
-        
-        train_dataset_iterator = iter(dataloaders[lib_utils.CVSets.TRAIN])
-
         if RANK == 0:
             wandb.log(
                 {f"{lib_constant.WANDB_NAMESPACE}/epoch": epoch_idx}, 
@@ -727,13 +739,12 @@ def main(
 
             # Train
             for batch_idx, batch in enumerate(tqdm(it.islice(
-                    train_dataset_iterator, 
+                    dataloaders[lib_utils.CVSets.TRAIN],
                     n_batches_predict_train,
                 ), 
                 disable = RANK != 0, 
                 desc    = "Train Batches",
             )):
-                
                 at_least_one = True
                 global_step += len(batch["forward"]["input_ids"]) * WORLD_SIZE
                 
@@ -742,6 +753,7 @@ def main(
                     epoch_idx   = epoch_idx,
                     global_step = global_step,
                     log         = True,
+                    do_train    = True,
                 )
 
                 if batch_idx % 10 == 0:
@@ -758,11 +770,11 @@ def main(
                         )
             
             validation_evaluator.evaluate(
+                global_step = global_step,
                 dataloader  = small_eval_dl, 
-                epoch_idx   = epoch_idx, 
-                global_step = global_step, 
-                model       = model, 
-                stepper     = validation_stepper
+                epoch_idx   = epoch_idx,
+                stepper     = validation_stepper,
+                model       = model,
             )
 
     validation_evaluator.evaluate(
@@ -778,7 +790,7 @@ def main(
         epoch_idx   = epoch_idx,
         global_step = global_step + 1,
         model       = model, 
-        stepper     = training_stepper
+        stepper     = training_stepper,
     )
 
 if __name__ == "__main__":

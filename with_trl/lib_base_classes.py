@@ -65,18 +65,17 @@ class BatchedUnrollReturn:
     class IndivualReturn:
         response_tensor: torch.Tensor
         response_text: str
-        raw_response_tensor: torch.Tensor
-        raw_response_text: str
+        # raw_response_tensor: torch.Tensor
+        # raw_response_text: str
 
     def __iter__(self):
-        response_text = self.response_text
 
         for i in range(len(self)):
             yield self.IndivualReturn(
-                response_tensor=self.response_tensors[i],
-                response_text=response_text[i],
-                raw_response_tensor=self.raw_response_tensors[i],
-                raw_response_text=self.raw_response_text[i],
+                response_tensor     = self.response_tensors[i],
+                response_text       = self.response_text[i],
+                # raw_response_tensor = self.raw_response_tensors[i],
+                # raw_response_text   = self.raw_response_text[i],
             )
 
 

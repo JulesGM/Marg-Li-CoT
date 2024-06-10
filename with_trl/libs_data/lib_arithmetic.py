@@ -3,6 +3,7 @@ import collections
 import enum
 import itertools as it
 import logging
+import math
 import os
 import pathlib
 import random
@@ -19,6 +20,7 @@ import rich
 import rich.logging
 import rich.markup
 import rich.rule
+import rich.traceback
 import torch
 import torch.utils.data
 import tqdm
@@ -33,6 +35,7 @@ from libs_extraction import lib_final_line
 from libs_data import lib_base
 from libs_data.arithmetic import arithmetic_10_shot
 
+rich.traceback.install(show_locals=True)
 datasets.disable_caching()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -86,8 +89,21 @@ def _count_lines(file):
 
 
 class DSIterator:
-    def __init__(self, ds, use_curriculum: bool):
+    """
+
+    Init:    
+    Set the index of each curriculum level to 0.
+    or
+    Set the index to zero.
+
+    
+
+    """
+
+    def __init__(self, ds, use_curriculum: bool, return_idx: bool, use_few_shots: bool):
         self._ds = ds
+        self._return_idx = return_idx
+        self._use_few_shots = use_few_shots
 
         self._proportion_difficulties = None
         self._use_curriculum = use_curriculum
@@ -95,6 +111,7 @@ class DSIterator:
         if self._use_curriculum:
             assert isinstance(self._ds, dict), type(self._ds).mro()
             self._indices = {k: 0 for k in self._ds}
+            self._is_done = {k: False for k in self._ds}
             self._idx = None
         else:
             self._indices = None
@@ -113,6 +130,10 @@ class DSIterator:
             rich.print(rich.rule.Rule(style="red"))
 
         self._proportion_difficulties = proportions
+        assert not all(
+            math.isclose(v, 0) 
+            for v in proportions.values()
+        ), proportions
 
     def __next__(self):
         """
@@ -128,33 +149,90 @@ class DSIterator:
 
         if self._use_curriculum:
             """
+            . Look up unfinished difficulties
+            . Normalize the probabilities of unfinished difficulties
             . Sample a difficulty
             . Get the dataset object linked to the difficulty
             . get the index of the sharded data we're at with that difficulty dataset
             . increment the index, possibly restarting the epoch
 
+            The issue with that is that the proportions break down as the epoch progresses.
+            Anything that has a non zero proportion will eventually be fully trained on.
+
+            Using uniform probabilities between a set of difficulties would be a more robust way to do it, if less flexible.
+            
             """
 
+            #######################################################################################
+            # Look up unfinished difficulties
+            #######################################################################################
+            proportion_keys = self._proportion_difficulties.keys()
+            not_done = {k for k in proportion_keys if not self._is_done[k]}
+            not_dones = proportion_keys & not_done
+            
+            if not not_dones:
+                raise StopIteration
+
+            #######################################################################################
+            # Normalize the probabilities of unfinished difficulties
+            #######################################################################################
+            normalization_factor = sum(self._proportion_difficulties[k] for k in not_dones)
+            normalized_proportions = {
+                k: self._proportion_difficulties[k] / normalization_factor
+                for k in not_dones
+            }
+            for k in self._proportion_difficulties:
+                if k not in not_dones:
+                    normalized_proportions[k] = 0.
+
+            #######################################################################################
+            # Pick a difficulty
+            #######################################################################################
+            assert math.isclose(sum(normalized_proportions.values()), 1), normalized_proportions
+
             difficulty = np.random.choice(
-                list(self._proportion_difficulties.keys()),
+                list(normalized_proportions.keys()),
                 p=list(self._proportion_difficulties.values()),
             )
-            ds_obj                      = self._ds      [difficulty]
-            base_idx                    = self._indices [difficulty]
-            self._indices [difficulty] += 1
+
+            #######################################################################################
+            # Increment the index.
+            #######################################################################################
+            self._indices [difficulty]   +=  1
+            ds_obj                        =  self._ds      [difficulty]
+            base_idx                      =  self._indices [difficulty]
+            
+            if self._indices[difficulty] + 1 >= len(ds_obj):
+                assert self._indices[difficulty] + 1 == len(ds_obj), (
+                    self._indices[difficulty] + 1, 
+                    len(ds_obj),
+                )
+                self._is_done[difficulty] = True
 
         else:
             ds_obj     = self._ds
             base_idx   = self._idx
             self._idx += 1
+            if self._idx >= len(ds_obj):
+                assert self._idx == len(ds_obj), (self._idx, len(ds_obj))
+                raise StopIteration
             
         # Check that the sharded idx is within bounds
         # Adjust it if it't not
-        
-        sharded_idx = (base_idx * WORLD_SIZE + RANK) % len(ds_obj)
-        value = ds_obj[sharded_idx]
-        
-        return value, sharded_idx
+
+        value = ds_obj[base_idx]
+
+        if self._use_few_shots:
+            value.detok_ref_query = self.make_few_shot_toks() + "\n\n" + value.detok_ref_query
+
+        if self._return_idx:
+            return value, base_idx
+        else:
+            return value
+
+
+    def __iter__(self):
+        return self
 
 
 class TrainModes(enum.Enum):
@@ -175,6 +253,7 @@ class Arithmetic(
             eos_token: str,
             extractor_ignore_one_line: bool,
             pad_token: str,
+            return_idx: bool,
             sft_mode: bool,
             shuffle_once: bool,
             split: lib_utils.CVSets,
@@ -183,9 +262,11 @@ class Arithmetic(
             use_cached_dataset: bool,
         ):
 
-        dataset_root_folder_dir = pathlib.Path(dataset_root_folder_dir)
-        self._dataset_root_folder_dir = dataset_root_folder_dir
-        assert dataset_root_folder_dir.exists(), dataset_root_folder_dir
+        self._return_idx              = return_idx
+        self._dataset_root_folder_dir = pathlib.Path(dataset_root_folder_dir)
+        del dataset_root_folder_dir
+        assert self._dataset_root_folder_dir.exists(), self._dataset_root_folder_dir
+
         if sft_mode:
             self._mode = TrainModes.SFT
         else:
@@ -195,12 +276,9 @@ class Arithmetic(
         if use_curriculum:
             assert self._mode != TrainModes.SFT, "sft mode is not compatible with curriculum."
 
-        if answer_only:
-            assert self._mode != TrainModes.SFT, "Not done yet"
-
-        self._answer_only = answer_only
-        self._eos_token = eos_token
-        self._use_curriculum = use_curriculum
+        self._answer_only            = answer_only # This is handled in the collator.
+        self._eos_token              = eos_token
+        self._use_curriculum         = use_curriculum
         self._curriculum_proportions = None
 
         self._extractor = lib_final_line.FinalLineExtractor(
@@ -209,7 +287,7 @@ class Arithmetic(
         )
 
         split = lib_utils.CVSets(split)
-        folder = dataset_root_folder_dir / f"{split.value}_scratch"
+        folder = self._dataset_root_folder_dir / f"{split.value}_scratch"
         assert folder.exists(), folder
         assert folder.is_dir(), folder
         glob_pattern = "*.jsonl"
@@ -220,7 +298,7 @@ class Arithmetic(
         
         self._use_few_shots = use_few_shots
         if use_few_shots:
-            assert not self._mode == 
+            assert not self._mode == TrainModes.SFT, self._mode
             self._few_shot_text = self._prepare_few_shots()
         else:
             self._few_shot_text = None
@@ -228,6 +306,7 @@ class Arithmetic(
         #######################################################################
         if self._mode == TrainModes.SFT:
             self._setup_sft_mode(target_files)
+            
         elif self._mode == TrainModes.RL:
             tok_name = any_tokenizer.name_or_path.replace("/", "_")
             hf_dataset_path = folder / f"{split}_{tok_name}_{self._answer_only}.hf_dataset"
@@ -250,14 +329,9 @@ class Arithmetic(
         if shuffle_once:
             self._core.shuffle()
 
-        self._inner_iterator = DSIterator(
-            ds=self._core, 
-            use_curriculum=self._use_curriculum,
-        )
-        self._already_started = False
-
 
     def make_few_shot_toks(self) -> torch.Tensor:
+        assert False, "Move this to the iterator."
         if not self._use_curriculum:
             raise NotImplementedError("Few shot only works with curriculum")
     
@@ -399,7 +473,7 @@ class Arithmetic(
                     self._core.append(dict(
                         ref_qa_question   = sample["input"],
                         ref_qa_answer     = sample["answer"],
-                        ref_qa_scratchpad = scratchpad,
+                        ref_qa_scratchpad = scratchpad, 
                         num_digits        = int(sample["num_digits"]),
                 ))
 
@@ -433,10 +507,12 @@ class Arithmetic(
         return self._use_few_shots
 
     def __iter__(self):
-        assert self._already_started is False, f"Already started {self._already_started = }"
-        self._already_started = True
-
-        return self
+        return DSIterator(
+            ds=self._core, 
+            use_curriculum=self._use_curriculum,
+            return_idx=self._return_idx,
+            use_few_shots=self._use_few_shots,
+        )
 
     def get_extractor(self):
         return self._extractor
@@ -449,15 +525,9 @@ class Arithmetic(
         ]
 
     def set_proportion_difficulties(self, proportions):
+        raise DeprecationWarning("Call it in the iterator instead.")
         self._curriculum_proportions = proportions
         self._inner_iterator.set_proportion_difficulties(proportions)
-
-    def __next__(self):
-        
-        assert self._inner_iterator is not None
-        data, idx = next(self._inner_iterator)
-        data.detok_ref_query = self.make_few_shot_toks() + "\n\n" + data.detok_ref_query
-        return data, idx
 
 
 class PerNumberOfDigitsAccuracy(lib_base_classes.Metric):
@@ -548,7 +618,7 @@ class PerNumberOfDigitsAccuracy(lib_base_classes.Metric):
         return output
 
 
-def main(n=1):
+def main(use_curriculum=True):
     forward_tokenizer = transformers.AutoTokenizer.from_pretrained(
         "Open-Orca/Mistral-7B-OpenOrca"
     )
@@ -557,22 +627,35 @@ def main(n=1):
     )
 
     ds = Arithmetic(
-            answer_only               = False,
-            dataset_root_folder_dir   = path,
-            eos_token                 = forward_tokenizer.eos_token,
-            extractor_ignore_one_line = False,
-            pad_token                 = forward_tokenizer.pad_token,
-            split                     = lib_utils.CVSets.TRAIN,
-            shuffle_once              = False,
-            
-            sft_mode                  = False,
-            use_few_shots             = False,
-            use_curriculum            = True,
-            use_cached_dataset        = True,
+        answer_only               = False,
+        dataset_root_folder_dir   = path,
+        eos_token                 = forward_tokenizer.eos_token,
+        extractor_ignore_one_line = False,
+        pad_token                 = forward_tokenizer.pad_token,
+        split                     = lib_utils.CVSets.TRAIN,
+        shuffle_once              = False,
+        
+        sft_mode                  = True,
+        use_few_shots             = False,
+        use_curriculum            = use_curriculum,
+        use_cached_dataset        = True,
 
-            any_tokenizer             = forward_tokenizer,
-        )
-    
+        any_tokenizer             = forward_tokenizer,
+        return_idx                = False,
+    )
+
+    iterator_ = iter(ds)
+
+    if use_curriculum:
+        iterator_.set_proportion_difficulties({
+            1: 0.5,
+            2: 0.5,
+        })
+
+    for i, _ in enumerate(iterator_):
+        print(i)
+
+
     # for i in range(n):
     #     sample = ds[i]
     #     sorted_keys = sorted(sample.keys())
@@ -597,9 +680,8 @@ def main(n=1):
     #         rich.markup.escape(str(sample["detok_ref_query"])))
     #     rich.print(table)
 
-    breakpoint()
 
-    rich.print(ds[0]["detok_ref_query"])
+    # rich.print(ds[0]["detok_ref_query"])
 
 if __name__ == "__main__":
     fire.Fire(main)

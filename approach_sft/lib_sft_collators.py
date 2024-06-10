@@ -70,7 +70,6 @@ class CausalFullCollator:
         - Chain of thought then answer
         - Answer only
         """
-        import ipdb; ipdb.set_trace()
         assert False
 
         if self.output_type == lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER:
@@ -151,10 +150,10 @@ class CausalMaskedCollator:
     def __init__(
         self, 
         *, 
-        output_type, 
+        output_type: lib_sft_constants.OutputTypes,
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
         prediction_tokenizer: transformers.PreTrainedTokenizerBase,
-        has_choices,
+        has_choices: bool,
     ):
         
         self._forward_tokenizer = forward_tokenizer
@@ -249,7 +248,7 @@ class CausalMaskedCollator:
         )
 
         assert masked_forward.input_ids.shape == forward_input_tok.input_ids.shape, (
-            masked_forward.input_ids.shape, forward_input_tok.input_ids.shape
+            masked_forward.input_ids.shape, forward_input_tok.input_ids.shape,
         )
 
         keys = features[0].keys()
@@ -258,8 +257,6 @@ class CausalMaskedCollator:
             forward        = forward_input_tok,
             masked_forward = masked_forward,
             predict        = predict_input_tok,
-            extra_info     = {
-                key: [f[key] for f in features] for key in keys
-            },
+            extra_info     = {key: [f[key] for f in features] for key in keys},
         )
 
