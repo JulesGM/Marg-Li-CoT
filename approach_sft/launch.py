@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
+
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --job-name="This is an escaped name"
+
 """ 
 Launches your script with a yaml config & Huggingface Accelerate.
 
+python launch.py answer_only
+
+python launch.py outlines
 
 """
+import subprocess as sp
 import shlex
 import os
 import pathlib
@@ -16,20 +26,59 @@ import rich.console
 import rich.traceback
 from typing import Union
 
+
+import os
+import json
+import subprocess as sp
+
+
+def scontrol_show(job_id=None):
+  if job_id is None:
+    assert "SLURM_JOB_ID" in os.environ, (
+        "Either need a value for the argument job_id or a value for the argument $SLURM_JOB_ID"
+    )
+    job_id = os.environ["SLURM_JOB_ID"]
+
+  output = sp.check_output(["scontrol", "--json", "show", "job", str(job_id)], text=True).strip()
+  parsed = json.loads(output)
+  parsed = parsed["jobs"]
+  assert len(parsed) == 1, parsed
+  parsed = parsed[0]
+
+  return parsed
+
+
 rich.traceback.install(console=rich.console.Console(force_terminal=True))
-SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
+
+def get_script_dir():
+
+    if "SLURM_JOB_ID" in os.environ:
+        scontrol_output = scontrol_show()        
+        if scontrol_output["batch_flag"]:            
+            return pathlib.Path(scontrol_output["current_work_directory"])
+    
+    return pathlib.Path(__file__).absolute().parent
+
+SCRIPT_DIR = pathlib.Path(get_script_dir())
+
 TARGET_SCRIPT = SCRIPT_DIR / "bin_sft.py"
 
-
 def main(
-    name: str,
+    experiment,
     one: bool = False,
-    config_path: Union[str, pathlib.Path] = SCRIPT_DIR.parent / "accelerate_configs" / "accelerate_ddp_no.yaml",
+    config_path: Union[str, pathlib.Path] = (
+        SCRIPT_DIR.parent / "accelerate_configs" / "accelerate_ddp_no.yaml"),
 ):
+    rich.print(locals())
+
     config_path = pathlib.Path(config_path)
     assert config_path.exists(), config_path
     assert TARGET_SCRIPT.exists(), TARGET_SCRIPT
 
+    if experiment.startswith("experiment="):
+        experiment = experiment.split("=", 1)[1].strip()
+
+    name = f"{experiment}_{os.environ['SLURM_JOB_ID']}"
     num_processes = 1 if one else len(nvgpu.gpu_info())
 
     command = [
@@ -38,15 +87,20 @@ def main(
         "--num_processes", num_processes,
         "--config_file", config_path,
         TARGET_SCRIPT,
-        name,
-    ]
+        f"run_name={name}",
+        f"experiment={experiment}",
+    ] 
     
     command = list(map(str, command))
     rich.print(rich.panel.Panel(
         shlex.join(command),
         title="[bold]Running Command:",
         title_align="left",
+        expand=True,
     ))
+
+    if not "SLURM_TMPDIR" in os.environ:
+        os.environ["SLURM_TMPDIR"] = str(SCRIPT_DIR / "outputs")
 
     os.execvp("accelerate", command)
 

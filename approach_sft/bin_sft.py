@@ -3,13 +3,23 @@
 Supervised Trainer.
 
 """
+import abc
 import collections
 import enum
+import functools
 import itertools as it
 import os
 import pathlib
 import random
+import re
 import sys
+
+import more_itertools as mit
+import outlines
+import outlines.generate
+import outlines.models
+import outlines.models.transformers
+import outlines.samplers
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
 os.environ["DATASETS_VERBOSITY"] = "warning"
@@ -25,6 +35,7 @@ import hydra
 import git
 import more_itertools as mi
 import numpy as np
+import omegaconf
 import peft
 import rich
 import rich.console
@@ -45,6 +56,15 @@ from with_trl.libs_extraction import lib_final_line, lib_multiple_choice
 
 from approach_sft import (lib_sft_constants, lib_sft_dataloaders,
                           lib_sft_tables, lib_sft_utils)
+import lib_sft_multi_regexes
+
+rich.traceback.install(
+    console=rich.console.Console(
+        force_terminal=True, 
+        force_interactive=True, 
+        markup=True,
+    )
+)
 
 random.seed(0)
 np.random.seed(0)
@@ -65,65 +85,15 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 LOGGER = logging.getLogger(__name__)
 
-
-########################################################################
-# 🏎️ Change a lot
-########################################################################
-DEFAULT_DATASET = lib_utils.Datasets.ARITHMETIC
-
-REPO_ROOT = pathlib.Path(git.Repo(__file__, search_parent_directories=True).working_tree_dir)
-""" These commented out paths :') """
-DEFAULT_DATA_DIRECTORY = pathlib.Path(
-    REPO_ROOT / "with_trl" / "libs_data" / "arithmetic"
-)
+REPO_ROOT = pathlib.Path(git.Repo(
+    __file__, 
+    search_parent_directories=True
+).working_tree_dir)
 
 
-""" This makes me wish we had Hydra setup :) """
-# DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/pythia-410m";  DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER;  DEFAULT_TRAIN_BATCH_SIZE = 64;  DEFAULT_EVAL_BATCH_SIZE = 128;                           DEFAULT_USE_PEFT = True;
-# DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B";     DEFAULT_OUTPUT_TYPE = ANSWER_ONLY_MODE;                                            DEFAULT_TRAIN_BATCH_SIZE = 8;   DEFAULT_EVAL_BATCH_SIZE = DEFAULT_TRAIN_BATCH_SIZE * 3;  DEFAULT_USE_PEFT = True;
-# DEFAULT_MODEL_NAME_OR_PATH = "EleutherAI/gpt-j-6B";     DEFAULT_OUTPUT_TYPE = SCRATCHPAD_MODE;                                             DEFAULT_TRAIN_BATCH_SIZE = 8;   DEFAULT_EVAL_BATCH_SIZE = DEFAULT_TRAIN_BATCH_SIZE;      DEFAULT_USE_PEFT = True;
-DEFAULT_MODEL_NAME_OR_PATH = "susnato/phi-2";             DEFAULT_OUTPUT_TYPE = lib_sft_constants.OutputTypes.ANSWER_ONLY;  DEFAULT_TRAIN_BATCH_SIZE = 16;  DEFAULT_EVAL_BATCH_SIZE = 16;                            DEFAULT_USE_PEFT = True
-DEFAULT_N_BATCHES_PREDICT_TRAIN = 50
-
-
-DEFAULT_MASK_QUERY = False
-DEFAULT_PEFT_DO_ALL_LIN_LAYERS = False
-DEFAULT_FILTER_OUT_BAD = True
-DEFAULT_LEARNING_RATE = 10 ** -4
-
-
-DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
-DEFAULT_GEN_KWARGS = dict(
-    do_sample=False,
-    max_new_tokens=20 if DEFAULT_OUTPUT_TYPE == lib_sft_constants.OutputTypes.ANSWER_ONLY else 300,
-    min_new_tokens=1,
-    repetition_penalty=1,
-    temperature=1,
-    use_cache=True,
-)
-
-########################################################################
-# 🛑 Never change
-########################################################################
-DEFAULT_JUST_DEVICE_MAP = False
-DEFAULT_LM_MODE = lib_sft_constants.LMModes.CAUSAL_FULL
-DEFAULT_BASE_PRECISION = "float32"
-
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "sft_output"
-DEFAULT_WANDB_PROJECT_NAME = "sft_arithmetic"
-DEFAULT_WANDB_ENTITY = "julesgm"
-DEFAULT_NUM_EPOCHS = 1000
-DEFAULT_QTY_EVAL_SMALL = 150
-DEFAULT_BATCH_TABLE_PRINT_QTY = 2
-DEFAULT_PREDICT_QTY_PRINT = 2
-DEFAULT_PEFT_CONFIG = dict(
-    inference_mode=False,
-    lora_dropout=0,
-    lora_alpha=1024,
-    r=1024,
-    bias="none",
-    task_type=peft.TaskType.CAUSAL_LM,
-)
+def repo_path(input_path):
+    """ Helper for Hydra """
+    return REPO_ROOT / input_path
 
 
 ########################################################################
@@ -158,20 +128,22 @@ def predict(
     )
     model.eval()
     query_seq_len = query["input_ids"].shape[1]
+    
     predictions = accelerator.unwrap_model(model).generate(
-            **query.to(accelerator.local_process_index), 
-            **gen_kwargs
-        )[:, query_seq_len:]
+        **query.to(accelerator.local_process_index), 
+        **gen_kwargs
+    )[:, query_seq_len:]
     response_text_for_metrics = predict_tokenizer.batch_decode(
-            predictions, 
-            skip_special_tokens=True,
-        )
+        predictions, 
+        skip_special_tokens=True,
+    )
 
     ###########################################################################
     # Compute the metrics
     ###########################################################################
     #######################################
-    # Prepare the inputs for the metrics, and the containers for the outputs
+    # Prepare the inputs for the metrics, 
+    # and the containers for the outputs
     #######################################
     metric_outputs = {}
     local_metric_outputs = collections.defaultdict(list)
@@ -201,7 +173,8 @@ def predict(
         # Gather metrics
         #######################################
         pre_gather = [x for x in local_metric_output.values if x is not None]
-        pre_gather = torch.tensor(pre_gather).to(accelerator.local_process_index)
+        pre_gather = torch.tensor(pre_gather).to(
+            accelerator.local_process_index)
         metric_outputs[name] = accelerator.gather_for_metrics(
             pre_gather).mean().item()
 
@@ -210,9 +183,8 @@ def predict(
     ###########################################################################
     if RANK == 0:
         prediction_batch_obj = lib_base_classes.BatchedUnrollReturn(
-                response_tensors     = predictions,
-                # raw_response_tensors = None, 
-                any_tokenizer        = predict_tokenizer,
+                response_tensors = predictions,
+                any_tokenizer   = predict_tokenizer,
             )
         
         lib_sft_tables.predict_table(
@@ -238,6 +210,88 @@ def iter_all_equal(iterable, key):
     return all(key(x) == key(first) for x in iterator)
 
 
+class OutlinesContextABC(abc.ABC):
+    @abc.abstractmethod
+    def data_collator(self, batch):
+        pass
+
+    @abc.abstractmethod
+    def outlines_forward(self, batch):
+        pass
+
+
+class ArithmeticOutlinesContext(OutlinesContextABC):
+    def __init__(self, model, forward_tokenizer, predict_tokenizer, sampler):
+        self._forward_tokenizer = forward_tokenizer
+        self._predict_tokenizer = predict_tokenizer
+        self._outlines_model = outlines.models.Transformers(
+            model=model, 
+            tokenizer=self._forward_tokenizer,
+        )
+        self._multi_fsm_gen = lib_sft_multi_regexes.MultiFSMSequenceGenerator(
+            model=self._outlines_model,
+            sampler=sampler,
+            device=model.device,
+        )
+        self._pattern_format = r"\n<scratch>\n.{{5,200}}\n</scratch>\nA:\n{escaped_answer}\n!"
+
+    def data_collator(self, batch):
+        batch["fsms"] = []
+        batch["fsm_regex_str"] = []
+        for i in range(len(batch["ref_qa_question"])):    
+            escaped_answer = re.escape(batch["ref_qa_answer"][i]).strip()
+            pattern = self._pattern_format.format(
+                escaped_answer=escaped_answer
+            )
+            batch["fsms"].append(outlines.fsm.guide.RegexGuide(
+                pattern, 
+                self._outlines_model.tokenizer,
+            ))
+            batch["fsm_regex_str"].append(pattern)
+        return batch
+
+    def outlines_forward(
+        self, batch,
+    ):  
+        with torch.no_grad():
+            samples, states = self._multi_fsm_gen(
+                [f"What is {x}" for x in batch["ref_qa_question"]],
+                batch["fsms"],
+                max_tokens=200,
+            )
+
+        #######################################################################
+        # Print samples
+        #######################################################################
+        table = rich.table.Table(
+            "Prompt", 
+            "Sample", 
+            "Pattern", 
+            show_lines=True,
+        )
+
+        for prompt, pat, sample in mit.zip_equal(
+            batch["ref_qa_question"],
+            batch["fsm_regex_str"],
+            samples,
+        ):
+            table.add_row(
+                rich.markup.escape("\"" + prompt + "\""), 
+                rich.markup.escape("\"" + sample + "\""),
+                rich.markup.escape("\"" + pat    + "\""), 
+                rich.markup.escape(str(len(sample))),
+            )
+
+        rich.print(table)
+        real_batch = {}
+        real_batch["forward"] = self._forward_tokenizer(
+            samples, padding=True, return_tensors="pt")
+        real_batch["predict"] = self._predict_tokenizer(
+            batch["ref_qa_question"], padding=True, return_tensors="pt")
+        real_batch["extra_info"] = batch | {"patterns": batch["fsm_regex_str"]}
+        
+        return real_batch
+
 def step(
     *, 
     accelerator: accelerate.Accelerator,
@@ -248,15 +302,20 @@ def step(
     forward_tokenizer: transformers.PreTrainedTokenizerBase,
     mask_query: bool,
     model: peft.peft_model.PeftModelForCausalLM,
+    predict_tokenizer,
     optimizer: torch.optim.Optimizer,
     log: bool,
     global_step: int,
     do_train: bool,
+    output_type: lib_sft_constants.OutputTypes,
 ):
-    if cv_set:
+    assert not cv_set == lib_utils.CVSets.VALID and do_train, cv_set
+
+    if cv_set == lib_utils.CVSets.TRAIN:
         model.train()
         optimizer.zero_grad()
 
+    rich.print("[bold green]######")
     lib_utils.not_first_token(
         forward_tokenizer=forward_tokenizer,
         tensor=batch["forward"]["input_ids"],
@@ -267,7 +326,11 @@ def step(
     else:
         labels = batch["forward"]["input_ids"]
 
-    gpu_batch = {k: v.to(accelerator.local_process_index) for k, v in batch["forward"].items()}
+    gpu_batch = {
+        k: v.to(accelerator.local_process_index) 
+        for k, v in batch["forward"].items()
+    }
+
     loss = model(**gpu_batch, labels=labels).loss
     forward_logger.log(
         batch       = batch["forward"]["input_ids"], 
@@ -313,8 +376,11 @@ class Evaluator:
         metrics,
         prediction_tokenizer: transformers.PreTrainedTokenizerBase,
         predict_qty_print: int,
+        output_type,
+        outlines_context,
     ):
         
+        self._outlines_context      = outlines_context
         self._cv_split              = cv_split
         self._accelerator           = accelerator
         self._batch_table_print_qty = batch_table_print_qty
@@ -324,6 +390,7 @@ class Evaluator:
         self._metrics               = metrics
         self._prediction_tokenizer  = prediction_tokenizer
         self._predict_qty_print     = predict_qty_print
+        self._output_type           = output_type
         
         if RANK == 0:
             rich_kwargs = dict(show_lines = True, title = f"{cv_split.value} - Predictions")
@@ -390,7 +457,6 @@ class Evaluator:
         
         return metrics_outputs
         
-
     def evaluate(
             self, 
             *, 
@@ -409,11 +475,18 @@ class Evaluator:
             disable = RANK != 0, 
             desc    = "Eval Batches"
         )):
+            if self._output_type == lib_sft_constants.OutputTypes.OUTLINES:
+                batch = self._outlines_context.outlines_forward(
+                    batch=batch,
+                )
+            assert "forward" in batch, batch.keys()
+            assert "predict" in batch, batch.keys()
+
             with torch.no_grad():
                 losses.append(
                     stepper(
                         batch       = batch,
-                        epoch_idx   = epoch_idx,
+                        epoch       = epoch_idx,
                         global_step = global_step,
                         log         = False,
                         do_train    = False,
@@ -436,13 +509,13 @@ class Evaluator:
         if RANK == 0:
             assert "loss" not in metrics
             dict_to_log = {
-                f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/{metric_name}": np.mean(metric_values)
+                f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/{metric_name}": 
+                np.mean(metric_values)
                 for metric_name, metric_values in metrics.items()
             }
             
             dict_to_log[f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/loss"] = np.mean(losses)
             wandb.log(dict_to_log, step=global_step)
-
 
 class ForwardLogger:
     def __init__(self, *, any_tokenizer, cv_set):
@@ -462,95 +535,81 @@ class ForwardLogger:
             self._table.add_data(
                 epoch, self._any_tokenizer.decode(batch[idx])
             )
-            
-@hydra.main(version_base=None, config_path="config", config_name="config")
+
+
+OUTLINES_CLASSES = {
+    lib_utils.Datasets.ARITHMETIC: ArithmeticOutlinesContext,
+}
+
+@hydra.main(
+    version_base="1.3.2", 
+    config_path="config", 
+    config_name="config",
+)
 def main(
-    run_name,
-    *,
-    batch_table_print_qty     = DEFAULT_BATCH_TABLE_PRINT_QTY,
-    dataset_choice            = DEFAULT_DATASET,
-    data_directory            = DEFAULT_DATA_DIRECTORY,
-    eval_batch_size           = DEFAULT_EVAL_BATCH_SIZE,
-    extractor_ignore_one_line = False,
-    filter_out_bad            = DEFAULT_FILTER_OUT_BAD,
-    gen_kwargs                = DEFAULT_GEN_KWARGS,
-    learning_rate             = DEFAULT_LEARNING_RATE,
-    lm_mode                   = DEFAULT_LM_MODE,
-    just_device_map           = DEFAULT_JUST_DEVICE_MAP,
-    mask_query                = DEFAULT_MASK_QUERY,
-    max_num_epochs            = DEFAULT_NUM_EPOCHS,
-    model_name_or_path        = DEFAULT_MODEL_NAME_OR_PATH,
-    n_batches_predict_train   = DEFAULT_N_BATCHES_PREDICT_TRAIN,
-    output_type               = DEFAULT_OUTPUT_TYPE,
-    peft_config_dict          = DEFAULT_PEFT_CONFIG,
-    peft_do_all_lin_layers    = DEFAULT_PEFT_DO_ALL_LIN_LAYERS,
-    predict_qty_print         = DEFAULT_PREDICT_QTY_PRINT,
-    precision                 = DEFAULT_BASE_PRECISION,
-    qty_eval_small            = DEFAULT_QTY_EVAL_SMALL,
-    stop_at_line_return       = False,
-    train_batch_size          = DEFAULT_TRAIN_BATCH_SIZE,
-    use_peft                  = DEFAULT_USE_PEFT,
-    wandb_entity              = DEFAULT_WANDB_ENTITY,
-    wandb_project_name        = DEFAULT_WANDB_PROJECT_NAME,
+    cfg: omegaconf.DictConfig,
 ):
-    args = locals().copy()
+    cfg = hydra.utils.instantiate(cfg)
 
     # We convert the enums to their values so they can be displayed in wandb.
-    for k, v in args.items():
-        if isinstance(v, enum.Enum):
-            args[k] = v.value
+    # for k, v in args.items():
+    #     if isinstance(v, enum.Enum):
+    #         args[k] = v.value
 
     ###########################################################################
     # 🔍 Checks, Wandb then Metrics
     ###########################################################################
-    lm_mode = lib_sft_constants.LMModes(lm_mode)
-    precision = lib_utils.ValidPrecisions(precision)
+    
     is_encoder_decoder = lib_sft_utils.get_is_encoder_decoder(
-        model_name_or_path)
+        cfg.model_name_or_path)
     assert not is_encoder_decoder, "Encoder decoder not supported yet."
     
     if RANK == 0:
         wandb_dir = pathlib.Path(os.environ["SLURM_TMPDIR"]) / "tmp" 
         wandb_dir.mkdir(exist_ok=True)
         wandb.init(
-            name    = run_name,
-            project = wandb_project_name,
-            entity  = wandb_entity,
-            config  = dict(args=args, gen_kwargs=gen_kwargs),
+            name    = cfg.run_name,
+            project = cfg.wandb_project_name,
+            entity  = cfg.wandb_entity,
+            config  = dict(
+                args=omegaconf.OmegaConf.to_container(cfg, resolve=True), 
+                gen_kwargs=cfg.gen_kwargs,
+            ),
             dir     = wandb_dir,
         )
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
 
-
-    if dataset_choice == lib_utils.Datasets.COMMONSENSE_QA:
+    if cfg.dataset_choice == lib_utils.Datasets.COMMONSENSE_QA:
         metrics = dict(
             exact_match=lib_metric.ScratchpadAnswerAccuracy(
-                lib_multiple_choice.MultipleChoiceRfindExtractor(["(A)", "(B)", "(C)", "(D)", "(E)"]),
+                lib_multiple_choice.MultipleChoiceRfindExtractor(
+                    ["(A)", "(B)", "(C)", "(D)", "(E)"]),
                 pad_token=tokenizer.pad_token,
             ),
         )
-    elif dataset_choice == lib_utils.Datasets.ARITHMETIC:
+
+    elif cfg.dataset_choice == lib_utils.Datasets.ARITHMETIC:
         metrics = dict(
             exact_match = lib_metric.ScratchpadAnswerAccuracy(
                 extractor=lib_final_line.FinalLineExtractor(
-                    ignore_one_line = extractor_ignore_one_line,
+                    ignore_one_line = cfg.extractor_ignore_one_line,
                     pad_token=tokenizer.pad_token,
                 ),
                 pad_token=tokenizer.pad_token,
             )
         )
+
     else:
-        raise NotImplementedError(dataset_choice)
+        raise NotImplementedError(cfg.dataset_choice)
         
 
     ###########################################################################
     # 🏗️ Load Tokenizer and Data.
     ###########################################################################
-    tmp_tokenizers = lib_trl_utils.load_tokenizers(model_name_or_path)
-
-    forward_tokenizer = tmp_tokenizers["forward_tokenizer"]
+    tmp_tokenizers       = lib_trl_utils.load_tokenizers(cfg.model_name_or_path)
+    forward_tokenizer    = tmp_tokenizers["forward_tokenizer"   ]
     prediction_tokenizer = tmp_tokenizers["prediction_tokenizer"]
     del tmp_tokenizers
 
@@ -558,103 +617,108 @@ def main(
     # 🏗️ Load Model and Build Optimizer.
     ###########################################################################
     if RANK == 0:
-        print(f"Loading model {model_name_or_path}")
+        print(f"Loading model {cfg.model_name_or_path}")
 
     model = lib_trl_utils.load_then_peft_ize_model(
         adapter_name           = "default",
         forward_tokenizer      = forward_tokenizer,
-        just_device_map        = just_device_map,
-        model_name             = model_name_or_path,
-        peft_config            = peft.LoraConfig(**peft_config_dict),
-        peft_do_all_lin_layers = peft_do_all_lin_layers,
+        just_device_map        = cfg.just_device_map,
+        model_name             = cfg.model_name_or_path,
+        peft_config            = peft.LoraConfig(**cfg.peft_config_dict),
+        peft_do_all_lin_layers = cfg.peft_do_all_lin_layers,
+        precision              = cfg.precision,
         prediction_tokenizer   = prediction_tokenizer,
-        precision              = precision,
-        use_peft               = use_peft,
         trust_remote_code      = False,
-    )
+        use_peft               = cfg.use_peft,
+    ).to(LOCAL_RANK)
 
     if RANK == 0:
         print("Model loaded.")
 
-    optimizer = torch.optim.Adam([
-        x for x in model.parameters() if x.requires_grad],
-        lr=learning_rate,
+    optimizer = torch.optim.Adam(
+        [x for x in model.parameters() if x.requires_grad],
+        lr=cfg.learning_rate,
     )
 
     ###########################################################################
     # Set EOS to line return
     ###########################################################################
-    if stop_at_line_return:
+    if cfg.stop_at_line_return:
         line_return_tok = lib_utils.line_return_token(
-            any_tokenizer=prediction_tokenizer)
-        assert "eos_token_id" not in gen_kwargs, gen_kwargs
-        gen_kwargs["eos_token_id"] = line_return_tok
+            any_tokenizer=prediction_tokenizer
+        )
+        assert "eos_token_id" not in cfg.gen_kwargs, cfg.gen_kwargs
+        cfg.gen_kwargs["eos_token_id"] = line_return_tok
 
     ###########################################################################
     # Dataloaders
     ###########################################################################
     assert not is_encoder_decoder
+    if cfg.output_type.enum == lib_sft_constants.OutputTypes.OUTLINES:
+        outlines_context = OUTLINES_CLASSES[cfg.dataset_choice](
+            model              = model,
+            forward_tokenizer  = forward_tokenizer,
+            predict_tokenizer  = prediction_tokenizer,
+            # sampler            = outlines.samplers.GreedySampler(),
+            sampler            = outlines.samplers.BeamSearchSampler(10),
+        )
+
+    else:
+        outlines_context = None 
 
     dataloaders, small_eval_dl = lib_sft_dataloaders.get_dataloaders(
-        answer_only          = False, # Doesn't do anything for sft
-        data_directory       = data_directory,
-        dataset_choice       = dataset_choice,
-        eval_batch_size      = eval_batch_size * WORLD_SIZE,
-        extractor_ignore_one_line = extractor_ignore_one_line,
-        filter_bads          = filter_out_bad,
-        forward_tokenizer    = forward_tokenizer,
-        lm_mode              = lm_mode,
-        output_type          = output_type,
-        prediction_tokenizer = prediction_tokenizer,
-        qty_eval_small       = qty_eval_small,
-        train_batch_size     = train_batch_size * WORLD_SIZE,
+        answer_only               = False, # Doesn't do anything for sft
+        data_directory            = cfg.data_directory,
+        dataset_choice            = cfg.dataset_choice,
+        eval_batch_size           = cfg.output_type.eval_batch_size * WORLD_SIZE,
+        extractor_ignore_one_line = cfg.extractor_ignore_one_line,
+        filter_bads               = cfg.filter_out_bad,
+        forward_tokenizer         = forward_tokenizer,
+        lm_mode                   = cfg.lm_mode,
+        output_type               = cfg.output_type.enum,
+        outlines_context          = outlines_context,
+        prediction_tokenizer      = prediction_tokenizer,
+        qty_eval_small            = cfg.qty_eval_small,
+        seed                      = 0,
+        train_batch_size          = cfg.output_type.train_batch_size * WORLD_SIZE,
+        use_workers               = cfg.use_workers,
     )
-
 
     ###########################################################################
     # 🏎️ Accelerator business
     ###########################################################################
-    accelerator = accelerate.Accelerator(split_batches=True)
-    (
-        model, 
-        optimizer, 
-        dataloaders[lib_utils.CVSets.TRAIN], 
-        dataloaders[lib_utils.CVSets.VALID], 
-        small_eval_dl,
-    ) = accelerator.prepare(
-        model, 
-        optimizer, 
-        dataloaders[lib_utils.CVSets.TRAIN], 
-        dataloaders[lib_utils.CVSets.VALID], 
-        small_eval_dl,
-    )
-    
+    accelerator = accelerate.Accelerator()
+    model, optimizer = accelerator.prepare(model, optimizer)
 
     ###########################################################################
     # 🔁 Main Loop
     ###########################################################################
     train_evaluator = Evaluator(
         accelerator           = accelerator,
-        batch_table_print_qty = batch_table_print_qty,
+        batch_table_print_qty = cfg.batch_table_print_qty,
         cv_split              = lib_utils.CVSets.TRAIN,
         forward_tokenizer     = forward_tokenizer,
-        gen_kwargs            = gen_kwargs,
-        max_num_epochs        = max_num_epochs,
+        gen_kwargs            = cfg.gen_kwargs,
+        max_num_epochs        = cfg.max_num_epochs,
         metrics               = metrics,
         prediction_tokenizer  = prediction_tokenizer,
-        predict_qty_print     = predict_qty_print,
+        predict_qty_print     = cfg.predict_qty_print,
+        output_type           = cfg.output_type.enum,
+        outlines_context      = outlines_context,
     )
 
     validation_evaluator = Evaluator(
         accelerator           = accelerator,
-        batch_table_print_qty = batch_table_print_qty,
+        batch_table_print_qty = cfg.batch_table_print_qty,
         cv_split              = lib_utils.CVSets.VALID,
         forward_tokenizer     = forward_tokenizer,
-        gen_kwargs            = gen_kwargs,
-        max_num_epochs        = max_num_epochs,
+        gen_kwargs            = cfg.gen_kwargs,
+        max_num_epochs        = cfg.max_num_epochs,
         metrics               = metrics,
         prediction_tokenizer  = prediction_tokenizer,
-        predict_qty_print     = predict_qty_print,
+        predict_qty_print     = cfg.predict_qty_print,
+        output_type           = cfg.output_type.enum,
+        outlines_context      = outlines_context,
     )
     
     train_forward_logger = ForwardLogger(
@@ -666,56 +730,37 @@ def main(
         cv_set        = lib_utils.CVSets.VALID,
     )
 
-    def training_stepper(
-        *, 
-        batch,
-        epoch_idx: int,
-        global_step: int,
-        log,
-        do_train,
-    ):
-        return step(
-            accelerator       = accelerator,
-            batch             = batch,
-            cv_set            = lib_utils.CVSets.TRAIN,
-            epoch             = epoch_idx,
-            forward_logger    = train_forward_logger,
-            forward_tokenizer = forward_tokenizer,
-            global_step       = global_step,
-            mask_query        = mask_query,
-            model             = model,
-            optimizer         = optimizer,
-            log               = log,
-            do_train          = do_train,
-        )
+    training_stepper = functools.partial(
+        step,
+        accelerator       = accelerator,
+        cv_set            = lib_utils.CVSets.TRAIN,
+        forward_logger    = train_forward_logger,
+        forward_tokenizer = forward_tokenizer,
+        mask_query        = cfg.mask_query,
+        model             = model,
+        optimizer         = optimizer,
+        output_type       = cfg.output_type.enum,
+        predict_tokenizer = prediction_tokenizer,
+    )
 
-    def validation_stepper(
-        *,
-        batch,
-        epoch_idx,
-        global_step,
-        log,
-        do_train,
-    ):
-        assert not do_train, "Validation stepper should not train."
-        return step(
-            accelerator       = accelerator,
-            batch             = batch,
-            cv_set            = lib_utils.CVSets.VALID,
-            epoch             = epoch_idx,
-            forward_logger    = validation_forward_logger,
-            forward_tokenizer = forward_tokenizer,
-            global_step       = global_step,
-            mask_query        = mask_query,
-            model             = model,
-            optimizer         = optimizer,
-            log               = log,
-            do_train          = False,
-        )
+    validation_stepper = functools.partial(
+        step,
+        accelerator       = accelerator,
+        cv_set            = lib_utils.CVSets.VALID,
+        forward_logger    = validation_forward_logger,
+        forward_tokenizer = forward_tokenizer,
+        mask_query        = cfg.mask_query,
+        model             = model,
+        optimizer         = optimizer,
+        output_type       = cfg.output_type.enum,
+        predict_tokenizer = prediction_tokenizer,
+    )
+
     
+
     global_step = 0
     for epoch_idx in tqdm(
-        range(max_num_epochs), 
+        range(cfg.max_num_epochs), 
         disable = RANK != 0, 
         desc    = "Epochs",
     ):
@@ -740,17 +785,22 @@ def main(
             # Train
             for batch_idx, batch in enumerate(tqdm(it.islice(
                     dataloaders[lib_utils.CVSets.TRAIN],
-                    n_batches_predict_train,
+                    cfg.n_batches_predict_train,
                 ), 
                 disable = RANK != 0, 
                 desc    = "Train Batches",
             )):
+
+                if cfg.output_type.enum == lib_sft_constants.OutputTypes.OUTLINES:
+                    batch = outlines_context.outlines_forward(
+                        batch=batch,
+                    )
+
                 at_least_one = True
                 global_step += len(batch["forward"]["input_ids"]) * WORLD_SIZE
-                
                 training_stepper(
                     batch       = batch,
-                    epoch_idx   = epoch_idx,
+                    epoch       = epoch_idx,
                     global_step = global_step,
                     log         = True,
                     do_train    = True,
@@ -794,4 +844,4 @@ def main(
     )
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    main()

@@ -24,6 +24,6 @@ class IterableDataset(abc.ABC, torch.utils.data.IterableDataset):
 
 class FewShotMixin(abc.ABC):
     @classmethod
-    @abc.abstractclassmethod
+    @abc.abstractmethod
     def post_process_gen_fewshots(cls) -> str:
         raise NotImplementedError()

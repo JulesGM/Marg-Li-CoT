@@ -12,15 +12,20 @@ import torch.utils.data
 from beartype import beartype
 
 
+@dataclass
+class IndivualReturn:
+    response_tensor: torch.Tensor
+    response_text: str
 
-@beartype
+        
+# @beartype
 class BatchedUnrollReturn:
     def __init__(
             self, *, 
             response_tensors, 
-            # raw_response_tensors, 
             any_tokenizer,
         ):
+
         """
         The exctractors expect there to be no padding tokens in the response.
 
@@ -29,14 +34,13 @@ class BatchedUnrollReturn:
         anymore.
         
         """
-        
+        print("BatchedUnrollReturn.__init__")
         self._response_tensors = response_tensors
         # self._raw_response_tensors = raw_response_tensors
 
         self._response_text = any_tokenizer.batch_decode(
             self.response_tensors, skip_special_tokens=True,
         )
-
 
     @property
     def response_tensors(self):
@@ -59,25 +63,15 @@ class BatchedUnrollReturn:
             f"{len(self.response_tensors) = } " f"{len(self.response_text)    = } "
         )
         return len(self.response_tensors)
-    
-    @beartype
-    @dataclass
-    class IndivualReturn:
-        response_tensor: torch.Tensor
-        response_text: str
-        # raw_response_tensor: torch.Tensor
-        # raw_response_text: str
+
 
     def __iter__(self):
-
         for i in range(len(self)):
-            yield self.IndivualReturn(
-                response_tensor     = self.response_tensors[i],
-                response_text       = self.response_text[i],
-                # raw_response_tensor = self.raw_response_tensors[i],
-                # raw_response_text   = self.raw_response_text[i],
-            )
-
+            yield IndivualReturn(
+                response_tensor = self.response_tensors[i],
+                response_text   = self.response_text[i],
+            )    
+        
 
 @dataclasses.dataclass
 class DataListContainer:
@@ -234,3 +228,10 @@ class Metric:
         batch: DataListContainer,
     ) -> MetricOutput:
         raise NotImplementedError()
+    
+if __name__ == "__main__":
+    BatchedUnrollReturn(
+        response_tensors="response_tensors", 
+        any_tokenizer="any_tokenizer",
+    )
+    breakpoint()

@@ -1,5 +1,6 @@
 compute_environment: LOCAL_MACHINE
-debug: false
+distributed_type: DEEPSPEED
+
 deepspeed_config:
   gradient_accumulation_steps: 1
   gradient_clipping: 1.0
@@ -7,7 +8,7 @@ deepspeed_config:
   offload_param_device: none
   zero3_init_flag: true
   zero_stage: 2
-distributed_type: DEEPSPEED
+debug: false
 fsdp_config: {}
 machine_rank: 0
 main_process_ip: null

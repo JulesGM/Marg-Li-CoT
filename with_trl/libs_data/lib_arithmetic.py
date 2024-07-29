@@ -28,6 +28,7 @@ import transformers
 
 SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
 sys.path.append(str(SCRIPT_DIR.parent))
+
 import lib_base_classes
 import lib_metric
 import lib_utils
@@ -46,41 +47,6 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 LOGGER = logging.getLogger(__name__)
 
 
-def _tok_detok(*, batch, any_tokenizer, batched, exclusion_set=None):
-    if exclusion_set is None:
-        exclusion_set = set()
-
-    output = {}
-    assert "question" in batch, batch.keys()
-
-
-    for k, v in batch.items():
-        if k in exclusion_set:
-            output[k] = v
-            continue
-
-        tok = any_tokenizer(v)
-        if batched:
-            detok_skip = any_tokenizer.batch_decode(
-                tok.input_ids, 
-                skip_special_tokens=True
-            )
-            # detok_not_skip = any_tokenizer.batch_decode(tok.input_ids, skip_special_tokens=False)
-        else:
-            detok_skip = any_tokenizer.decode(
-                tok.input_ids, 
-                skip_special_tokens=True
-            )
-            # detok_not_skip = any_tokenizer.decode(tok.input_ids, skip_special_tokens=False)
-
-        output[k + "_tok"  ] = tok.input_ids
-        # output[k + "_detok"] = detok_skip
-        output[k + "_detok_skip"] = detok_skip
-        # output[k + "_detok_not_skip"] = detok_not_skip
-
-    return output
-
-
 def _count_lines(file):
     return int(subprocess.check_output(
             ["wc", "-l", str(file)], 
@@ -88,161 +54,93 @@ def _count_lines(file):
         ).split()[0])
 
 
-class DSIterator:
-    """
-
-    Init:    
-    Set the index of each curriculum level to 0.
-    or
-    Set the index to zero.
-
-    
-
-    """
-
-    def __init__(self, ds, use_curriculum: bool, return_idx: bool, use_few_shots: bool):
-        self._ds = ds
-        self._return_idx = return_idx
-        self._use_few_shots = use_few_shots
-
-        self._proportion_difficulties = None
-        self._use_curriculum = use_curriculum
-
-        if self._use_curriculum:
-            assert isinstance(self._ds, dict), type(self._ds).mro()
-            self._indices = {k: 0 for k in self._ds}
-            self._is_done = {k: False for k in self._ds}
-            self._idx = None
-        else:
-            self._indices = None
-            self._idx = 0
-
-    def set_proportion_difficulties(self, proportions):
-        assert self._use_curriculum, "Trying to set proportions when use-curriculum is disabled"
-        
-        if RANK == 0:
-            rich.print(rich.rule.Rule(style="red"))
-            rich.print(rich.rule.Rule(style="red"))
-            rich.print(rich.rule.Rule(style="red"))
-            rich.print(f"SETTING DIFFICULTY PROPORTIONS TO {proportions}")
-            rich.print(rich.rule.Rule(style="red"))
-            rich.print(rich.rule.Rule(style="red"))
-            rich.print(rich.rule.Rule(style="red"))
-
-        self._proportion_difficulties = proportions
-        assert not all(
-            math.isclose(v, 0) 
-            for v in proportions.values()
-        ), proportions
-
-    def __next__(self):
-        """
-        Each dataset difficulty is sharded to len / num_gpus.
-
-        This is the most naive way to do it.
-
-        The main advantage is that it's the most straightforward to parallelize. 
-
-        The main disadvantage is that a process can run out of data while another has too much.
-
-        """
-
-        if self._use_curriculum:
-            """
-            . Look up unfinished difficulties
-            . Normalize the probabilities of unfinished difficulties
-            . Sample a difficulty
-            . Get the dataset object linked to the difficulty
-            . get the index of the sharded data we're at with that difficulty dataset
-            . increment the index, possibly restarting the epoch
-
-            The issue with that is that the proportions break down as the epoch progresses.
-            Anything that has a non zero proportion will eventually be fully trained on.
-
-            Using uniform probabilities between a set of difficulties would be a more robust way to do it, if less flexible.
-            
-            """
-
-            #######################################################################################
-            # Look up unfinished difficulties
-            #######################################################################################
-            proportion_keys = self._proportion_difficulties.keys()
-            not_done = {k for k in proportion_keys if not self._is_done[k]}
-            not_dones = proportion_keys & not_done
-            
-            if not not_dones:
-                raise StopIteration
-
-            #######################################################################################
-            # Normalize the probabilities of unfinished difficulties
-            #######################################################################################
-            normalization_factor = sum(self._proportion_difficulties[k] for k in not_dones)
-            normalized_proportions = {
-                k: self._proportion_difficulties[k] / normalization_factor
-                for k in not_dones
-            }
-            for k in self._proportion_difficulties:
-                if k not in not_dones:
-                    normalized_proportions[k] = 0.
-
-            #######################################################################################
-            # Pick a difficulty
-            #######################################################################################
-            assert math.isclose(sum(normalized_proportions.values()), 1), normalized_proportions
-
-            difficulty = np.random.choice(
-                list(normalized_proportions.keys()),
-                p=list(self._proportion_difficulties.values()),
-            )
-
-            #######################################################################################
-            # Increment the index.
-            #######################################################################################
-            self._indices [difficulty]   +=  1
-            ds_obj                        =  self._ds      [difficulty]
-            base_idx                      =  self._indices [difficulty]
-            
-            if self._indices[difficulty] + 1 >= len(ds_obj):
-                assert self._indices[difficulty] + 1 == len(ds_obj), (
-                    self._indices[difficulty] + 1, 
-                    len(ds_obj),
-                )
-                self._is_done[difficulty] = True
-
-        else:
-            ds_obj     = self._ds
-            base_idx   = self._idx
-            self._idx += 1
-            if self._idx >= len(ds_obj):
-                assert self._idx == len(ds_obj), (self._idx, len(ds_obj))
-                raise StopIteration
-            
-        # Check that the sharded idx is within bounds
-        # Adjust it if it't not
-
-        value = ds_obj[base_idx]
-
-        if self._use_few_shots:
-            value.detok_ref_query = self.make_few_shot_toks() + "\n\n" + value.detok_ref_query
-
-        if self._return_idx:
-            return value, base_idx
-        else:
-            return value
-
-
-    def __iter__(self):
-        return self
-
-
 class TrainModes(enum.Enum):
     RL = "RL"
     SFT = "SFT"
 
 
+class DSIterator(torch.utils.data.Dataset):
+    """
+
+    Curriculum should just be on or off per difficulty to keep things simple.
+    Sampling makes things complicated.
+    
+    Init:    
+    Set the index of each curriculum level to 0.
+    or
+    Set the index to zero.   
+
+    """
+
+    def __init__(self, 
+        *,
+        ds, 
+        use_curriculum: bool, 
+        return_idx: bool, 
+        use_few_shots: bool, 
+        difficulty_toggles, 
+        seed: int,
+        few_show_text: Optional[str],
+        few_shot_qty: Optional[int],
+    ):
+        self._few_shot_text = few_show_text
+        self._few_shot_qty = few_shot_qty
+        self._return_idx = return_idx
+        self._use_few_shots = use_few_shots
+        self._rng = random.Random(seed)
+        self._difficulty_toggles = difficulty_toggles
+        self._use_curriculum = use_curriculum
+
+        if use_curriculum:
+            self._turned_ons = {k for k, v in self._difficulty_toggles.items() if v}
+            self._ds = list(it.chain(ds[k] for k in self._turned_ons))
+            self._rng.shuffle(self._ds)
+        else:
+            self._ds = ds
+
+    def __len__(self):
+        return len(self._ds)
+
+    def __getitem__(self, idx):
+        value = self._ds[idx]
+        if self._use_few_shots:
+            value["ref_qa_question"] = (
+                self.make_few_shot_toks() + "\n\n" + "Q: " + value["ref_qa_question"]
+            )
+        return value
+        
+    def __iter__(self):
+        return self
+
+    def make_few_shot_toks(self) -> torch.Tensor:
+        """
+        Select from a subset of the few-shot examples.
+        """
+
+        per_digit = {}
+
+        # If we are using curriculum, we select a few from each level
+        if self._use_curriculum:
+            proportions = self._curriculum_proportions
+        else:
+            proportions = {
+                k: 1. / len(self._few_shot_text) for k in self._few_shot_text.keys()
+            }
+
+        for num_digits, proportion in proportions.items():
+            rounded_prop = round(self._few_shot_qty * proportion)
+            indices = np.random.permutation(self._few_shot_qty)[:rounded_prop]
+            per_digit[num_digits] = [self._few_shot_text[num_digits][i] for i in indices]
+
+        flattened_few_shots = list(it.chain.from_iterable(per_digit.values()))
+        # Shuffle
+        random.shuffle(flattened_few_shots)
+        return "\n".join(flattened_few_shots).strip()
+
+
 class Arithmetic(
-    lib_base.FewShotMixin,
-    lib_base.IterableDataset,
+    # lib_base.FewShotMixin,
+    # lib_base.IterableDataset,
 ):
     def __init__(
             self, 
@@ -298,7 +196,6 @@ class Arithmetic(
         
         self._use_few_shots = use_few_shots
         if use_few_shots:
-            assert not self._mode == TrainModes.SFT, self._mode
             self._few_shot_text = self._prepare_few_shots()
         else:
             self._few_shot_text = None
@@ -328,24 +225,6 @@ class Arithmetic(
 
         if shuffle_once:
             self._core.shuffle()
-
-
-    def make_few_shot_toks(self) -> torch.Tensor:
-        assert False, "Move this to the iterator."
-        if not self._use_curriculum:
-            raise NotImplementedError("Few shot only works with curriculum")
-    
-        assert not self._train_mode == TrainModes.SFT, self._train_mode
-
-        per_digit = {}
-        for num_digits, proportion in self._curriculum_proportions.items():
-            rounded_prop = round(self._few_shot_qty * proportion)
-            indices = np.random.permutation(self._few_shot_qty)[:rounded_prop]
-            per_digit[num_digits] = [self._few_shot_text[num_digits][i] for i in indices]
-        
-        flattened_few_shots = list(it.chain.from_iterable(per_digit.values()))
-        random.shuffle(flattened_few_shots)
-        return "\n".join(flattened_few_shots).strip()
     
     @property
     def training_mode(self):
@@ -483,6 +362,7 @@ class Arithmetic(
 
     def _prepare_few_shots(self):
         self._few_shot_qty = 10
+
         few_shots = arithmetic_10_shot.make_few_shots(
             max_digits=self.max_num_digits,
             num_per=self._few_shot_qty,
@@ -506,12 +386,16 @@ class Arithmetic(
     def use_few_shots(self):
         return self._use_few_shots
 
-    def __iter__(self):
+    def make_dataset(self, difficulty_toggles, seed):
         return DSIterator(
-            ds=self._core, 
-            use_curriculum=self._use_curriculum,
-            return_idx=self._return_idx,
-            use_few_shots=self._use_few_shots,
+            ds                 = self._core, 
+            use_curriculum     = self._use_curriculum,
+            return_idx         = self._return_idx,
+            use_few_shots      = self._use_few_shots,
+            difficulty_toggles = difficulty_toggles,
+            seed               = seed,
+            few_show_text      = self._few_shot_text,
+            few_shot_qty       = self._few_shot_qty,
         )
 
     def get_extractor(self):
@@ -523,11 +407,6 @@ class Arithmetic(
             torch.tensor(x, dtype=torch.long, device=torch.device(LOCAL_RANK)) 
             for x in any_tokenizer(text_list)["input_ids"]
         ]
-
-    def set_proportion_difficulties(self, proportions):
-        raise DeprecationWarning("Call it in the iterator instead.")
-        self._curriculum_proportions = proportions
-        self._inner_iterator.set_proportion_difficulties(proportions)
 
 
 class PerNumberOfDigitsAccuracy(lib_base_classes.Metric):
@@ -682,6 +561,7 @@ def main(use_curriculum=True):
 
 
     # rich.print(ds[0]["detok_ref_query"])
+
 
 if __name__ == "__main__":
     fire.Fire(main)
