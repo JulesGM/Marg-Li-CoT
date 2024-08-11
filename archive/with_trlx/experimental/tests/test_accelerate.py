@@ -5,7 +5,7 @@ import os
 import random
 
 import accelerate
-import datasets
+import mlc_datasets
 import fire
 import rich
 import rich.logging
@@ -76,7 +76,7 @@ def main(
     model = hf_class.from_pretrained(hf_name)
     info("Done loading model.")
     tokenizer = transformers.AutoTokenizer.from_pretrained(hf_name)
-    all_data = datasets.load_dataset("gsm8k", "main", split="train")["question"][:qty]
+    all_data = mlc_datasets.load_dataset("gsm8k", "main", split="train")["question"][:qty]
     all_tokenized = tokenizer(all_data, return_tensors="pt", padding=True)
     list_of_dicts = []
 

@@ -26,7 +26,7 @@ import random
 from pathlib import Path
 from typing import *
 
-import datasets
+import mlc_datasets
 import fire
 import general_utils
 import numpy as np
@@ -47,7 +47,7 @@ import lib_reward
 import lib_modeling
 
 
-datasets    .logging.set_verbosity_warning()
+mlc_datasets    .logging.set_verbosity_warning()
 transformers.logging.set_verbosity_warning()
 logging.getLogger("datasets"    ).setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
@@ -286,12 +286,12 @@ def _build_dataset(
     ds_train_obj = lib_data.GSM8KLMDataset(
         max_length = max_input_length,
         tokenizer  = reward_tokenizer,
-        ds         = datasets.load_dataset("gsm8k", "main", split="train"),)
+        ds         = mlc_datasets.load_dataset("gsm8k", "main", split="train"),)
 
     #############################################################################
     # Eval Subset
     #############################################################################
-    eval_dataset = datasets.load_dataset("gsm8k", "main", split="test")
+    eval_dataset = mlc_datasets.load_dataset("gsm8k", "main", split="test")
     if val_subset_size:
         np_indices = np.random.permutation(len(eval_dataset))[:val_subset_size]
         np_indices.sort()

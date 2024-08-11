@@ -3,7 +3,6 @@ import os
 import re
 import typing
 
-import general_utils
 import more_itertools
 import numpy as np
 import peft
@@ -17,6 +16,7 @@ import transformers
 import lib_base_classes
 import lib_bisect_tokens
 import lib_utils
+import general_utils
 
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))

@@ -1,4 +1,11 @@
-"""Implements support for the "aqua_rat" dataset.
+"""
+
+Implements support for the "aqua_rat" dataset.
+
+4th of August, 2024 - Jules: 
+    Not planned for either of SFT or RL.
+    Loads the Huggingface Dataset aqua_rat.
+
 """
 
 import pathlib
@@ -73,7 +80,7 @@ def only_one_int(sample):
 
 
 def make_dataset():
-    rat = datasets.load_dataset("aqua_rat")    
+    rat = datasets.load_dataset("aqua_rat")
     # Fields: 'question', 'rationale', 'answer'
 
     return (

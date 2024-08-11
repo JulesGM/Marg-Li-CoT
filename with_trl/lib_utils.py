@@ -29,8 +29,9 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 
 
 class Datasets(str, enum.Enum):
-    COMMONSENSE_QA = "commonsense_qa"
+    GSM8K = "gsm8k"
     ARITHMETIC = "arithmetic"
+    COMMONSENSE_QA = "commonsense_qa"
 
 
 class TrlLibraryMode(enum.Enum):

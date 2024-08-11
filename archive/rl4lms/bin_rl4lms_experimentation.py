@@ -7,7 +7,7 @@ import os
 import types
 from typing import *
 
-import datasets
+import mlc_datasets
 import general_utils
 import general_utils as utils
 import pretty_traceback
@@ -31,7 +31,7 @@ RL4LMS_ROOT = "/home/mila/g/gagnonju/AccelerateRL4LMS"
 
 
 pretty_traceback.install()
-datasets.logging.set_verbosity_error()
+mlc_datasets.logging.set_verbosity_error()
 transformers.logging.set_verbosity_error()
 
 CONSOLE = rich.console.Console(width=80)
@@ -342,7 +342,7 @@ def main():
 
 
     transformers.logging.set_verbosity_error()
-    datasets.logging.set_verbosity_error()
+    mlc_datasets.logging.set_verbosity_error()
     trainer.train_and_eval()
 
 

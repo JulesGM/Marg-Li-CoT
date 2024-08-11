@@ -5,6 +5,7 @@ import os
 import collections
 import logging
 
+import datasets
 import torch
 import torch.backends
 import torch.backends.cuda
@@ -13,13 +14,13 @@ import torch.utils.data
 import transformers
 import transformers.utils
 
-from with_trl import libs_data
 from with_trl import lib_utils
 from with_trl.libs_data import lib_arithmetic
+from with_trl.libs_data import lib_gsm8k
 
 from approach_sft import lib_sft_collators
 from approach_sft import lib_sft_constants
-from approach_sft import lib_sft_dataset
+from approach_sft import lib_sft_commonsense_qa
 
 
 RANK = int(os.environ.get("RANK", 0))
@@ -116,13 +117,23 @@ def get_dataloaders(
         lm_mode == lib_sft_constants.LMModes.CAUSAL_FULL and 
         output_type != lib_sft_constants.OutputTypes.OUTLINES
     ):
-        assert dataset_choice == lib_utils.Datasets.ARITHMETIC
-        data_collator = lib_sft_collators.ArithmeticCausalMaskedCollator(
-            output_type          = output_type,
-            forward_tokenizer    = forward_tokenizer,
-            prediction_tokenizer = prediction_tokenizer,
-            has_choices          = False
-        )
+        if dataset_choice == lib_utils.Datasets.ARITHMETIC:
+            data_collator = lib_sft_collators.ArithmeticCausalMaskedCollator(
+                output_type          = output_type,
+                forward_tokenizer    = forward_tokenizer,
+                prediction_tokenizer = prediction_tokenizer,
+                has_choices          = False
+            )
+
+        elif dataset_choice == lib_utils.Datasets.GSM8K:
+            data_collator = lib_sft_collators.GSM8KCollator(
+                output_type=output_type,
+                forward_tokenizer=forward_tokenizer,
+                prediction_tokenizer=prediction_tokenizer,
+            )
+
+        else:
+            raise NotImplementedError(dataset_choice)
     else:
         class CollatorChainer:
             def __init__(self, collators):
@@ -140,6 +151,17 @@ def get_dataloaders(
     ###########################################################################
     # Dataloaders
     ###########################################################################
+    
+    if dataset_choice == lib_utils.Datasets.GSM8K:
+        full_ds = datasets.load_dataset("gsm8k", "main")["train"]
+        gsm8k_splits = full_ds.train_test_split(test_size=0.15, seed=seed)
+        gsm8k_splits = {
+            lib_utils.CVSets.TRAIN: gsm8k_splits["train"], 
+            lib_utils.CVSets.VALID: gsm8k_splits["test"],
+            small_eval_set: gsm8k_splits["test"],
+        }
+
+
     dataloaders = {}
     for cv_set in it.chain(lib_utils.CVSets, [small_eval_set]):
         if dataset_choice == lib_utils.Datasets.ARITHMETIC:
@@ -158,9 +180,25 @@ def get_dataloaders(
                     use_cached_dataset        = True,
                     return_idx                = False,
                 )
+            dataset = ds_builder.make_dataset(difficulty_toggles=None, seed=seed)
+            
+        elif dataset_choice == lib_utils.Datasets.GSM8K:
+            dataset = lib_gsm8k.GSM8K(
+                tok_max_query_length  = None,
+                tok_max_answer_length = None,
+                tok_max_total_length  = None,
+                ds                    = gsm8k_splits[cv_set],
+
+                any_tokenizer         = forward_tokenizer,
+                device                = LOCAL_RANK,
+
+                use_few_shots         = False,
+                few_show_qty          = None,
+            )
+            
         else:
             assert False
-            ds_builder = lib_sft_dataset.openai_commonsense_qa_output(
+            ds_builder = lib_sft_commonsense_qa.openai_commonsense_qa_output(
                 root_path=data_directory, 
                 filter_bads=filter_bads,
             )
@@ -176,7 +214,6 @@ def get_dataloaders(
             assert cv_set == lib_utils.CVSets.VALID or cv_set == small_eval_set, cv_set
             batch_size = eval_batch_size
 
-        dataset = ds_builder.make_dataset(difficulty_toggles=None, seed=seed)
         if cv_set == small_eval_set :
             dataset =  torch.utils.data.Subset(
                 dataset=dataset,

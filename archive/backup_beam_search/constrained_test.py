@@ -20,7 +20,7 @@ with rich.status.Status("Importing.", spinner="weather"):
     import rich.markup
     import torch
     import transformers
-    import datasets
+    import mlc_datasets
 
     transformers.generation.utils
     CONSOLE = rich.console.Console(highlight=True)
@@ -111,7 +111,7 @@ def main(
     )
     tokenizer.pad_token = tokenizer.eos_token
 
-    gsm8k = datasets.load_dataset("gsm8k", "main", split="train")
+    gsm8k = mlc_datasets.load_dataset("gsm8k", "main", split="train")
 
     dataloader = torch.utils.data.DataLoader(
         gsm8k,

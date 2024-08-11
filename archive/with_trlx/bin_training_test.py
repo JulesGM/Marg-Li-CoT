@@ -15,7 +15,7 @@ import logging
 import random
 
 import accelerate
-import datasets
+import mlc_datasets
 import fire
 import numpy as np
 import peft
@@ -29,7 +29,7 @@ import torch
 from general_utils import parallel_print as pprint
 
 
-datasets.logging.set_verbosity_error()
+mlc_datasets.logging.set_verbosity_error()
 transformers.logging.set_verbosity_error()
 logging.getLogger("datasets").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -112,7 +112,7 @@ def preprocess_function(
 
 def make_dataset(model):
     # loading dataset
-    dataset = datasets.load_dataset(
+    dataset = mlc_datasets.load_dataset(
         "financial_phrasebank", "sentences_allagree"
     )
     dataset = dataset["train"].train_test_split(test_size=0.1)

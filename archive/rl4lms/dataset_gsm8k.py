@@ -2,7 +2,7 @@ import logging
 import re
 import typing
 
-import datasets
+import mlc_datasets
 import general_utils as utils
 import jsonlines as jsonl
 import pretty_traceback
@@ -17,7 +17,7 @@ import rl4lms.data_pools.text_generation_pool as rl4lms_pool
 import rl4lms.envs.text_generation.registry as rl4lms_registry
 
 pretty_traceback.install()
-datasets.logging.set_verbosity_error()
+mlc_datasets.logging.set_verbosity_error()
 text2digits = text2digits.Text2Digits()
 LOGGER = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def _build_dataset(
     #     max_question_len is not None and max_question_len is not None
     # ), (max_sum_squares, max_question_len, max_question_len)
 
-    dataset = datasets.load_dataset("gsm8k", "main", split=split)
+    dataset = mlc_datasets.load_dataset("gsm8k", "main", split=split)
     dataset = dataset.map(_clean_text).map(_split_answer_scratchpad)
 
     if max_sum_squares is not None:

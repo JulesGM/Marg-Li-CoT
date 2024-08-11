@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 from typing import *
 
-import datasets
+import mlc_datasets
 import fire
 import numpy as np
 import rich
@@ -291,11 +291,11 @@ def train(
     ) as (hf_path, tok_path, reward_model, reward_tokenizer):
 
         ds_train_obj = lib_data.GSM8KLMDataset(
-            datasets.load_dataset("gsm8k", "main", split="train"),
+            mlc_datasets.load_dataset("gsm8k", "main", split="train"),
             tokenizer=reward_tokenizer,
         )
         ds_eval_obj = lib_data.GSM8KLMDataset(
-            datasets.load_dataset("gsm8k", "main", split="train"),
+            mlc_datasets.load_dataset("gsm8k", "main", split="train"),
             tokenizer=reward_tokenizer,
         )
 

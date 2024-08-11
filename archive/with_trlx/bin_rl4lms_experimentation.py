@@ -13,7 +13,7 @@ import types
 from pathlib import Path
 from typing import *
 
-import datasets
+import mlc_datasets
 import general_utils
 import general_utils as utils
 import numpy as np
@@ -30,7 +30,7 @@ import libs_compute_accuracy.dataset_asdiv as dataset_asdiv
 import libs_compute_accuracy.dataset_gsm8k as dataset_gsm8k
 
 pretty_traceback.install()
-datasets.logging.set_verbosity_error()
+mlc_datasets.logging.set_verbosity_error()
 transformers.logging.set_verbosity_error()
 
 CONSOLE = rich.console.Console(width=80)

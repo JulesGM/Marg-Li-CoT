@@ -13,6 +13,7 @@ import pathlib
 import random
 import re
 import sys
+import tempfile
 
 import more_itertools as mit
 import outlines
@@ -91,9 +92,11 @@ REPO_ROOT = pathlib.Path(git.Repo(
 ).working_tree_dir)
 
 
+
 def repo_path(input_path):
     """ Helper for Hydra """
     return REPO_ROOT / input_path
+
 
 
 ########################################################################
@@ -133,6 +136,7 @@ def predict(
         **query.to(accelerator.local_process_index), 
         **gen_kwargs
     )[:, query_seq_len:]
+
     response_text_for_metrics = predict_tokenizer.batch_decode(
         predictions, 
         skip_special_tokens=True,
@@ -184,7 +188,7 @@ def predict(
     if RANK == 0:
         prediction_batch_obj = lib_base_classes.BatchedUnrollReturn(
                 response_tensors = predictions,
-                any_tokenizer   = predict_tokenizer,
+                any_tokenizer    = predict_tokenizer,
             )
         
         lib_sft_tables.predict_table(
@@ -309,13 +313,13 @@ def step(
     do_train: bool,
     output_type: lib_sft_constants.OutputTypes,
 ):
-    assert not cv_set == lib_utils.CVSets.VALID and do_train, cv_set
+    assert not (cv_set == lib_utils.CVSets.VALID and do_train), (
+        cv_set)
 
     if cv_set == lib_utils.CVSets.TRAIN:
         model.train()
         optimizer.zero_grad()
 
-    rich.print("[bold green]######")
     lib_utils.not_first_token(
         forward_tokenizer=forward_tokenizer,
         tensor=batch["forward"]["input_ids"],
@@ -565,8 +569,10 @@ def main(
     assert not is_encoder_decoder, "Encoder decoder not supported yet."
     
     if RANK == 0:
-        wandb_dir = pathlib.Path(os.environ["SLURM_TMPDIR"]) / "tmp" 
-        wandb_dir.mkdir(exist_ok=True)
+        
+        wandb_dir_obj = tempfile.TemporaryDirectory()
+        wandb_dir = wandb_dir_obj.name
+        
         wandb.init(
             name    = cfg.run_name,
             project = cfg.wandb_project_name,
@@ -576,21 +582,22 @@ def main(
                 gen_kwargs=cfg.gen_kwargs,
             ),
             dir     = wandb_dir,
+            mode    = "disabled" if cfg.test_mode else "online",
         )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
 
-    if cfg.dataset_choice == lib_utils.Datasets.COMMONSENSE_QA:
-        metrics = dict(
-            exact_match=lib_metric.ScratchpadAnswerAccuracy(
-                lib_multiple_choice.MultipleChoiceRfindExtractor(
-                    ["(A)", "(B)", "(C)", "(D)", "(E)"]),
-                pad_token=tokenizer.pad_token,
-            ),
-        )
+    # if cfg.dataset_choice == lib_utils.Datasets.COMMONSENSE_QA:
+    #     metrics = dict(
+    #         exact_match=lib_metric.ScratchpadAnswerAccuracy(
+    #             lib_multiple_choice.MultipleChoiceRfindExtractor(
+    #                 ["(A)", "(B)", "(C)", "(D)", "(E)"]),
+    #             pad_token=tokenizer.pad_token,
+    #         ),
+    #     )
 
-    elif cfg.dataset_choice == lib_utils.Datasets.ARITHMETIC:
+    if cfg.dataset_choice == lib_utils.Datasets.ARITHMETIC:
         metrics = dict(
             exact_match = lib_metric.ScratchpadAnswerAccuracy(
                 extractor=lib_final_line.FinalLineExtractor(
@@ -600,7 +607,14 @@ def main(
                 pad_token=tokenizer.pad_token,
             )
         )
-
+    elif cfg.dataset_choice == lib_utils.Datasets.GSM8K:
+        from with_trl.libs_extraction import lib_numerical
+        metrics = dict(
+            exact_match = lib_metric.ScratchpadAnswerAccuracy(
+                extractor=lib_numerical.ConvToNum(),
+                pad_token=tokenizer.pad_token,
+            )
+        )
     else:
         raise NotImplementedError(cfg.dataset_choice)
         
@@ -756,7 +770,39 @@ def main(
         predict_tokenizer = prediction_tokenizer,
     )
 
-    
+
+    if cfg.test_mode:
+
+        for dataloader_name, dataloader in it.chain(dataloaders.items(), dict(small_eval_dl=small_eval_dl).items()):
+            for batch in tqdm(
+                it.islice(dataloader, cfg.test_dataloader_qty,), 
+                desc=f"Testing {dataloader_name}", 
+                total=cfg.test_dataloader_qty,
+            ):
+                forward_ids = batch["forward"]["input_ids"]
+                predict_ids = batch["predict"]["input_ids"]
+
+                assert forward_ids.shape[0] == predict_ids.shape[0], (
+                    f"Shapes do not match: forward_ids.shape={forward_ids.shape}, predict_ids.shape={predict_ids.shape}")
+                assert forward_ids.shape[1] > predict_ids.shape[1], (
+                    f"Shape mismatch: forward_ids.shape={forward_ids.shape}, predict_ids.shape={predict_ids.shape}")
+                
+                for entry_forward, entry_predict in mit.zip_equal(forward_ids, predict_ids):
+                    entry_forward = torch.tensor([x for x in entry_forward if x != forward_tokenizer   .pad_token_id])
+                    entry_predict = torch.tensor([x for x in entry_predict if x != prediction_tokenizer.pad_token_id])
+                    
+                    if not (entry_forward[:len(entry_predict)] == entry_predict).all():
+                        breakpoint()
+
+                    assert (entry_forward[:len(entry_predict)] == entry_predict).all(), (
+                        entry_forward, 
+                        entry_predict, 
+                        forward_tokenizer.decode(entry_forward), 
+                        prediction_tokenizer.decode(entry_predict),
+                    )
+
+        exit(0)
+
 
     global_step = 0
     for epoch_idx in tqdm(
@@ -778,54 +824,68 @@ def main(
               iterator is not done, so the loop should repeat
         """
 
-        at_least_one = True
-        while at_least_one:
-            at_least_one = False
+        # Train
+        for batch_idx, batch in enumerate(tqdm(
+            dataloaders[lib_utils.CVSets.TRAIN],
+            disable = RANK != 0, 
+            desc    = "Train Batches",
+        )):
 
-            # Train
-            for batch_idx, batch in enumerate(tqdm(it.islice(
-                    dataloaders[lib_utils.CVSets.TRAIN],
-                    cfg.n_batches_predict_train,
-                ), 
-                disable = RANK != 0, 
-                desc    = "Train Batches",
-            )):
-
-                if cfg.output_type.enum == lib_sft_constants.OutputTypes.OUTLINES:
-                    batch = outlines_context.outlines_forward(
-                        batch=batch,
-                    )
-
-                at_least_one = True
-                global_step += len(batch["forward"]["input_ids"]) * WORLD_SIZE
-                training_stepper(
-                    batch       = batch,
-                    epoch       = epoch_idx,
-                    global_step = global_step,
-                    log         = True,
-                    do_train    = True,
+            if cfg.output_type.enum == lib_sft_constants.OutputTypes.OUTLINES:
+                batch = outlines_context.outlines_forward(
+                    batch=batch,
                 )
 
-                if batch_idx % 10 == 0:
-                    with torch.no_grad():
-                        model.eval()
-                        train_evaluator.evaluate_one(
-                            batch             = batch,
-                            batch_idx         = batch_idx,
-                            epoch_idx         = epoch_idx,
-                            global_step       = global_step,
-                            model             = model,
-                            log               = True,
-                            total_num_batches = None
-                        )
-            
-            validation_evaluator.evaluate(
+            global_step += len(batch["forward"]["input_ids"]) * WORLD_SIZE
+            training_stepper(
+                batch       = batch,
+                epoch       = epoch_idx,
                 global_step = global_step,
-                dataloader  = small_eval_dl, 
-                epoch_idx   = epoch_idx,
-                stepper     = validation_stepper,
-                model       = model,
+                log         = True,
+                do_train    = True,
             )
+
+            # Eval just one batch every 10 samples:
+            if batch_idx % 10 == 0:
+                with torch.no_grad():
+                    model.eval()
+                    train_evaluator.evaluate_one(
+                        batch             = batch,
+                        batch_idx         = batch_idx,
+                        epoch_idx         = epoch_idx,
+                        global_step       = global_step,
+                        model             = model,
+                        log               = True,
+                        total_num_batches = None,
+                    )
+        
+            # Do a small eval subset every `cfg.n_batches_predict_train` batches:
+            if batch_idx % cfg.n_batches_predict_train == 0 and batch_idx >= 0:
+                validation_evaluator.evaluate(
+                    global_step = global_step,
+                    dataloader  = small_eval_dl, 
+                    epoch_idx   = epoch_idx,
+                    stepper     = validation_stepper,
+                    model       = model,
+                )
+        
+        # End of epoch
+        if RANK == 0:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_dir = pathlib.Path(temp_dir)
+                ckpt_path = temp_dir / f"ep_{epoch_idx}_model.pt"
+                torch.save(dict(
+                    cfg=omegaconf.OmegaConf.to_container(cfg, resolve=True),
+                    model=model.state_dict(),
+                    optimizer=optimizer.state_dict(),
+                    epoch=epoch_idx,
+                    global_step=global_step,
+                    wandb_run_id=wandb.run.id,
+                    wandb_url=wandb.run.get_url(),
+                ))
+                wandb.save(str(ckpt_path))
+                
+        accelerator.wait_for_everyone()
 
     validation_evaluator.evaluate(
         dataloader  = dataloaders[lib_utils.CVSets.VALID], 

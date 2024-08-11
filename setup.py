@@ -1,7 +1,10 @@
 import setuptools as st
 
+modules = st.find_packages() 
+print(modules)
+
 st.setup(
-    name="approach_sft",
+    name="marglicot",
     version="1.0",
-    py_modules=st.find_packages(),
+    py_modules=modules,
 )

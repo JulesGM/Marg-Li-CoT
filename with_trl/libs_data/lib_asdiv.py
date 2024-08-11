@@ -1,3 +1,10 @@
+"""
+
+August 4th 2024, Jules:
+    Huggingface ASDiv very simple arithmetic dataset. Likely too easy to be of any use at all.
+
+"""
+
 import more_itertools
 import pathlib
 

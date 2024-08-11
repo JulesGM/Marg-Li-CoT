@@ -19,7 +19,7 @@ import os
 import typing
 from pathlib import Path
 
-import datasets
+import mlc_datasets
 import fire
 import general_utils as utils
 import pretty_traceback
@@ -29,7 +29,7 @@ import transformers
 import yaml
 
 
-datasets.logging.set_verbosity_error()
+mlc_datasets.logging.set_verbosity_error()
 transformers.logging.set_verbosity_error()
 
 print("Done importing modules.")

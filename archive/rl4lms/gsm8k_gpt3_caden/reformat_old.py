@@ -6,7 +6,7 @@ import enum
 import fire
 import re
 
-import datasets
+import mlc_datasets
 import editdistance
 import jsonlines as jsonl
 import numpy as np
@@ -145,7 +145,7 @@ def main(
     new_path_all=NEW_PATH_ALL,
     new_path_good=NEW_PATH_GOOD,
 ):
-    gsm8k = datasets.load_dataset("gsm8k", "main", split="train")
+    gsm8k = mlc_datasets.load_dataset("gsm8k", "main", split="train")
     gsm8k = gsm8k.map(lambda x: {
         "answer": x["answer"].split("####")[1].strip(), 
         "scratchpad": x["answer"].split("####")[0].strip()

@@ -17,6 +17,16 @@ from with_trl import libs_data
 from with_trl import libs_extraction
 from with_trl import lib_utils
 
+import with_trl.libs_extraction.lib_numerical
+import with_trl.libs_extraction.lib_multiple_choice
+import with_trl.libs_data.lib_arithmetic
+import with_trl.libs_data.lib_commonsense_qa
+import with_trl.libs_data.lib_gsm8k
+import with_trl.libs_data.lib_sentiment
+import with_trl.libs_data.lib_asdiv
+import with_trl.libs_data.lib_base
+
+
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
@@ -32,18 +42,18 @@ class DatasetChoices(str, enum.Enum):
 
 
 DATASET_KEY_TO_CLASS = {
-    DatasetChoices.ASDIV: libs_data.lib_asdiv.ASDiv,
-    DatasetChoices.GSM8K: libs_data.lib_gsm8k.GSM8K,
-    DatasetChoices.COMMONSENSEQA_MC: libs_data.lib_commonsense_qa.CommonSenseQAMC,
-    DatasetChoices.SENTIMENT: libs_data.lib_sentiment.SentimentData
+    DatasetChoices.ASDIV:            with_trl.libs_data.lib_asdiv.ASDiv,
+    DatasetChoices.GSM8K:            with_trl.libs_data.lib_gsm8k.GSM8K,
+    DatasetChoices.SENTIMENT:        with_trl.libs_data.lib_sentiment.SentimentData,
+    DatasetChoices.COMMONSENSEQA_MC: with_trl.libs_data.lib_commonsense_qa.CommonSenseQAMC,
 }
 
 
 DATASET_KEY_TO_ANSWER_EXTRACTOR = {
-    DatasetChoices.ASDIV: libs_extraction.lib_numerical,
-    DatasetChoices.GSM8K: libs_extraction.lib_numerical,
-    DatasetChoices.COMMONSENSEQA_MC: libs_extraction.lib_multiple_choice,
-    DatasetChoices.SENTIMENT: None
+    DatasetChoices.ASDIV:            with_trl.libs_extraction.lib_numerical,
+    DatasetChoices.GSM8K:            with_trl.libs_extraction.lib_numerical,
+    DatasetChoices.SENTIMENT:        None,
+    DatasetChoices.COMMONSENSEQA_MC: with_trl.libs_extraction.lib_multiple_choice,
 }
 
 
@@ -80,7 +90,7 @@ def prep_dataset_rl(
     arithmetic_dataset_root_folder_dir: Optional[str],
     extr_arith_ignore_one_line,
     use_curriculum,
-) -> libs_data.lib_base.Dataset:
+) -> with_trl.libs_data.lib_base.Dataset:
     
     split = lib_utils.CVSets(split)
     if answer_only and dataset_name not in {DatasetChoices.COMMONSENSEQA_MC, DatasetChoices.ARITHMETIC}:
@@ -89,7 +99,7 @@ def prep_dataset_rl(
     if dataset_name == DatasetChoices.GSM8K:
         assert not use_few_shots, "n_few_shots must be 0 for GSM8K"
         assert isinstance(LOCAL_RANK, int), type(LOCAL_RANK)
-        dataset = libs_data.lib_gsm8k.GSM8K(
+        dataset = with_trl.libs_data.lib_gsm8k.GSM8K(
             tok_max_query_length=input_max_length,
             any_tokenizer=any_tokenizer,
             device=torch.device(LOCAL_RANK),
@@ -103,7 +113,7 @@ def prep_dataset_rl(
         )
 
     elif dataset_name == DatasetChoices.COMMONSENSEQA_MC:
-        dataset = libs_data.lib_commonsense_qa.CommonSenseQAMC(
+        dataset = with_trl.libs_data.lib_commonsense_qa.CommonSenseQAMC(
             answer_only=answer_only,
             answer_only_path=answer_only_path,
             any_tokenizer=any_tokenizer,
@@ -116,31 +126,32 @@ def prep_dataset_rl(
     elif dataset_name == DatasetChoices.ASDIV:
         raise NotImplementedError
         assert split is None, "split must be None for ASDiv"
-        dataset = libs_data.lib_asdiv.ASDiv(
+        dataset = with_trl.libs_data.lib_asdiv.ASDiv(
             tokenizer=any_tokenizer,
             cache_path="/tmp/asdiv",
         )
 
     elif dataset_name == DatasetChoices.SENTIMENT:
-        dataset = libs_data.lib_sentiment.SentimentData(
+        dataset = with_trl.libs_data.lib_sentiment.SentimentData(
             any_tokenizer=any_tokenizer, 
             split=split,
         )
-
+            
     elif dataset_name == DatasetChoices.ARITHMETIC:
-        dataset = libs_data.lib_arithmetic.Arithmetic(
-            dataset_root_folder_dir = arithmetic_dataset_root_folder_dir,
-            answer_only     = answer_only,
-            any_tokenizer   = any_tokenizer,
-            eos_token       = any_tokenizer.eos_token,
-            pad_token       = any_tokenizer.pad_token,
-            sft_mode        = False,
-            shuffle_once    = False,
-            split           = split,
-            use_few_shots   = True,
-            use_curriculum  = use_curriculum,
+        dataset = with_trl.libs_data.lib_arithmetic.Arithmetic(
+            split                     = split,
+            sft_mode                  = False,
+            eos_token                 = any_tokenizer.eos_token,
+            pad_token                 = any_tokenizer.pad_token,
+            return_idx                = False,
+            answer_only               = answer_only,
+            shuffle_once              = False,
+            any_tokenizer             = any_tokenizer,
+            use_few_shots             = True,
+            use_curriculum            = use_curriculum,
+            use_cached_dataset        = False,
+            dataset_root_folder_dir   = arithmetic_dataset_root_folder_dir,
             extractor_ignore_one_line = extr_arith_ignore_one_line,
-            use_cached_dataset = False,
         )
 
     else:

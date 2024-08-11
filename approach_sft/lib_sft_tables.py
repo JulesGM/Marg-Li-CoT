@@ -1,6 +1,6 @@
 import os
 
-import more_itertools as mi
+import more_itertools as mit
 import rich
 import rich.markup
 import rich.table
@@ -43,9 +43,9 @@ def predict_table(
         local_em_gen,
         local_em_ref,
         pred_tok,
-    ) in mi.take(
+    ) in mit.take(
         qty_print,
-        mi.zip_equal(
+        mit.zip_equal(
             decoded_questions,
             decoded_predictions,
             local_metric_outputs["exact_match"].logging_columns["gen"],  # type: ignore
@@ -64,7 +64,7 @@ def predict_table(
         wandb_and_rich_table.add_row(
             str(epoch),                            # "Epoch"
             rich.markup.escape(escaped_q),         # "Question"
-            rich.markup.escape(escaped_p),         # "Prediction"
+            rich.markup.escape(escaped_p.rstrip(predict_tokenizer.pad_token)), # "Prediction"
             rich.markup.escape(str(local_em_gen)), # "Extracted Gen A"
             rich.markup.escape(str(local_em_ref)), # "Ref A"
             str(p_len),                            # "Qty Toks"
@@ -104,29 +104,40 @@ def batch_table(
     table.add_column("Key", style="green bold")
     table.add_column("Value")
 
-    for batch_key, batch_value in batch.items():  # type: ignore
-        if isinstance(batch_value, torch.Tensor) and (batch_value == -100).any():
-            assert "label" in batch_key, batch_key
+    input_ids = batch["input_ids"]
+    mask = batch["attention_mask"]
 
-        for i, single_sentence in enumerate(mi.take(print_qty, batch_value)):
-            if batch_key == "input_ids":
-                single_sentence = [
-                    x if x != -100 else forward_tokenizer.pad_token_id
-                    for x in single_sentence
-                ]
+    assert len(batch) == 2, batch.keys()
+    assert not (input_ids == -100).any()
 
-                text = forward_tokenizer.decode(
-                    single_sentence, skip_special_tokens=False
-                )
+    for i, (input_id_single, attention_mask_single) in enumerate(mit.take(print_qty, mit.zip_equal(input_ids, mask))):
+        assert isinstance(input_ids, torch.Tensor), type(input_ids)
+        unmasked_inputs = input_id_single[attention_mask_single.bool()]
+        unmasked_inputs = [
+            x if x != -100 else forward_tokenizer.pad_token_id
+            for x in unmasked_inputs
+        ]
 
-            else:
-                text = str(single_sentence)
 
-            table.add_row(
-                f"{rich.markup.escape(batch_key)} - " 
-                + f"{rich.markup.escape(str(i))}",
-                rich.markup.escape(text),
-            )
+        text = rich.markup.escape(forward_tokenizer.decode(
+            unmasked_inputs, skip_special_tokens=False,
+        ))
+
+        for v in forward_tokenizer.special_tokens_map.values():
+            text = text.replace(v, f"[bold blue]{v}[/]")
+
+        table.add_row(
+            f"input_ids - {i}",
+            text,
+        )
+
+    for i, attention_mask_single in enumerate(mit.take(print_qty, mask)):
+        text = str(attention_mask_single)
+
+        table.add_row(
+            f"attention_mask - {i}",
+            rich.markup.escape(text),
+        )
             
 
     if RANK == 0:

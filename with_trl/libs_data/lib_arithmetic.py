@@ -1,3 +1,17 @@
+"""
+August 4th 2024, Jules:
+    Only dataset that is fully ready for TRL ... 
+
+    Supports schedules.
+
+    Supports Few-shot.
+
+    Supports RL and SFT.
+
+    I wish I had separated the RL and SFT codebases completely.
+
+"""
+
 from __future__ import annotations
 import collections
 import enum
@@ -34,17 +48,19 @@ import lib_metric
 import lib_utils
 from libs_extraction import lib_final_line
 from libs_data import lib_base
-from libs_data.arithmetic import arithmetic_10_shot
+from mlc_datasets.arithmetic import arithmetic_10_shot
+
 
 rich.traceback.install(show_locals=True)
 datasets.disable_caching()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-RANK = int(os.getenv("RANK", 0))
-LOCAL_RANK = int(os.getenv("LOCAL_RANK", 0))
+LOGGER     = logging.getLogger(__name__)
+RANK       = int(os.getenv("RANK", 0))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
-LOGGER = logging.getLogger(__name__)
+LOCAL_RANK = int(os.getenv("LOCAL_RANK", 0))
+LOCAL_WORLD_SIZE = int(os.getenv("LOCAL_WORLD_SIZE", 1))
 
 
 def _count_lines(file):
@@ -54,7 +70,7 @@ def _count_lines(file):
         ).split()[0])
 
 
-class TrainModes(enum.Enum):
+class TrainModes(str, enum.Enum):
     RL = "RL"
     SFT = "SFT"
 
@@ -66,9 +82,9 @@ class DSIterator(torch.utils.data.Dataset):
     Sampling makes things complicated.
     
     Init:    
-    Set the index of each curriculum level to 0.
+        Set the index of each curriculum level to 0.
     or
-    Set the index to zero.   
+        Set the index to zero.   
 
     """
 
@@ -160,6 +176,7 @@ class Arithmetic(
             use_cached_dataset: bool,
         ):
 
+        self._few_shot_qty            = 10
         self._return_idx              = return_idx
         self._dataset_root_folder_dir = pathlib.Path(dataset_root_folder_dir)
         del dataset_root_folder_dir
@@ -232,7 +249,9 @@ class Arithmetic(
         
     @property
     def few_shot_text(self) -> str:
-        assert False
+        
+        assert self._use_few_shots, self._use_few_shots
+
         return self._few_shot_text
 
     def _load_cached_rl_mode_dataset(self, hf_dataset_path):
@@ -361,7 +380,6 @@ class Arithmetic(
         return self._max_num_digits
 
     def _prepare_few_shots(self):
-        self._few_shot_qty = 10
 
         few_shots = arithmetic_10_shot.make_few_shots(
             max_digits=self.max_num_digits,

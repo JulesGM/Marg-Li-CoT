@@ -1,50 +1,25 @@
+"""
+Collators need to support three things:
+ - `Question -> Answer` only forward
+ - Chain of thought then answer forward
+ - Have the answer somewhere for evaluation
+
+Arithmetic Causal Masked Collator
+
+"""
+
 import more_itertools as mit
 import numpy as np
 import transformers
-import torch
-
-from with_trl import lib_base_classes
 import approach_sft.lib_sft_constants as lib_sft_constants
 
 
-class EncoderDecoderCollator:
-    def __init__(self, output_type, tokenizer):
-        assert False
-
-        self._output_type = output_type
-        self._tokenizer = tokenizer
-        self._data_collator_base = transformers.DataCollatorForSeq2Seq( # type: ignore
-            tokenizer=tokenizer
-        )
-        raise NotImplementedError("TODO: implement this collator")
-
-    @property
-    def output_type(self):
-        return self._output_type
-
-    @property
-    def tokenizer(self):
-        return self._tokenizer
-
-    def __call__(self, features):
-        output_features = dict(text=features["query"])
-
-        if self.output_type == lib_sft_constants.OutputTypes.ANSWER_ONLY:
-            output_features["labels"] = features["ref_answer"]
-
-        elif (
-            self.output_type
-            == lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER
-        ):
-            output_features["labels"] = features["ref_scratchpad"]
-
-        else:
-            raise self.output_type
-
-        return self._data_collator_base(output_features)
+def pad_to_max(sequence, pad_token):
+    max_length = max(len(seq) for seq in sequence)
+    return [seq + [pad_token] * (max_length - len(seq)) for seq in sequence]
 
 
-class CausalFullCollator:
+class GSM8KCollator:
     def __init__(
         self, 
         *, 
@@ -52,7 +27,6 @@ class CausalFullCollator:
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
         prediction_tokenizer: transformers.PreTrainedTokenizerBase,
     ):
-        assert False
         self._forward_tokenizer = forward_tokenizer
         self._prediction_tokenizer = prediction_tokenizer
         self._output_type = output_type
@@ -66,61 +40,48 @@ class CausalFullCollator:
     def output_type(self):
         return self._output_type
 
-    def __call__(self, features: list[lib_base_classes.DataItemContainer]):
+    def __call__(self, features: list):
         """
         Two main modes:
         - Chain of thought then answer
         - Answer only
         """
-        assert False
 
         if self.output_type == lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER:
-            questions   = [f["ref_qa_question"].strip() for f in features]
-            answers     = [f["ref_qa_answer"].strip() for f in features]
-            choices     = [f["ref_qa_choices"].strip() for f in features]
-
-            generations = [f["output"].strip() for f in features]
-
-            full_query_text = [
-                f"Q: {question}\n" +
-                f"Answer Choices:\n{choice}\n"
-                for question, choice 
-                in mit.zip_equal(questions, choices)
-            ]
+            questions   = [f["ref_qa_question"  ].strip() for f in features]
+            scratchpads = [f["ref_qa_scratchpad"].strip() for f in features]
+            answers     = [f["ref_qa_answer"]    .strip() for f in features]
 
             forward_input_text = [
-                full_query +
-                f"A: {generation}"
-                for full_query, generation 
-                in mit.zip_equal(full_query_text, generations)
+                f"Q: {question}. " +
+                f"Reasoning: {scratchpad}. " +
+                f"A: {answer}"
+                for question, scratchpad, answer
+                in mit.zip_equal(questions, scratchpads, answers)
             ]
 
             predict_input_text = [
-                full_query +
-                "A: "
-                for full_query in full_query_text
+                f"Q: {question}. " +
+                "Reasoning:"
+                for question in questions
             ]
 
         elif self.output_type == lib_sft_constants.OutputTypes.ANSWER_ONLY:
-            questions = [f["ref_qa_question"].strip() for f in features]
-            choices   = [f["ref_qa_choices"].strip() for f in features]
-            answers   = [f["ref_qa_answer"].strip() for f in features]
+            questions   = [f["ref_qa_question"].strip() for f in features]
+            answers     = [f["ref_qa_answer"]  .strip() for f in features]
 
             forward_input_text = [
                 f"Q: {question}\n" +
-                "Answer Choices:\n" +
-                f"{choice}\n" +
                 f"A: {answer}"
-                for question, choice, answer 
-                in mit.zip_equal(questions, choices, answers)
+                for question, answer 
+                in mit.zip_equal(questions, answers)
             ]
+
             predict_input_text = [
                 f"Q: {question}\n" +
-                f"Answer Choices:\n{choice}\n" +
-                "A: "
-                for question, choice in mit.zip_equal(questions, choices)
+                "A:"
+                for question in questions
             ]
-            
         else:
             raise NotImplementedError(self.output_type)
 
@@ -130,26 +91,52 @@ class CausalFullCollator:
             [self._forward_tokenizer.eos_token_id] 
             for forward_input_text in forward_input_text
         ]
+
+        forward_input_ids = self._forward_tokenizer.pad(
+                dict(input_ids=forward_input_ids), 
+                return_tensors="pt",
+            )
+
         predict_input_ids = self._prediction_tokenizer(
-            predict_input_text, padding=True, return_tensors="pt"
+            predict_input_text, 
+            padding=True, 
+            return_tensors="pt"
         )
 
         del forward_input_text
-        assert self._forward_tokenizer.pad_token_id != self._forward_tokenizer.eos_token_id, (
-            "This is bad for training with the language modeling collator. It makes it so "
-            "the eos token is masked for no reason, the model doesn't know when to stop."
-        )
 
-        keys = features[0].keys()
-        return dict(
-            forward=self._forward_tokenizer.pad(dict(input_ids=forward_input_ids), return_tensors="pt"),
+        #######################################################################
+        # Token Checks
+        #######################################################################
+        # For prediction, there should be no EOS in the unmasked input
+        assert not (
+            predict_input_ids["input_ids"][predict_input_ids["attention_mask"] == 1] == 
+            self._prediction_tokenizer.eos_token_id
+        ).any()
+
+        # For forward, there should be exactly one EOS in the unmasked input, and
+        # it should be the last token.
+        for input_ids, attention_mask in mit.zip_equal(
+            forward_input_ids["input_ids"     ],
+            forward_input_ids["attention_mask"],
+        ):
+            is_eos = input_ids[attention_mask.bool()] == self._forward_tokenizer.eos_token_id
+            real_eos_count = (is_eos).sum()
+
+            assert real_eos_count == 1, real_eos_count
+            assert is_eos[-1], is_eos[-1]
+
+        keys = set(features[0].keys())
+        assert "extra_information" in keys, keys
+
+        output = dict(
+            forward=forward_input_ids,
             predict=predict_input_ids,
             extra_info={key: [f[key] for f in features] for key in keys},
         )
 
-def pad_to_max(sequence, pad_token):
-    max_length = max(len(seq) for seq in sequence)
-    return [seq + [pad_token] * (max_length - len(seq)) for seq in sequence]
+        return output
+
 
 class ArithmeticCausalMaskedCollator:
     def __init__(
@@ -175,7 +162,7 @@ class ArithmeticCausalMaskedCollator:
     def output_type(self):
         return self._output_type
 
-    def __call__(self, features: list[lib_base_classes.DataItemContainer]):
+    def __call__(self, features: list):
         """
         Two main modes:
         - Chain of thought then answer
@@ -187,39 +174,39 @@ class ArithmeticCausalMaskedCollator:
         scratchpads = [f["ref_qa_scratchpad"].strip() for f in features]
 
         if self.output_type == lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER:
-            forward_input = [
+            forward_text = [
                 f"{q} = {s}{self._forward_tokenizer.eos_token}"
                 for q, s in 
                 mit.zip_equal(questions, scratchpads)
             ]
 
-            forward_input = self._forward_tokenizer(
-                forward_input, 
+            forward_inputs = self._forward_tokenizer(
+                forward_text, 
                 padding=True,
                 return_offsets_mapping=True,
             )
 
-            pred_inputs = [f"{q} =" for q in questions]
+            pred_text = [f"{q} =" for q in questions]
             pred_inputs = self._forward_tokenizer(
-                pred_inputs, 
+                pred_text, 
                 return_offsets_mapping=True,
             )
 
         elif self.output_type == lib_sft_constants.OutputTypes.ANSWER_ONLY:
-            forward_inputs = [
+            forward_text = [
                 f"{q} = {a}{self._forward_tokenizer.eos_token}"
                 for q, a in 
                 mit.zip_equal(questions, answers)
             ]
 
             forward_inputs = self._forward_tokenizer(
-                forward_inputs, 
+                forward_text, 
                 return_offsets_mapping=True,
             )
 
-            pred_inputs = [f"{q} =" for q in questions]
+            pred_text = [f"{q} =" for q in questions]
             pred_inputs = self._forward_tokenizer(
-                pred_inputs, 
+                pred_text, 
                 return_offsets_mapping=True,
             )
 
@@ -258,19 +245,26 @@ class ArithmeticCausalMaskedCollator:
             raise NotImplementedError(self.output_type)
 
         forward_input_tok = self._forward_tokenizer.pad(
-            dict(input_ids=forward_inputs.input_ids), 
+            dict(
+                input_ids=forward_inputs.input_ids, 
+                attention_mask=forward_inputs.attention_mask,
+            ), 
             return_tensors="pt",
         )
         assert self._forward_tokenizer.eos_token_id is not None, "eos_token_id is None?"
         qty_unmasked_eos = (
             forward_input_tok.input_ids == self._forward_tokenizer.eos_token_id
         ).logical_and(forward_input_tok.attention_mask).sum(-1)
+
+        if not (qty_unmasked_eos == 1).all():
+            breakpoint()
         assert (qty_unmasked_eos == 1).all(), qty_unmasked_eos
 
         predict_input_tok = self._prediction_tokenizer.pad(
             dict(input_ids=pred_inputs.input_ids), 
             return_tensors="pt",
         )
+
         assert self._prediction_tokenizer.eos_token_id is not None, "eos_token_id is None?"
         qty_unmasked_eos = (
             predict_input_tok.input_ids == self._prediction_tokenizer.eos_token_id
@@ -290,9 +284,8 @@ class ArithmeticCausalMaskedCollator:
         keys = features[0].keys()
 
         return dict(
-            forward        = forward_input_tok,
-            # masked_forward = masked_forward,
-            predict        = predict_input_tok,
-            extra_info     = {key: [f[key] for f in features] for key in keys},
+            forward    = forward_input_tok,
+            predict    = predict_input_tok,
+            extra_info = {key: [f[key] for f in features] for key in keys},
         )
 

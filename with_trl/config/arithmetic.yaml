@@ -45,5 +45,5 @@ use_few_shots: True
 dataset_name: arithmetic
 task_name: main
 peft_do_all_lin_layers: False
-arithmetic_dataset_root_folder_dir: "/home/mila/g/gagnonju/marglicot/with_trl/libs_data/arithmetic/"
-answer_only_path: "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/not-cond-on-answers/commonsenseqa.chatgpt"
+arithmetic_dataset_root_folder_dir: "/home/mila/g/gagnonju/marglicot/mlc_datasets/arithmetic/"
+answer_only_path: null

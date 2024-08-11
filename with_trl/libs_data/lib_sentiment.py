@@ -1,3 +1,20 @@
+"""
+
+4th of August, 2024 - Jules: 
+
+    Uses the IMDB dataset internally.
+    
+    NO COT.
+
+    - Few-shot learning:
+        Not supported. Would be easy to add.
+
+    - Curriculum / variable difficulty is not supported. 
+        There is no real difficulty level
+
+    - Interface: Uses lib_base_classes.DataItemContainer.
+"""
+
 import os
 
 

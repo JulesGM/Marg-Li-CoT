@@ -1,3 +1,9 @@
+"""
+
+4th of August, 2024 - Jules: 
+    Commonsense QA. Not used anymore as it was proven that COT doesn't affect the model's performance.
+
+"""
 import logging
 import os
 import pathlib

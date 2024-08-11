@@ -1,5 +1,5 @@
 import accelerate
-import datasets
+import mlc_datasets
 import transformers
 import torch
 
@@ -22,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def make_dataloader(*, tokenizer, batch_size, num_workers):
-    all_data = datasets.load_dataset("gsm8k", "main", split="train")["question"]
+    all_data = mlc_datasets.load_dataset("gsm8k", "main", split="train")["question"]
     return torch.utils.data.DataLoader(
         all_data,
         collate_fn=lambda batch: tokenizer(batch, return_tensors="pt", padding=True),

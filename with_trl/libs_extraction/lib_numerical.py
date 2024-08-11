@@ -4,7 +4,7 @@ import re
 from typing import Optional
 
 import more_itertools
-import text2digits
+from text2digits import text2digits
 
 from with_trl import lib_utils
 from . import lib_base
@@ -21,7 +21,10 @@ class ConvToNum(lib_base.Extractor):
     Keeps internal failure rate statistics.
     
     """
-    def __init__(self, failure_rate_moving_average_window_size: int = 10000):
+    def __init__(
+            self, 
+            failure_rate_moving_average_window_size: int = 10000,
+        ):
         self._failure_rate = lib_utils.MovingAverage(failure_rate_moving_average_window_size)
         self._change_rate = lib_utils.MovingAverage(failure_rate_moving_average_window_size)
         self._no_answer_rate = lib_utils.MovingAverage(failure_rate_moving_average_window_size)
@@ -306,7 +309,9 @@ class ConvToNum(lib_base.Extractor):
         return converted
     
     def __call__(self, text):
-        return more_itertools.last(self.extract_numbers(text), None)
+        return more_itertools.last(
+            self.extract_numbers(text), None
+        )
     
     def compare(self, extracted_answer_a, extracted_answer_b):
         return math.isclose(extracted_answer_a, extracted_answer_b)
