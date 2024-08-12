@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - override /output_type:  answer_only
+
+
+experiment_name: answer_only
+
+dataset_choice: 
+  _args_: ["arithmetic"]
+
+
+train_batch_size:          24
+eval_batch_size:           48

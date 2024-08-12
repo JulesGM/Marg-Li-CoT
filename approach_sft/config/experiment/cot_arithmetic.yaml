@@ -1,0 +1,7 @@
+# @package _global_
+defaults:
+  - override /output_type: chain_of_thought_then_answer
+experiment_name: chain_of_thought_then_answer
+
+dataset_choice: 
+  _args_: ["arithmetic"]

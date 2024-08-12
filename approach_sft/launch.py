@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-#SBATCH --gres=gpu:a100l:1
+#SBATCH --gres=gpu:rtx8000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --job-name="<name>"
@@ -93,6 +93,7 @@ def main(
         "launch",
         "--num_processes", num_processes,
         "--config_file", config_path,
+        "--main_process_port", 29500 + int(os.environ["SLURM_JOB_ID"]) % 2000,
         TARGET_SCRIPT,
         f"run_name={name}",
         f"experiment={experiment}",

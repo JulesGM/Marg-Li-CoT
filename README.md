@@ -8,7 +8,18 @@
 ## With TRL:
 Where the reinforcement learning is located.
 
+
 ## Approach SFT:
 There, one finds the supervised baselines:
 
 - Generate, then learn, masked.
+
+Launch all SFT jobs with 
+
+```bash
+
+cd approach_sft
+./queue_all_jobs.sh
+
+```
+

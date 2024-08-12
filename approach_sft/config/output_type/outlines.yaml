@@ -1,0 +1,8 @@
+max_new_tokens: 300
+
+enum:
+  _target_: lib_sft_constants.OutputTypes
+  value: outlines
+
+train_batch_size:          8
+eval_batch_size:           12

@@ -55,7 +55,7 @@ def main(
     one=False, 
     port=29511,
     config_name=ConfigName.ARITHMETIC, 
-    accelerate_config_file=SCRIPT_DIR / "accelerate_ds_2.yaml",
+    accelerate_config_file=SCRIPT_DIR / "accelerate_ddp_no.yaml",
     overloads=None,
     mixed_precision=None,
     **rest,

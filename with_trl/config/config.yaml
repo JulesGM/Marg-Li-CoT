@@ -1,0 +1,29 @@
+defaults:
+  - _self_
+  - experiment: ???
+  - model: mistral_instruct
+  - peft_config: default
+  - generation_kwargs: default
+  - curriculum_schedule: mixed_zero_one
+  - inference_generation_kwargs: default
+  - ppo_config: default
+  - acc_maintain: default
+
+use_few_shots: ??? # This depends on whether we are using a fine-tuned model or not
+
+
+use_peft: True
+batch_size: ???
+max_epochs: null
+no_training: False
+
+answer_only: False
+answer_only_path: null
+
+precision: float32
+float32_precision_generation: "highest"
+float32_precision_forward_backward: "highest"
+
+peft_do_all_lin_layers: False
+
+reward_type: exact_match

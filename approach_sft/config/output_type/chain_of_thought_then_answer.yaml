@@ -1,0 +1,8 @@
+max_new_tokens: 300
+
+enum:
+  _target_: lib_sft_constants.OutputTypes
+  value: chain_of_thought_then_answer
+
+train_batch_size:          16
+eval_batch_size:           16

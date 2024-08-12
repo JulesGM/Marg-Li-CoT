@@ -82,7 +82,7 @@ CS = lib_trl_utils.CurriculumSchedule
 CE = lib_trl_utils.CurriculumSchedule.CE
 
 
-@hydra.main(config_path="config", config_name="arithmetic", version_base="1.3")
+@hydra.main(config_path="config", config_name="config", version_base="1.3")
 def main(cfg):
     args = omegaconf.OmegaConf.to_object(cfg)
     precision = lib_utils.ValidPrecisions(cfg.precision)  # type: ignore

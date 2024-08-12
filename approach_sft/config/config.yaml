@@ -1,0 +1,73 @@
+# Very problematic
+
+defaults:
+  - _self_
+  - output_type:               null
+  - experiment:                ???
+  - override hydra/hydra_logging:       disabled  
+  - override hydra/job_logging:         disabled  
+  
+dataset_choice: 
+  _target_:                    bin_sft.lib_utils.Datasets
+  _args_:                      ???
+
+data_directory: 
+  _target_:                    bin_sft.repo_path
+  input_path:                  "mlc_datasets/arithmetic"
+
+gen_kwargs:
+  do_sample:                   False
+  min_new_tokens:              1
+  repetition_penalty:          1
+  temperature:                 1
+  use_cache:                   True
+  max_new_tokens:              ${..output_type.max_new_tokens}
+
+lm_mode: 
+  _target_:                    lib_sft_constants.LMModes
+  _args_:                      ["causal_full"]
+
+precision: 
+  _target_:                    lib_utils.ValidPrecisions
+  _args_:                      ["bfloat16"]
+
+peft_config_dict:
+  inference_mode:              False
+  lora_dropout:                0
+  lora_alpha:                  1024
+  r:                           1024
+  bias:                        "none"
+  task_type: 
+    _target_:                      peft.TaskType
+    _args_:                        ["CAUSAL_LM"]
+
+
+save_path:                 /network/scratch/g/gagnonju/marglicot_saves/sft_saves
+
+run_name:                  null
+batch_table_print_qty:     4
+model_name_or_path:        "mistralai/Mistral-7B-Instruct-v0.1" # "susnato/phi-2"
+
+extractor_ignore_one_line: False
+filter_out_bad:            True
+just_device_map:           False
+mask_query:                False
+
+
+max_num_epochs:            100
+learning_rate:             0.0001
+
+
+peft_do_all_lin_layers:    False
+predict_qty_print:         2
+qty_eval_small:            150
+stop_at_line_return:       False
+use_peft:                  True
+wandb_entity:              "julesgm"
+wandb_project_name:        "sft_arithmetic"
+n_batches_predict_train:   50
+use_workers:               False
+
+test_mode:                 False
+
+subset_data:               False

@@ -100,6 +100,7 @@ def get_dataloaders(
     qty_eval_small:            int,
     train_batch_size:          int,
     seed:                      int,
+    subset_data:               str,
     use_workers:               bool,
 ):
     ###########################################################################
@@ -218,6 +219,12 @@ def get_dataloaders(
             dataset =  torch.utils.data.Subset(
                 dataset=dataset,
                 indices=range(qty_eval_small),
+            )
+
+        if subset_data:
+            dataset = torch.utils.data.Subset(
+                dataset=dataset,
+                indices=range(int(subset_data))
             )
 
         sampler = torch.utils.data.distributed.DistributedSampler(

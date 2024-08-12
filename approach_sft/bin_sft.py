@@ -5,15 +5,15 @@ Supervised Trainer.
 """
 import abc
 import collections
-import enum
+import datetime
 import functools
 import itertools as it
 import os
 import pathlib
 import random
 import re
-import sys
 import tempfile
+from typing import Optional
 
 import more_itertools as mit
 import outlines
@@ -33,6 +33,7 @@ import accelerate
 import datasets
 import fire
 import hydra
+import hydra.core.hydra_config
 import git
 import more_itertools as mi
 import numpy as np
@@ -66,6 +67,8 @@ rich.traceback.install(
         markup=True,
     )
 )
+
+torch.set_float32_matmul_precision("high")
 
 random.seed(0)
 np.random.seed(0)
@@ -306,6 +309,7 @@ def step(
     forward_tokenizer: transformers.PreTrainedTokenizerBase,
     mask_query: bool,
     model: peft.peft_model.PeftModelForCausalLM,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
     predict_tokenizer,
     optimizer: torch.optim.Optimizer,
     log: bool,
@@ -342,17 +346,23 @@ def step(
         global_step = global_step
     )
 
+    assert do_train == (optimizer is not None), (
+        do_train, optimizer)
+    
     if do_train:
+        assert optimizer is not None
         assert cv_set == lib_utils.CVSets.TRAIN, cv_set
         accelerator.backward(loss)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
     # Training Logging Logging
     loss_logging = accelerator.gather(loss.detach()).mean() # type: ignore
 
     if RANK == 0 and log:
         wandb.log(
-            {f"{lib_constant.WANDB_NAMESPACE}/{cv_set.value}/loss": loss_logging.item()}, 
+            {f"{cv_set.value}/loss": loss_logging.item()}, 
             step=global_step, 
         )
         
@@ -452,7 +462,7 @@ class Evaluator:
         
         if RANK == 0 and log:
             dict_to_log = {
-                f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/{metric_name}": 
+                f"{self._cv_split.value}/{metric_name}": 
                 np.mean(metric_value) 
                 for metric_name, metric_value in metrics_outputs.items()
             }
@@ -467,26 +477,30 @@ class Evaluator:
             dataloader, 
             epoch_idx, 
             global_step, 
-            model, 
+            model,
             stepper,
         ):
 
         losses = []
         metrics = collections.defaultdict(list)
 
+        # For each batch in eval
         for batch_idx, batch in enumerate(tqdm(
             dataloader, 
             disable = RANK != 0, 
             desc    = "Eval Batches"
         )):
+            # 
             if self._output_type == lib_sft_constants.OutputTypes.OUTLINES:
                 batch = self._outlines_context.outlines_forward(
                     batch=batch,
                 )
+
             assert "forward" in batch, batch.keys()
             assert "predict" in batch, batch.keys()
 
             with torch.no_grad():
+                # Call forward on the batch to compute the cross entropy loss.
                 losses.append(
                     stepper(
                         batch       = batch,
@@ -497,6 +511,7 @@ class Evaluator:
                     ).cpu().item()
                 )
                 
+                # Call predict on the batch, 
                 metrics_outputs = self.evaluate_one(
                         batch             = batch,
                         batch_idx         = batch_idx,
@@ -513,12 +528,12 @@ class Evaluator:
         if RANK == 0:
             assert "loss" not in metrics
             dict_to_log = {
-                f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/{metric_name}": 
+                f"{self._cv_split.value}/{metric_name}": 
                 np.mean(metric_values)
                 for metric_name, metric_values in metrics.items()
             }
             
-            dict_to_log[f"{lib_constant.WANDB_NAMESPACE}/{self._cv_split.value}/loss"] = np.mean(losses)
+            dict_to_log[f"{self._cv_split.value}/loss"] = np.mean(losses)
             wandb.log(dict_to_log, step=global_step)
 
 class ForwardLogger:
@@ -568,21 +583,37 @@ def main(
         cfg.model_name_or_path)
     assert not is_encoder_decoder, "Encoder decoder not supported yet."
     
+    experiment = hydra.core.hydra_config.HydraConfig.get().runtime.choices["experiment"]
+    
+    # Assign a printable timestamp
     if RANK == 0:
-        
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    else:
+        timestamp = None
+    
+    if WORLD_SIZE > 1:
+        container = [None for _ in range(WORLD_SIZE)]
+        torch.distributed.all_gather_object(container, timestamp)
+        timestamp = container[0]
+
+    save_path = pathlib.Path(cfg.save_path) / f"{experiment}-{timestamp}"
+    if RANK == 0:
+        os.makedirs(save_path, exist_ok=False)
+
         wandb_dir_obj = tempfile.TemporaryDirectory()
         wandb_dir = wandb_dir_obj.name
         
         wandb.init(
-            name    = cfg.run_name,
-            project = cfg.wandb_project_name,
-            entity  = cfg.wandb_entity,
-            config  = dict(
+            name     = cfg.run_name,
+            project  = cfg.wandb_project_name,
+            entity   = cfg.wandb_entity,
+            config   = dict(
                 args=omegaconf.OmegaConf.to_container(cfg, resolve=True), 
                 gen_kwargs=cfg.gen_kwargs,
+                save_dir = save_path,
             ),
-            dir     = wandb_dir,
-            mode    = "disabled" if cfg.test_mode else "online",
+            dir      = wandb_dir,
+            mode     = "disabled" if cfg.test_mode else "online",
         )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.model_name_or_path)
@@ -695,14 +726,22 @@ def main(
         qty_eval_small            = cfg.qty_eval_small,
         seed                      = 0,
         train_batch_size          = cfg.output_type.train_batch_size * WORLD_SIZE,
+        subset_data               = cfg.subset_data,
         use_workers               = cfg.use_workers,
+    )
+
+    total_num_steps = len(dataloaders[lib_utils.CVSets.TRAIN]) * cfg.max_num_epochs
+    scheduler = transformers.get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=total_num_steps * 0.1,
+        num_training_steps=len(dataloaders[lib_utils.CVSets.TRAIN]) * cfg.max_num_epochs,
     )
 
     ###########################################################################
     # 🏎️ Accelerator business
     ###########################################################################
     accelerator = accelerate.Accelerator()
-    model, optimizer = accelerator.prepare(model, optimizer)
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
     ###########################################################################
     # 🔁 Main Loop
@@ -753,6 +792,7 @@ def main(
         mask_query        = cfg.mask_query,
         model             = model,
         optimizer         = optimizer,
+        scheduler         = scheduler,
         output_type       = cfg.output_type.enum,
         predict_tokenizer = prediction_tokenizer,
     )
@@ -765,7 +805,8 @@ def main(
         forward_tokenizer = forward_tokenizer,
         mask_query        = cfg.mask_query,
         model             = model,
-        optimizer         = optimizer,
+        optimizer         = None,
+        scheduler         = None,
         output_type       = cfg.output_type.enum,
         predict_tokenizer = prediction_tokenizer,
     )
@@ -775,9 +816,8 @@ def main(
 
         for dataloader_name, dataloader in it.chain(dataloaders.items(), dict(small_eval_dl=small_eval_dl).items()):
             for batch in tqdm(
-                it.islice(dataloader, cfg.test_dataloader_qty,), 
+                dataloader, 
                 desc=f"Testing {dataloader_name}", 
-                total=cfg.test_dataloader_qty,
             ):
                 forward_ids = batch["forward"]["input_ids"]
                 predict_ids = batch["predict"]["input_ids"]
@@ -791,9 +831,6 @@ def main(
                     entry_forward = torch.tensor([x for x in entry_forward if x != forward_tokenizer   .pad_token_id])
                     entry_predict = torch.tensor([x for x in entry_predict if x != prediction_tokenizer.pad_token_id])
                     
-                    if not (entry_forward[:len(entry_predict)] == entry_predict).all():
-                        breakpoint()
-
                     assert (entry_forward[:len(entry_predict)] == entry_predict).all(), (
                         entry_forward, 
                         entry_predict, 
@@ -812,7 +849,7 @@ def main(
     ):
         if RANK == 0:
             wandb.log(
-                {f"{lib_constant.WANDB_NAMESPACE}/epoch": epoch_idx}, 
+                {f"epoch": epoch_idx}, 
                 step=global_step,
             )
 
@@ -821,15 +858,17 @@ def main(
             - Do a number of steps over a training iterator
             - Validate
             - If we had done at least one training step, the 
-              iterator is not done, so the loop should repeat
+                iterator is not done, so the loop should repeat
         """
 
         # Train
         for batch_idx, batch in enumerate(tqdm(
             dataloaders[lib_utils.CVSets.TRAIN],
             disable = RANK != 0, 
-            desc    = "Train Batches",
+            desc    = f"[Epoch {epoch_idx}] Train Batches",
         )):
+            
+            wandb.log(dict(lr=mit.one(optimizer.param_groups)["lr"]), step=global_step)
 
             if cfg.output_type.enum == lib_sft_constants.OutputTypes.OUTLINES:
                 batch = outlines_context.outlines_forward(
@@ -859,43 +898,46 @@ def main(
                         total_num_batches = None,
                     )
         
-            # Do a small eval subset every `cfg.n_batches_predict_train` batches:
-            if batch_idx % cfg.n_batches_predict_train == 0 and batch_idx >= 0:
-                validation_evaluator.evaluate(
-                    global_step = global_step,
-                    dataloader  = small_eval_dl, 
-                    epoch_idx   = epoch_idx,
-                    stepper     = validation_stepper,
-                    model       = model,
-                )
+            # # Do a small eval subset every `cfg.n_batches_predict_train` batches:
+            # if batch_idx % cfg.n_batches_predict_train == 0 and batch_idx >= 0:
+            #     validation_evaluator.evaluate(
+            #         global_step = global_step,
+            #         dataloader  = small_eval_dl, 
+            #         epoch_idx   = epoch_idx,
+            #         stepper     = validation_stepper,
+            #         model       = model,
+            #     )
         
+        ################################################################################
         # End of epoch
+        ################################################################################
         if RANK == 0:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_dir = pathlib.Path(temp_dir)
-                ckpt_path = temp_dir / f"ep_{epoch_idx}_model.pt"
+                ckpt_path = save_path / f"ep_{epoch_idx}_model.pt"
                 torch.save(dict(
                     cfg=omegaconf.OmegaConf.to_container(cfg, resolve=True),
-                    model=model.state_dict(),
                     optimizer=optimizer.state_dict(),
                     epoch=epoch_idx,
                     global_step=global_step,
                     wandb_run_id=wandb.run.id,
                     wandb_url=wandb.run.get_url(),
-                ))
-                wandb.save(str(ckpt_path))
+                ), str(ckpt_path))
+                pretrained_save_dir = save_path / f"ep_{epoch_idx}_model"
+                model.module.save_pretrained(str(pretrained_save_dir))
                 
         accelerator.wait_for_everyone()
 
-    validation_evaluator.evaluate(
-        dataloader  = dataloaders[lib_utils.CVSets.VALID], 
-        epoch_idx   = epoch_idx, 
-        global_step = global_step + 1,
-        model       = model, 
-        stepper     = validation_stepper
-    )
+        validation_evaluator.evaluate(
+            dataloader  = dataloaders[lib_utils.CVSets.VALID], 
+            epoch_idx   = epoch_idx, 
+            global_step = global_step + 1,
+            model       = model, 
+            stepper     = validation_stepper,
+        )
 
-    validation_evaluator.evaluate(
+    ################################################################################
+    # End of training
+    ################################################################################
+    train_evaluator.evaluate(
         dataloader  = dataloaders[lib_utils.CVSets.TRAIN],
         epoch_idx   = epoch_idx,
         global_step = global_step + 1,

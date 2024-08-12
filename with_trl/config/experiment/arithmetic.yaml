@@ -1,0 +1,28 @@
+# @package _global_
+
+
+################################################################################
+# Top Importance
+################################################################################
+batch_size: 16
+
+use_curriculum: True
+input_max_length: 115
+name: "acc_maintain=${acc_maintain}_model_name=${model.model_name}_num_beams=${generation_kwargs.num_beams}"
+value_pretrain_epochs: null
+answer_only_max_length: 15
+
+eval_every: 0
+eval_subset_size: 0
+just_metrics: False
+wandb_project: rl_${dataset_name}
+
+
+################################################################################
+# This should never change
+################################################################################
+use_few_shots: True
+dataset_name: arithmetic
+task_name: main
+
+arithmetic_dataset_root_folder_dir: "/home/mila/g/gagnonju/marglicot/mlc_datasets/arithmetic/"

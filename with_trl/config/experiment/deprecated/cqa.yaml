@@ -1,3 +1,5 @@
+# @package _global_
+
 defaults:
   - _self_
   - generation_kwargs: default
