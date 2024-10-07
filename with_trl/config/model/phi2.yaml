@@ -1,6 +1,6 @@
-model_name: "susnato/phi-2"
-inference_batch_size: 1
-mini_batch_size: 1
-generation_batch_size: 1
+defaults:
+  - model_config
 
-gradient_accumulation_steps: 1
+model_name: "susnato/phi-2"
+
+

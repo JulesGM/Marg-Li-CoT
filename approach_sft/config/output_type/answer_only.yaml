@@ -1,9 +1,7 @@
-max_new_tokens: 20
 
 enum:
   _target_: lib_sft_constants.OutputTypes
   value: answer_only
 
-output_type:
-  train_batch_size:          24
-  eval_batch_size:           48
+train_batch_size:          24
+eval_batch_size:           48

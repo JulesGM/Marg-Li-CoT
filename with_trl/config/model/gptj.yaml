@@ -1,6 +1,8 @@
+defaults:
+  - model_config
+
 model_name: "EleutherAI/gpt-j-6B"
 inference_batch_size: 1
 mini_batch_size: 1
 generation_batch_size: 1
 
-gradient_accumulation_steps: 1

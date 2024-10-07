@@ -125,7 +125,7 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
         # Make checks
         #######################################################################
         generated_texts = responses
-        reference_answer_texts = batch.detok_ref_answer
+        reference_answer_texts = batch["ref_qa_answer"]
 
         assert len(reference_answer_texts) == len(generated_texts), (
             len(reference_answer_texts),

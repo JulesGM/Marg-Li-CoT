@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - override /output_type:  answer_only
+
+
+dataset_choice: 
+  _args_: ["gsm8k"]
+
+
+output_type:
+  train_batch_size:          12
+  eval_batch_size:           24
+  max_length:                127
+
+model_name_or_path: "google/gemma-2-2b"

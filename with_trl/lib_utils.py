@@ -315,6 +315,21 @@ class DictDataset(torch.utils.data.Dataset):
 
     def append(self, dict_) -> None:
 
+        if dict_.keys() != self._dataset.keys():
+            dict_keys = set(dict_.keys())
+            dataset_keys = set(self._dataset.keys())
+            missing_keys_in_call = dataset_keys - dict_keys
+            missing_keys_in_dataset = dict_keys - dataset_keys
+            print(f"{missing_keys_in_call = }")
+            print(f"{missing_keys_in_dataset = }")
+            formatted_mkic = ("\t- " if missing_keys_in_call    else "<None>") + "\n\t- ".join(missing_keys_in_call   )
+            formatted_mkid = ("\t- " if missing_keys_in_dataset else "<None>") + "\n\t- ".join(missing_keys_in_dataset)
+            raise ValueError(
+                f"Keys of the dictionary to append do not match the keys of the dataset.\n\n"
+                f"Missing keys in call   :\n{formatted_mkic}\n\n"
+                f"Missing keys in dataset:\n{formatted_mkid}"
+            )
+
         assert dict_.keys() == self._dataset.keys(), (
             dict_.keys(),
             self._dataset.keys(),
@@ -540,7 +555,7 @@ def compute_and_gather_metrics(
     ###########################################################################
     assert isinstance(response_text, list), type(response_text)
     assert isinstance(response_text[0], str), type(response_text[0])
-    assert isinstance(batch, lib_base_classes.DataListContainer), type(batch)
+    assert isinstance(batch, dict), type(batch)
     assert isinstance(accelerator, accelerate.Accelerator), type(accelerator)
 
     assert isinstance(metrics, dict), type(metrics)
@@ -558,7 +573,7 @@ def compute_and_gather_metrics(
             responses = response_text,
             batch     = batch,
         )
-        assert len(local_metric.values) == len(batch), (
+        assert len(local_metric.values) == len(batch["text_samples"]), (
             len(local_metric.values), 
             len(batch),
         )

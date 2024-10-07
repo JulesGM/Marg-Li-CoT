@@ -154,25 +154,25 @@ def predict(
     #######################################
     metric_outputs = {}
     local_metric_outputs = collections.defaultdict(list)
-    batch_for_metrics = lib_base_classes.DataListContainer(
-        detok_ref_query      = batch["extra_info"]["ref_qa_question"],
-        detok_ref_answer     = batch["extra_info"]["ref_qa_answer"],
-        detok_ref_scratchpad = batch["extra_info"].get("ref_qa_scratchpad", None),
+    # batch_for_metrics = lib_base_classes.DataListContainer(
+    #     detok_ref_query      = batch["extra_info"]["ref_qa_question"],
+    #     detok_ref_answer     = batch["extra_info"]["ref_qa_answer"],
+    #     detok_ref_scratchpad = batch["extra_info"].get("ref_qa_scratchpad", None),
 
-        # tok_ref_query        = None,
-        # tok_ref_answer       = None,
-        # tok_ref_scratchpad   = None,
+    #     # tok_ref_query        = None,
+    #     # tok_ref_answer       = None,
+    #     # tok_ref_scratchpad   = None,
 
-        difficulty_level     = None,
-        extra_information    = None,
-    )
+    #     difficulty_level     = None,
+    #     extra_information    = None,
+    # )
     
     for name, metric in metrics.items():
         #######################################
         # Actually compute metrics
         #######################################
         local_metric_output = metric(
-            batch     = batch_for_metrics,
+            batch     = batch["extra_info"],
             responses = response_text_for_metrics,)
         local_metric_outputs[name] = local_metric_output 
         
@@ -195,7 +195,7 @@ def predict(
             )
         
         lib_sft_tables.predict_table(
-            batch                 = batch_for_metrics,
+            batch                 = batch["extra_info"],
             epoch                 = epoch,
             global_step           = global_step,
             local_metric_outputs  = local_metric_outputs,
@@ -433,6 +433,7 @@ class Evaluator:
         model: peft.peft_model.PeftModelForCausalLM,
         global_step: int,
         total_num_batches: int,
+        wandb_key,
     ):
         # Predict on Training
         lib_sft_tables.batch_table(
@@ -462,7 +463,7 @@ class Evaluator:
         
         if RANK == 0 and log:
             dict_to_log = {
-                f"{self._cv_split.value}/{metric_name}": 
+                f"{wandb_key}/{metric_name}": 
                 np.mean(metric_value) 
                 for metric_name, metric_value in metrics_outputs.items()
             }
@@ -479,6 +480,7 @@ class Evaluator:
             global_step, 
             model,
             stepper,
+            wandb_key,
         ):
 
         losses = []
@@ -520,6 +522,7 @@ class Evaluator:
                         model             = model,
                         log               = False,
                         total_num_batches = len(dataloader),
+                        wandb_key         = wandb_key,
                     )
                 
                 for metrics_name, metrics_values in metrics_outputs.items():
@@ -528,7 +531,7 @@ class Evaluator:
         if RANK == 0:
             assert "loss" not in metrics
             dict_to_log = {
-                f"{self._cv_split.value}/{metric_name}": 
+                f"{wandb_key}/{metric_name}": 
                 np.mean(metric_values)
                 for metric_name, metric_values in metrics.items()
             }
@@ -673,7 +676,7 @@ def main(
         peft_do_all_lin_layers = cfg.peft_do_all_lin_layers,
         precision              = cfg.precision,
         prediction_tokenizer   = prediction_tokenizer,
-        trust_remote_code      = False,
+        trust_remote_code      = True,
         use_peft               = cfg.use_peft,
     ).to(LOCAL_RANK)
 
@@ -813,8 +816,12 @@ def main(
 
 
     if cfg.test_mode:
+        sizes = []
 
-        for dataloader_name, dataloader in it.chain(dataloaders.items(), dict(small_eval_dl=small_eval_dl).items()):
+        for dataloader_name, dataloader in it.chain(
+            dataloaders.items(), 
+            dict(small_eval_dl=small_eval_dl).items(),
+        ):
             for batch in tqdm(
                 dataloader, 
                 desc=f"Testing {dataloader_name}", 
@@ -822,15 +829,29 @@ def main(
                 forward_ids = batch["forward"]["input_ids"]
                 predict_ids = batch["predict"]["input_ids"]
 
+                for mask in batch["forward"]["attention_mask"]:
+                    sizes.append(mask.int().sum())
+
                 assert forward_ids.shape[0] == predict_ids.shape[0], (
-                    f"Shapes do not match: forward_ids.shape={forward_ids.shape}, predict_ids.shape={predict_ids.shape}")
+                    f"Shapes do not match: "
+                    f"forward_ids.shape={forward_ids.shape}, "
+                    f"predict_ids.shape={predict_ids.shape}"
+                )
                 assert forward_ids.shape[1] > predict_ids.shape[1], (
-                    f"Shape mismatch: forward_ids.shape={forward_ids.shape}, predict_ids.shape={predict_ids.shape}")
+                    f"Shape mismatch: "
+                    f"forward_ids.shape={forward_ids.shape}, "
+                    f"predict_ids.shape={predict_ids.shape}"
+                )
                 
                 for entry_forward, entry_predict in mit.zip_equal(forward_ids, predict_ids):
-                    entry_forward = torch.tensor([x for x in entry_forward if x != forward_tokenizer   .pad_token_id])
-                    entry_predict = torch.tensor([x for x in entry_predict if x != prediction_tokenizer.pad_token_id])
-                    
+                    entry_forward = torch.tensor([
+                        x for x in entry_forward 
+                        if x != forward_tokenizer.pad_token_id
+                    ])
+                    entry_predict = torch.tensor([
+                        x for x in entry_predict 
+                        if x != prediction_tokenizer.pad_token_id
+                    ])
                     assert (entry_forward[:len(entry_predict)] == entry_predict).all(), (
                         entry_forward, 
                         entry_predict, 
@@ -838,21 +859,31 @@ def main(
                         prediction_tokenizer.decode(entry_predict),
                     )
 
+        sizes = sorted(sizes)
+        breakpoint()
         exit(0)
 
+    full_valid_wandb_key = "full_valid"
+    small_valid_wandb_key = "small_valid"
+    single_train_wandb_key = "single_train"
+    full_train_wandb_key = "full_train"
 
+    # validation_evaluator.evaluate(
+    #     dataloader  = dataloaders[lib_utils.CVSets.VALID], 
+    #     epoch_idx   = 0, 
+    #     global_step = 0,
+    #     model       = model, 
+    #     stepper     = validation_stepper,
+    #     wandb_key   = full_valid_wandb_key,
+    # )
     global_step = 0
+
     for epoch_idx in tqdm(
         range(cfg.max_num_epochs), 
         disable = RANK != 0, 
         desc    = "Epochs",
     ):
-        if RANK == 0:
-            wandb.log(
-                {f"epoch": epoch_idx}, 
-                step=global_step,
-            )
-
+        
         """
         We want to evaluate every few batches. We:
             - Do a number of steps over a training iterator
@@ -867,8 +898,11 @@ def main(
             disable = RANK != 0, 
             desc    = f"[Epoch {epoch_idx}] Train Batches",
         )):
-            
-            wandb.log(dict(lr=mit.one(optimizer.param_groups)["lr"]), step=global_step)
+            if LOCAL_RANK == 0:
+                wandb.log(dict(
+                    lr=mit.one(optimizer.param_groups)["lr"],
+                    epoch=epoch_idx,
+                ), step=global_step)
 
             if cfg.output_type.enum == lib_sft_constants.OutputTypes.OUTLINES:
                 batch = outlines_context.outlines_forward(
@@ -876,6 +910,7 @@ def main(
                 )
 
             global_step += len(batch["forward"]["input_ids"]) * WORLD_SIZE
+
             training_stepper(
                 batch       = batch,
                 epoch       = epoch_idx,
@@ -896,17 +931,19 @@ def main(
                         model             = model,
                         log               = True,
                         total_num_batches = None,
+                        wandb_key         = single_train_wandb_key,
                     )
         
-            # # Do a small eval subset every `cfg.n_batches_predict_train` batches:
-            # if batch_idx % cfg.n_batches_predict_train == 0 and batch_idx >= 0:
-            #     validation_evaluator.evaluate(
-            #         global_step = global_step,
-            #         dataloader  = small_eval_dl, 
-            #         epoch_idx   = epoch_idx,
-            #         stepper     = validation_stepper,
-            #         model       = model,
-            #     )
+            # Do a small eval subset every `cfg.n_batches_predict_train` batches:
+            if batch_idx % cfg.n_batches_predict_train == 0 and batch_idx >= 0:
+                validation_evaluator.evaluate(
+                    global_step = global_step,
+                    dataloader  = small_eval_dl, 
+                    epoch_idx   = epoch_idx,
+                    stepper     = validation_stepper,
+                    model       = model,
+                    wandb_key   = small_valid_wandb_key,
+                )
         
         ################################################################################
         # End of epoch
@@ -932,6 +969,7 @@ def main(
             global_step = global_step + 1,
             model       = model, 
             stepper     = validation_stepper,
+            wandb_key   = full_valid_wandb_key,
         )
 
     ################################################################################
@@ -943,7 +981,10 @@ def main(
         global_step = global_step + 1,
         model       = model, 
         stepper     = training_stepper,
+        wandb_key   = full_train_wandb_key,
     )
+
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

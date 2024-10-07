@@ -95,7 +95,7 @@ class DSIterator(torch.utils.data.Dataset):
         return_idx: bool, 
         use_few_shots: bool, 
         difficulty_toggles, 
-        seed: int,
+        # seed: int,
         few_show_text: Optional[str],
         few_shot_qty: Optional[int],
     ):
@@ -103,16 +103,17 @@ class DSIterator(torch.utils.data.Dataset):
         self._few_shot_qty = few_shot_qty
         self._return_idx = return_idx
         self._use_few_shots = use_few_shots
-        self._rng = random.Random(seed)
+        # self._rng = random.Random(seed)
         self._difficulty_toggles = difficulty_toggles
         self._use_curriculum = use_curriculum
+        self._ds_all = ds
 
         if use_curriculum:
             self._turned_ons = {k for k, v in self._difficulty_toggles.items() if v}
-            self._ds = list(it.chain(ds[k] for k in self._turned_ons))
-            self._rng.shuffle(self._ds)
+            self._ds_active = list(it.chain(ds[k] for k in self._turned_ons))
+            # self._rng.shuffle(self._ds) # This is not needed if we have a sampler
         else:
-            self._ds = ds
+            self._ds_active = ds
 
     def __len__(self):
         return len(self._ds)
@@ -123,6 +124,7 @@ class DSIterator(torch.utils.data.Dataset):
             value["ref_qa_question"] = (
                 self.make_few_shot_toks() + "\n\n" + "Q: " + value["ref_qa_question"]
             )
+        breakpoint()
         return value
         
     def __iter__(self):
@@ -133,25 +135,59 @@ class DSIterator(torch.utils.data.Dataset):
         Select from a subset of the few-shot examples.
         """
 
-        per_digit = {}
-
         # If we are using curriculum, we select a few from each level
         if self._use_curriculum:
-            proportions = self._curriculum_proportions
+            enabled_difficulities = set(self._curriculum_difficulties)
         else:
-            proportions = {
-                k: 1. / len(self._few_shot_text) for k in self._few_shot_text.keys()
-            }
+            enabled_difficulities = set(self._few_shot_text.keys())
 
-        for num_digits, proportion in proportions.items():
-            rounded_prop = round(self._few_shot_qty * proportion)
-            indices = np.random.permutation(self._few_shot_qty)[:rounded_prop]
-            per_digit[num_digits] = [self._few_shot_text[num_digits][i] for i in indices]
+        # Compute the number of few-shot examples per difficulty.
+        # We start by computing the minimum number of examples per difficulty.
+        # This is just the floored division of the total number of 
+        # examples by the number of difficulties.
+        #
+        # We then add one to the hardest difficulties until we reach the
+        # total number of examples. The reasoning is that if some difficulties 
+        # deserve more examples than others, it is the hardest ones.
+        
+        # Compute the minimum number of examples per difficulty.
+        qty_enabled = len(enabled_difficulities)
+        assert len(enabled_difficulities) <= self._few_shot_qty, (
+            "Did not do the math for this case yet."
+        )
+        minimum_per_difficulties = qty_enabled  // self._few_shot_qty
+        qties_per_difficulty = {k: minimum_per_difficulties for k in enabled_difficulities}
+        
+        # Distribute the remainder to the hardest difficulties, one by one.
+        remainder = qty_enabled % self._few_shot_qty
+        most_to_least_sorted_difficulties = sorted(enabled_difficulities, reverse=True)
+        for difficulty in most_to_least_sorted_difficulties[:remainder]:
+            qties_per_difficulty[difficulty] += 1
 
-        flattened_few_shots = list(it.chain.from_iterable(per_digit.values()))
+        # Make sure we have the right number of examples.
+        empirical_qty = sum(qties_per_difficulty.values())
+        assert empirical_qty == self._few_shot_qty, (
+            empirical_qty, self._few_shot_qty
+        )
+
+        # Extract the appropriate number of examples per difficulty.
+        samples_per_digit = {}
+        for difficulty_index in enabled_difficulities:
+            # split between the enabled digits
+            samples_per_digit[difficulty_index] = [
+                self._few_shot_text[difficulty_index][i] for i in range(
+                    qties_per_difficulty[difficulty_index]
+                )]
+
+        # Flatten the list of samples.
+        flattened_few_shots = list(it.chain.from_iterable(samples_per_digit.values()))
+        
         # Shuffle
         random.shuffle(flattened_few_shots)
         return "\n".join(flattened_few_shots).strip()
+
+    def set_difficulties(self, difficulties):
+        self._difficulty_toggles = difficulties
 
 
 class Arithmetic(
@@ -171,46 +207,47 @@ class Arithmetic(
             sft_mode: bool,
             shuffle_once: bool,
             split: lib_utils.CVSets,
-            use_few_shots: bool,
             use_curriculum: bool,
             use_cached_dataset: bool,
+            use_few_shots: bool,
         ):
 
-        self._few_shot_qty            = 10
-        self._return_idx              = return_idx
+        self._return_idx = return_idx
+        self._answer_only = answer_only # This is handled in the collator.
+        self._eos_token = eos_token
+        self._curriculum = None
+        self._extractor = lib_final_line.FinalLineExtractor(
+            pad_token = pad_token,
+            ignore_one_line = extractor_ignore_one_line,
+        )
+
+        ##############
+        # Find all the files of the dataset.
+        ##############
+        split = lib_utils.CVSets(split)
         self._dataset_root_folder_dir = pathlib.Path(dataset_root_folder_dir)
         del dataset_root_folder_dir
         assert self._dataset_root_folder_dir.exists(), self._dataset_root_folder_dir
-
-        if sft_mode:
-            self._mode = TrainModes.SFT
-        else:
-            self._mode = TrainModes.RL
-        del sft_mode    
-
-        if use_curriculum:
-            assert self._mode != TrainModes.SFT, "sft mode is not compatible with curriculum."
-
-        self._answer_only            = answer_only # This is handled in the collator.
-        self._eos_token              = eos_token
-        self._use_curriculum         = use_curriculum
-        self._curriculum_proportions = None
-
-        self._extractor = lib_final_line.FinalLineExtractor(
-            pad_token=pad_token,
-            ignore_one_line=extractor_ignore_one_line,
-        )
-
-        split = lib_utils.CVSets(split)
         folder = self._dataset_root_folder_dir / f"{split.value}_scratch"
         assert folder.exists(), folder
         assert folder.is_dir(), folder
         glob_pattern = "*.jsonl"
         target_files = list(folder.glob(glob_pattern))
         assert target_files, (glob_pattern, folder, list(folder.iterdir()))
-        
+
+        ##############
+        # Curriculum config:
+        ##############
+        if use_curriculum:
+            assert not sft_mode, ("sft mode is not compatible with curriculum.")
+        self._use_curriculum = use_curriculum
+        # Compute the maximum difficulty level
         self._max_num_digits = max(int(file.stem) for file in target_files)
         
+        ##############
+        # Few-shot settings, & construction.
+        ##############
+        self._few_shot_qty = 10 # Could be a config.
         self._use_few_shots = use_few_shots
         if use_few_shots:
             self._few_shot_text = self._prepare_few_shots()
@@ -218,17 +255,34 @@ class Arithmetic(
             self._few_shot_text = None
 
         #######################################################################
+        # Per-mode load
+        #######################################################################
+        if sft_mode:
+            self._mode = TrainModes.SFT
+        else:
+            self._mode = TrainModes.RL
+        del sft_mode 
+
         if self._mode == TrainModes.SFT:
+            rich.print("[bold blue]SFT MODE[/]")
             self._setup_sft_mode(target_files)
             
         elif self._mode == TrainModes.RL:
+            rich.print("[bold blue]RL MODE[/]")
+            # We cache the dataset to avoid re-tokenizing.
+            # The name of the cache is a function of the tokenizer name.
+            # We convert the tokenizer name to something that can be used in a file-name.
             tok_name = any_tokenizer.name_or_path.replace("/", "_")
+            # We compose the path to the cached dataset. 
             hf_dataset_path = folder / f"{split}_{tok_name}_{self._answer_only}.hf_dataset"
+            # The existence of the file determines if we need to re-cache.
             already_exists = (
-                hf_dataset_path.exists() or 
-                list(hf_dataset_path.parent.glob(hf_dataset_path.name + "*"))
+                # Either the file exists or
+                hf_dataset_path.exists() or  
+                # Files with the name as a prefix exist.
+                list(hf_dataset_path.parent.glob(hf_dataset_path.name + "*")) 
             )
-
+            # We need to rebuild if we don't use the cache or the cache does not exist.
             if not use_cached_dataset or not already_exists:
                 self._prepare_rl_mode_data(target_files, any_tokenizer)
                 if use_cached_dataset:
@@ -249,28 +303,32 @@ class Arithmetic(
         
     @property
     def few_shot_text(self) -> str:
-        
         assert self._use_few_shots, self._use_few_shots
-
         return self._few_shot_text
 
     def _load_cached_rl_mode_dataset(self, hf_dataset_path):
+        """
+        Either load the whole dataset from disk or load the dataset 
+        by difficulty, for the curriculum.
+        """
         if RANK == 0:
             rich.print(f"[green bold]Loading hf_dataset from disk:[/]  {hf_dataset_path}")
         
         if self._use_curriculum:
+            # We load the files and load their content by difficulty.
             self._core = {}
             files = hf_dataset_path.parent.glob(hf_dataset_path.name + "*")
             for file in files:
                 difficulty = int(file.name.rsplit("_", 1)[-1])
                 data = datasets.load_from_disk(file)
                 self._core[difficulty] = lib_base_classes.DataListContainer.from_list_of_items([
-                    lib_base_classes.DataItemContainer(**data) for data in data
+                    lib_base_classes.DataItemContainer(**data) 
+                    for data in data
                 ])
         else:
             self._core = lib_base_classes.DataListContainer.from_list_of_items([
-                lib_base_classes.DataItemContainer(**data) for data in 
-                datasets.load_from_disk(hf_dataset_path)
+                lib_base_classes.DataItemContainer(**data) 
+                for data in datasets.load_from_disk(hf_dataset_path)
             ])
 
 
@@ -279,7 +337,6 @@ class Arithmetic(
             rich.print(f"[green bold]Saving hf_dataset to disk:[/] {hf_dataset_path}")
 
         print("Converting to basic types")
-
         if self._use_curriculum:
             progress = tqdm.tqdm(self._core.items())
             for dificulty_level, difficulty_data  in progress:
@@ -411,7 +468,7 @@ class Arithmetic(
             return_idx         = self._return_idx,
             use_few_shots      = self._use_few_shots,
             difficulty_toggles = difficulty_toggles,
-            seed               = seed,
+            # seed               = seed,
             few_show_text      = self._few_shot_text,
             few_shot_qty       = self._few_shot_qty,
         )

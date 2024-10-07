@@ -46,11 +46,12 @@ class GSM8KCollator:
         - Chain of thought then answer
         - Answer only
         """
+        features = [f[0] for f in features]
 
         if self.output_type == lib_sft_constants.OutputTypes.CHAIN_OF_THOUGHT_THEN_ANSWER:
             questions   = [f["ref_qa_question"  ].strip() for f in features]
             scratchpads = [f["ref_qa_scratchpad"].strip() for f in features]
-            answers     = [f["ref_qa_answer"]    .strip() for f in features]
+            answers     = [f["ref_qa_answer"    ].strip() for f in features]
 
             forward_input_text = [
                 f"Q: {question}. " +

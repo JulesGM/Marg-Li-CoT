@@ -1,5 +1,9 @@
+defaults:
+  - peft_config
+
 bias: "none"
 inference_mode: False
 lora_dropout: 0.
-lora_alpha: 256
-r: 256
+lora_alpha: 128
+r: 128
+task_type: null

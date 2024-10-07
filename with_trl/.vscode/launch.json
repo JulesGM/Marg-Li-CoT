@@ -1,19 +1,28 @@
 {
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "train --one",
-            "type": "python",
+            "name": "with_trl_GSM8K",
+            "type": "debugpy",
             "request": "launch",
-            "module": "accelerate.commands.launch",
+            "program": "bin_main.py",
+            "console": "integratedTerminal",
+            "args": [   
+                "experiment=gsm8k"
+            ]
+        },
+        {
+            "name": "With_trl_PROMPT_FOR_EXPERIMENT",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "bin_main.py",
+            "console": "integratedTerminal",
             "args": [
-                "--num_processes", "1",
-                "--config_file", "/home/mila/g/gagnonju/Marg-Li-CoT/with_trl/accelerate_ddp_no.yaml",
-                "/home/mila/g/gagnonju/Marg-Li-CoT/with_trl/bin_main.py",
-                "test"
-            ], 
-            "console": "integratedTerminal"
-            // "env": {"CUDA_LAUNCH_BLOCKING": "1"}
+                "${command:pickArgs}"
+            ]
         }
     ]
-  }
+}

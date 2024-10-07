@@ -37,14 +37,15 @@ from typing import Any, Optional, Union
 
 import datasets
 import more_itertools
+import numpy as np
 import rich
 import torch
 import torch.utils.data
 import transformers
 
+import lib_utils
 import lib_base_classes
 import libs_extraction.lib_numerical
-import libs_data.lib_base
 
 LOGGER = logging.getLogger(__name__)
 
@@ -58,28 +59,33 @@ def dict_unzip(list_of_dict):
     return {k: [d[k] for d in list_of_dict] for k in keys}
 
 
-class GSM8K:
+class GSM8K(torch.utils.data.Dataset):
     _int_patt = re.compile(r"\-?\d+")
     _eqn_patt = re.compile(r"<<[\(\)0-9\+\-/\*=\.]+>>")
 
     def __init__(
         self,
         *,
+        any_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
+        device: torch.device,
+        ds: Optional[collections.abc.Sequence[str]],
+        few_show_qty: int,
+        
         tok_max_query_length: Optional[int] = None,
         tok_max_answer_length: Optional[int] = None,
         tok_max_total_length: Optional[int] = None,
-        any_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-        device: torch.device,
+
         use_few_shots: bool,
-        few_show_qty: int,
-        ds: Optional[collections.abc.Sequence[str]] = None,
+        
+        cv_set: lib_utils.CVSets,
+        use_curriculum: bool,
     ):
         self._extractor = libs_extraction.lib_numerical.ConvToNum()
         self._output_container: Optional[dict[str, list[Any]]] = None
         
-        self._tok_max_query_length  = tok_max_query_length
+        self._tok_max_query_length = tok_max_query_length
         self._tok_max_answer_length = tok_max_answer_length
-        self._tok_max_total_length  = tok_max_total_length
+        self._tok_max_total_length = tok_max_total_length
 
         self._any_tokenizer = any_tokenizer
         self._device = device
@@ -87,8 +93,17 @@ class GSM8K:
         self._use_few_shots = use_few_shots
         self._few_show_qty = few_show_qty
         self._few_shot_examples = None
+        self._use_curriculum = use_curriculum
+        self._cv_set = cv_set
 
         self._populate_ds(ds)
+
+        if self._use_few_shots:
+            self._select_few_shots()
+
+    @property
+    def use_few_shots(self):
+        return self._use_few_shots
 
     def get_extractor(self):
         return self._extractor
@@ -101,9 +116,20 @@ class GSM8K:
         ######################################################################
         # Parse the original Hugging Face dataset object.
         ######################################################################
-        for idx in range(len(ds)):
-            sample = ds[idx]["question"].strip()
-            scratchpad, answer = ds[idx]["answer"].split("####")
+        ds_len = None
+
+        if isinstance(ds, datasets.Dataset):
+            ds = ds.to_dict()
+        
+        for k, v in ds.items():
+            if ds_len is None:
+                ds_len = len(v)
+            else:
+                assert len(v), {k: len(v) for k, v in ds.items()}
+
+        for idx in range(ds_len):
+            sample = ds["question"][idx].strip()
+            scratchpad, answer = ds["answer"][idx].split("####")
 
             scratchpad = scratchpad.strip()
             answer = answer.strip().replace(",", "")
@@ -137,9 +163,12 @@ class GSM8K:
             for x in self._any_tokenizer(text_answers)["input_ids"] # type: ignore
         ]
 
-        detokenized_ref_queries    = self._any_tokenizer.batch_decode(tokenized_ref_queries    , skip_special_tokens=True)
-        detokenized_ref_answers    = self._any_tokenizer.batch_decode(tokenized_ref_answers    , skip_special_tokens=True)
-        detokenized_ref_scratchpad = self._any_tokenizer.batch_decode(tokenized_ref_scratchpads, skip_special_tokens=True)
+        detokenized_ref_queries = self._any_tokenizer.batch_decode(
+            tokenized_ref_queries, skip_special_tokens=True)
+        detokenized_ref_answers = self._any_tokenizer.batch_decode(
+            tokenized_ref_answers, skip_special_tokens=True)
+        detokenized_ref_scratchpad = self._any_tokenizer.batch_decode(
+            tokenized_ref_scratchpads, skip_special_tokens=True)
         
         LOGGER.info("< Done Tokenizing.")
         
@@ -225,6 +254,9 @@ class GSM8K:
                 self._output_container["difficulty_level" ].append(len(equations))
                 self._output_container["extra_information"].append(dict(equations=equations))
 
+        for k, v in self._output_container.items():
+            assert isinstance(v, list), (k, type(v))
+
         # Check lengths in self._output_container
         first = len(self._output_container["ref_qa_question"])
         for k, v in self._output_container.items():
@@ -245,54 +277,136 @@ class GSM8K:
         )
 
     def __len__(self):
-        return len(self._output_container["ref_qa_question"])  # type: ignore
+        
+        lens = [(k, len(v)) for k, v in self._output_container.items()]
+        first = lens[0][1]
+        assert all(l == first for _, l in lens), lens
 
-    def _get(self, idx_or_slice, use_few_shots):
+        return first
+
+    def _get(self, idx, use_few_shots):
         """
+        Separate function from __get__ to be able to pass `use_few_shots`.
+
         We unzip the dict, then, if use_few_shots is True, we add the few-shot examples.
+
         The few shot examples could vary by example. They don't this time, but this is
         why we have a reference for each element of the batch.
         """
 
-        examples =  {k: v[idx_or_slice] for k, v in self._output_container.items()}
+        examples =  {k: v[idx] for k, v in self._output_container.items()}
 
         if use_few_shots:
+            assert self._few_shot_examples is not None, (
+                f"self._few_shot_examples is None, {self._few_shot_examples = }")
+            assert len(self._few_shot_examples), (
+                f"self._few_shot_examples is len(0), {self._few_shot_examples = }")
+
+            # Add to the example.
             examples["extra_information"] = dict(
                 **examples["extra_information"], 
-                few_shot_examples=[
-                    self._few_shot_examples 
-                    for _ in range(len(examples["ref_qa_question"]))
-                ]
+                few_shot_examples=self._few_shot_examples
             )
 
         return examples
         
-
     def __getitem__(
-        self, idx_or_slice: typing.Union[int, slice]
+        self, idx: typing.Union[int, slice]
     ) -> lib_base_classes.DataItemContainer:
 
         # We use a secondary method, in order to have both a toggelable use_few_shots argument.
         # The "without" version is used to build the few-shot examples in the same way that
         # the "with" examples are built.
 
-        return self._get(idx_or_slice, self._use_few_shots)
+        return self._get(idx, self._use_few_shots), idx
 
+    def _select_few_shots(self):
+        """
+        We select a few shots for each example. The collator 
+        will actually format the few shots in the sample.
+        """
+        assert self._output_container is not None, (
+            f"{self._output_container = }")
 
+        if self._use_curriculum:
+            raise NotImplementedError()
+        
+        # We have to build the few-shot examples.
+        # Collect `self._few_show_qty` examples for each key.
+        
+        output = collections.defaultdict(list)
+        for k, output_container_v in self._output_container.items():
+            output_list = output[k]
+            for i in range(self._few_show_qty):
+                output_list.append(output_container_v[i])
+        
+        # Freeze the default dict.
+        self._few_shot_examples = dict(output.items())
+
+    def post_process_gen_fewshots(
+        self, 
+        raw_gen_outputs: np.ndarray,
+        forward_tokenizer: transformers.PreTrainedTokenizerBase,
+    ):
+
+        decoded = forward_tokenizer.batch_decode(
+            raw_gen_outputs, 
+            skip_special_tokens=True,
+        )
+        
+        outputs = []
+        for line in decoded:
+            final = line.find("Question:")
+
+            if final == -1:
+                final = len(line)
+
+            outputs.append(line[:final].strip())
+
+        tokenized = forward_tokenizer(
+            outputs,
+            return_tensors="pt",
+            padding=True,
+        )["input_ids"]
+        
+
+        return tokenized
 
 
 if __name__ == "__main__":
+    import sys
+    import pathlib
+    SCRIPT_DIR = pathlib.Path(__file__).parent
+    sys.path.append(str(SCRIPT_DIR))
+    sys.path.append(str(SCRIPT_DIR.parent))
+    import lib_data
+    import accelerate
+    
     gsm8k = GSM8K(
-        tok_max_query_length=64,
-        tok_max_answer_length=64,
-        tok_max_total_length=128,
-        any_tokenizer=transformers.AutoTokenizer.from_pretrained("gpt2"),
-        device=torch.device("cpu"),
-        use_few_shots=True,
-        few_show_qty=1,
+        any_tokenizer         = transformers.AutoTokenizer.from_pretrained("gpt2"),
+        cv_set                = lib_utils.CVSets.TRAIN,
+        device                = torch.device("cpu"),
+        ds                    = datasets.load_dataset(
+            split="train",
+            path="gsm8k",
+            name="main",
+        ),
+        few_show_qty          = 10,
+        tok_max_query_length  = 64,
+        tok_max_answer_length = 64,
+        tok_max_total_length  = 128,
+        use_few_shots         = True,
+        use_curriculum        = False,
     )
 
-    import rich
-    rich.print(
-        next(iter(gsm8k))
+    dataloader = torch.utils.data.DataLoader(
+        gsm8k,
+        collate_fn=lib_data.data_item_collator,
+        batch_size=1,
     )
+
+    normal_iterator = iter(dataloader)
+    print(f"{type(normal_iterator) = }")
+
+    batch = next(normal_iterator)
+    print(f"{type(batch) = }")

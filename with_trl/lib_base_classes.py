@@ -39,7 +39,8 @@ class BatchedUnrollReturn:
         # self._raw_response_tensors = raw_response_tensors
 
         self._response_text = any_tokenizer.batch_decode(
-            self.response_tensors, skip_special_tokens=True,
+            self.response_tensors, 
+            skip_special_tokens=True,
         )
 
     @property
@@ -99,10 +100,12 @@ class DataListContainer:
     @classmethod
     def from_list_of_items(cls, list_items):
         list_container = DataListContainer()
-        for item in list_items:
-            assert isinstance(item, DataItemContainer)
-            for k, v in vars(item).items():
-                getattr(list_container, k).append(v)
+        for item, _ in list_items:
+            if not isinstance(item, dict):
+                breakpoint()
+            assert isinstance(item, dict), type(item).mro()
+            for k, v in item.items():
+                list_container[k]  = v
         return list_container
 
     collate = from_list_of_items

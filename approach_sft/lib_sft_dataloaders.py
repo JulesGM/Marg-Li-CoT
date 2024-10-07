@@ -155,11 +155,11 @@ def get_dataloaders(
     
     if dataset_choice == lib_utils.Datasets.GSM8K:
         full_ds = datasets.load_dataset("gsm8k", "main")["train"]
-        gsm8k_splits = full_ds.train_test_split(test_size=0.15, seed=seed)
+        gsm8k_splits = full_ds.train_test_split(test_size=0.05, seed=seed, shuffle=True)
         gsm8k_splits = {
             lib_utils.CVSets.TRAIN: gsm8k_splits["train"], 
-            lib_utils.CVSets.VALID: gsm8k_splits["test"],
-            small_eval_set: gsm8k_splits["test"],
+            lib_utils.CVSets.VALID: gsm8k_splits["test" ],
+            small_eval_set:         gsm8k_splits["test" ],
         }
 
 
@@ -185,9 +185,9 @@ def get_dataloaders(
             
         elif dataset_choice == lib_utils.Datasets.GSM8K:
             dataset = lib_gsm8k.GSM8K(
-                tok_max_query_length  = None,
+                tok_max_query_length  = 115,
                 tok_max_answer_length = None,
-                tok_max_total_length  = None,
+                tok_max_total_length  = 290,
                 ds                    = gsm8k_splits[cv_set],
 
                 any_tokenizer         = forward_tokenizer,
@@ -195,6 +195,9 @@ def get_dataloaders(
 
                 use_few_shots         = False,
                 few_show_qty          = None,
+                
+                cv_set                = cv_set,
+                use_curriculum        = False,
             )
             
         else:

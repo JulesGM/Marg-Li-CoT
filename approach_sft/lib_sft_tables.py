@@ -29,7 +29,7 @@ def predict_table(
 ):
     assert RANK == 0, RANK
 
-    decoded_questions = batch.detok_ref_query
+    decoded_questions = batch["ref_qa_answer"]
     decoded_predictions = predict_tokenizer.batch_decode(predictions)
     assert predictions_batch_obj, predictions_batch_obj
     assert decoded_predictions, decoded_predictions
@@ -110,7 +110,21 @@ def batch_table(
     assert len(batch) == 2, batch.keys()
     assert not (input_ids == -100).any()
 
-    for i, (input_id_single, attention_mask_single) in enumerate(mit.take(print_qty, mit.zip_equal(input_ids, mask))):
+    special_tokens = []
+    for special_token in forward_tokenizer.special_tokens_map.values():
+        if isinstance(special_token, str):
+            special_tokens.append(special_token)
+        elif isinstance(special_token, list):
+            for st in special_token:
+                assert isinstance(st, str), type(st)
+                special_tokens.extend(special_token)
+        else:
+            raise ValueError(special_token)
+
+    for i, (input_id_single, attention_mask_single) in enumerate(
+        mit.take(print_qty, mit.zip_equal(input_ids, mask))
+    ):
+
         assert isinstance(input_ids, torch.Tensor), type(input_ids)
         unmasked_inputs = input_id_single[attention_mask_single.bool()]
         unmasked_inputs = [
@@ -118,12 +132,11 @@ def batch_table(
             for x in unmasked_inputs
         ]
 
-
         text = rich.markup.escape(forward_tokenizer.decode(
             unmasked_inputs, skip_special_tokens=False,
         ))
 
-        for v in forward_tokenizer.special_tokens_map.values():
+        for v in special_tokens:
             text = text.replace(v, f"[bold blue]{v}[/]")
 
         table.add_row(

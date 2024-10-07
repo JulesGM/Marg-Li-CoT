@@ -33,26 +33,32 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 
 def make_eval_dataloader(
     *,
-    subset_size: typing.Optional[int] = None,
+    dataset: torch.utils.data.Dataset,
     accelerator: accelerate.Accelerator,
     batch_size: int,
     collator: typing.Callable,
-    dataset: torch.utils.data.Dataset,
+    subset_size: typing.Optional[int] = None,
 ) -> torch.utils.data.DataLoader:
+    assert dataset
+
+
     if subset_size is not None:
+        assert subset_size > 0, subset_size
         dataset = torch.utils.data.Subset(dataset, range(subset_size))
 
+    def collator_probe(lob):
+        output = collator(lob)
+        return output
+
     dataloader = torch.utils.data.DataLoader(
+        dataset=dataset,
         num_workers=0,
         batch_size=batch_size,
-        collate_fn=collator,
-        dataset=dataset,
+        collate_fn=collator_probe,
         shuffle=False,
     )
 
-    prepared = accelerator.prepare_data_loader(dataloader)
-
-    return prepared
+    return dataloader
 
 
 def make_metric_and_reward_fn(
@@ -148,57 +154,68 @@ class EvalLoop:
         *,
         accelerated_model,
         accelerator: accelerate.Accelerator,
-        batch_size: int,
+        collator: typing.Callable,
         dataset: torch.utils.data.Dataset,
         dataset_type: lib_data.DatasetChoices,
         eval_subset_size: int,
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
-        inference_gen_kwargs: typing.Dict[str, typing.Any],
         metrics,
         prediction_tokenizer: transformers.PreTrainedTokenizerBase,
         reward_fn,
         split: str,
         task_name: lib_utils.Task,
         use_few_shots: bool,
-        metric_exclusion = {f"accuracy_with_{i}_digits" for i in range(5)}
+        batch_size: int,
+        generation_batch_size: int,
+        inference_gen_kwargs: typing.Dict[str, typing.Any],
+        metric_exclusion = frozenset({f"accuracy_with_{i}_digits" for i in range(5)}), # Not mutable
     ):
         
         dataloader = make_eval_dataloader(
             accelerator  = accelerator,
             batch_size   = batch_size,
-            collator     = lib_base_classes.DataListContainer.collate,
+            collator     = collator,
             dataset      = dataset,
             subset_size  = eval_subset_size,
         )
-        wandb_table_keys = tuple(itertools.chain((
-                "call_idx",  "query_end",  "raw_gen", "cleaned_gen", "ref", 
-            ), (f"{metric_name}_extract_gen" for metric_name in metrics 
-            ), (f"{metric_name}_extract_ref" for metric_name in metrics)
-        ))
+        assert dataloader
 
+        wandb_table_keys = tuple(itertools.chain((
+                "call_idx",  
+                "query_end",  
+                # "raw_gen", 
+                "cleaned_gen", 
+                "ref", 
+            ), (
+                f"{metric_name}_extract_gen" for metric_name in metrics 
+            ), (
+                f"{metric_name}_extract_ref" for metric_name in metrics
+            )
+        ))
         wandb_table = lib_utils.WandbTableRepair(
             columns         = wandb_table_keys,
             table_name      = f"us_{split}_EvalLoop",
             wandb_kwargs    = dict(columns=list(wandb_table_keys))
         )
 
-        self._accelerated_model    = accelerated_model
-        self._accelerator          = accelerator
-        self._call_idx             = 0
-        self._dataset_type         = dataset_type
-        self._forward_tokenizer    = forward_tokenizer
-        self._inference_gen_kwargs = inference_gen_kwargs
-        self._metric_exclusion     = metric_exclusion
-        self._metrics              = metrics
-        self._prediction_tokenizer = prediction_tokenizer
-        self._raw_dataset          = unwrap_dataset(dataloader)
-        self._reward_fn            = reward_fn
-        self._set_dataloader       = dataloader
-        self._split                = split
-        self._task_name            = task_name
-        self._use_few_shots        = use_few_shots
-        self._wandb_table          = wandb_table
-        self._wandb_table_keys     = wandb_table_keys
+        self._accelerated_model     = accelerated_model
+        self._accelerator           = accelerator
+        self._call_idx              = 0
+        self._dataset_type          = dataset_type
+        self._forward_tokenizer     = forward_tokenizer
+        self._generation_batch_size = generation_batch_size
+        self._inference_gen_kwargs  = inference_gen_kwargs
+        self._metric_exclusion      = metric_exclusion
+        self._metrics               = metrics
+        self._prediction_tokenizer  = prediction_tokenizer
+        self._raw_dataset           = unwrap_dataset(dataloader)
+        self._reward_fn             = reward_fn
+        self._set_dataloader        = dataloader
+        self._split                 = split
+        self._task_name             = task_name
+        self._use_few_shots         = use_few_shots
+        self._wandb_table           = wandb_table
+        self._wandb_table_keys      = wandb_table_keys
 
         assert use_few_shots is self._raw_dataset.use_few_shots, (
             use_few_shots, self._raw_dataset.use_few_shots)
@@ -218,6 +235,7 @@ class EvalLoop:
             self._set_dataloader.sampler,
             torch.utils.data.sampler.SequentialSampler,
         )
+        assert self._set_dataloader, "Need to first set the dataloader"
 
         with torch.no_grad():
             rewards = []
@@ -236,29 +254,33 @@ class EvalLoop:
                 ############################################################
                 # Unroll
                 ############################################################
+                            
                 output, scores = lib_trl_utils.batched_unroll(
-                    accelerated_model    = self._accelerated_model,
-                    accelerator          = self._accelerator,
-                    dataset_name         = self._dataset_type,
-                    generation_kwargs    = self._inference_gen_kwargs,
-                    post_process_gen_fewshots_fn = 
-                        self._raw_dataset.post_process_gen_fewshots,
-                    prediction_tokenizer = self._prediction_tokenizer,
-                    query_tensors        = batch.tok_ref_query,
-                    task_name            = self._task_name,
-                    use_few_shots        = self._use_few_shots,
+                    accelerated_model            = self._accelerated_model,
+                    accelerator                  = self._accelerator,
+                    forward_tokenizer            = self._forward_tokenizer,
+                    generation_kwargs            = self._inference_gen_kwargs,
+                    post_process_gen_fewshots_fn = self._raw_dataset.post_process_gen_fewshots,
+                    prediction_tokenizer         = self._prediction_tokenizer,
+                    query_tensors                = batch["tok_ref_query"],
+                    task_name                    = self._task_name,
+                    use_few_shots                = self._use_few_shots,
+                    
+                    generation_batch_size        = self._generation_batch_size,
+                    ref_text                     = batch["ref_qa_answer"],
+                    difficulty_levels            = batch["difficulty_level"],
                 )
 
                 ############################################################
                 # Compute & Gather Rewards
                 ############################################################
                 local_batch_rewards: lib_base_classes.RewardOutput = self._reward_fn(
-                    responses=output.response_text,
-                    batch=batch,
+                    responses = output.response_text,
+                    batch     = batch,
                 )
 
                 gathered_batch_rewards = self._accelerator.gather_for_metrics(
-                    tensor=torch.tensor(local_batch_rewards.values).to(
+                    torch.tensor(local_batch_rewards.values).to(
                         self._accelerator.device
                     ),
                 )           
@@ -283,8 +305,12 @@ class EvalLoop:
                         (k, len(v.values)) for k, v in local_metrics.items()
                     )
 
-                idx_in_local_batch = random.randint(0, len(batch.detok_ref_query) - 1)
-                rindex = batch.detok_ref_query[idx_in_local_batch].rindex("Q:")
+                idx_in_local_batch = random.randint(0, len(batch["tok_ref_query"]) - 1)
+                # rindex = batch["ref_qa_query"][idx_in_local_batch].rindex("Q:")
+                # assert False, "rindex Q is fucked, maybe give datasets a way "
+                # This is just for logging.. but it's nice. Require that datasets provide a "start of question sequence"?
+                # Or .. a query without the few shots
+                
 
                 sub_metric_gen = {
                     f"{metric_name}_extract_gen": 
@@ -305,9 +331,8 @@ class EvalLoop:
                 table_information.append(dict(
                     call_idx    = str(self._call_idx),
                     cleaned_gen = str(output.response_text    [idx_in_local_batch]),
-                    raw_gen     = str(output.raw_response_text[idx_in_local_batch]),
-                    query_end   = str(batch.detok_ref_query   [idx_in_local_batch][rindex:]),
-                    ref         = str(batch.detok_ref_answer  [idx_in_local_batch]),
+                    query_end   = str(batch["ref_qa_question"][idx_in_local_batch]),
+                    ref         = str(batch["ref_qa_answer"  ][idx_in_local_batch]),
                 ) | sub_metric_gen | sub_metric_ref)
             
             ############################################################
@@ -354,7 +379,7 @@ class EvalLoop:
                         })
 
                     else:
-                        if metric_values:
+                        if metric_values is not None and len(metric_values) > 0:
                             metrics_mean.update({
                                 f"{metric_name}-mean": 
                                 metric_values.mean().item(),
@@ -378,5 +403,5 @@ class EvalLoop:
                     f"{lib_constant.WANDB_NAMESPACE}_{self._split.value}/{k}": 
                     v for k, v in to_log.items()
                 }
-                wandb.log(to_log, global_step=global_step)
+                wandb.log(to_log, step=global_step)
 
