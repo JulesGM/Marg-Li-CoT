@@ -1,0 +1,8 @@
+defaults:
+  - model_config
+
+model_name: "Qwen/Qwen2.5-1.5B"
+
+
+we_pretrained_it: False
+adapter_path: None

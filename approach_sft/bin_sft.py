@@ -8,6 +8,7 @@ import collections
 import datetime
 import functools
 import itertools as it
+import logging
 import os
 import pathlib
 import random
@@ -15,29 +16,26 @@ import re
 import tempfile
 from typing import Optional
 
-import more_itertools as mit
-import outlines
-import outlines.generate
-import outlines.models
-import outlines.models.transformers
-import outlines.samplers
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
 os.environ["DATASETS_VERBOSITY"] = "warning"
 # os.environ["WANDB_SILENT"] = "true"
 os.environ["NCCL_DEBUG"] = "WARN"
 
-import logging
 
 import accelerate
 import datasets
-import fire
 import hydra
 import hydra.core.hydra_config
 import git
-import more_itertools as mi
+import more_itertools as mit
 import numpy as np
 import omegaconf
+import outlines
+import outlines.generate
+import outlines.models
+import outlines.models.transformers
+import outlines.samplers
 import peft
 import rich
 import rich.console
@@ -48,22 +46,25 @@ import torch.backends
 import torch.backends.cuda
 import torch.utils
 import torch.utils.data
+from tqdm import tqdm
 import transformers
 import transformers.utils
 import wandb
-from tqdm import tqdm
-from with_trl import (lib_base_classes, lib_constant, lib_metric,
-                      lib_trl_utils, lib_utils)
-from with_trl.libs_extraction import lib_final_line, lib_multiple_choice
 
-from approach_sft import (lib_sft_constants, lib_sft_dataloaders,
-                          lib_sft_tables, lib_sft_utils)
+from approach_sft import lib_sft_constants
+from approach_sft import lib_sft_dataloaders
+from approach_sft import lib_sft_tables
+from approach_sft import lib_sft_utils
+from with_trl import lib_base_classes
+from with_trl import lib_metric
+from with_trl import lib_trl_utils
+from with_trl import lib_utils
+from with_trl.libs_extraction import lib_final_line
+from with_trl.libs_extraction import lib_numerical
 import lib_sft_multi_regexes
 
 rich.traceback.install(
     console=rich.console.Console(
-        force_terminal=True, 
-        force_interactive=True, 
         markup=True,
     )
 )
@@ -95,14 +96,11 @@ REPO_ROOT = pathlib.Path(git.Repo(
 ).working_tree_dir)
 
 
-
 def repo_path(input_path):
     """ Helper for Hydra """
     return REPO_ROOT / input_path
 
 
-
-########################################################################
 def empty_cache(accelerator):
     accelerator.wait_for_everyone()
     torch.cuda.empty_cache()
@@ -134,11 +132,13 @@ def predict(
     )
     model.eval()
     query_seq_len = query["input_ids"].shape[1]
-    
-    predictions = accelerator.unwrap_model(model).generate(
+
+    question_and_predictions = accelerator.unwrap_model(model).generate(
         **query.to(accelerator.local_process_index), 
         **gen_kwargs
-    )[:, query_seq_len:]
+    )
+
+    predictions = question_and_predictions[:, query_seq_len:]
 
     response_text_for_metrics = predict_tokenizer.batch_decode(
         predictions, 
@@ -153,27 +153,16 @@ def predict(
     # and the containers for the outputs
     #######################################
     metric_outputs = {}
-    local_metric_outputs = collections.defaultdict(list)
-    # batch_for_metrics = lib_base_classes.DataListContainer(
-    #     detok_ref_query      = batch["extra_info"]["ref_qa_question"],
-    #     detok_ref_answer     = batch["extra_info"]["ref_qa_answer"],
-    #     detok_ref_scratchpad = batch["extra_info"].get("ref_qa_scratchpad", None),
-
-    #     # tok_ref_query        = None,
-    #     # tok_ref_answer       = None,
-    #     # tok_ref_scratchpad   = None,
-
-    #     difficulty_level     = None,
-    #     extra_information    = None,
-    # )
-    
+    local_metric_outputs = collections.defaultdict(list)   
     for name, metric in metrics.items():
         #######################################
         # Actually compute metrics
         #######################################
         local_metric_output = metric(
             batch     = batch["extra_info"],
-            responses = response_text_for_metrics,)
+            responses = response_text_for_metrics,
+        )
+
         local_metric_outputs[name] = local_metric_output 
         
         #######################################
@@ -208,12 +197,17 @@ def predict(
         )
     
     empty_cache(accelerator)
-    return metric_outputs
+    return metric_outputs, dict(
+        text_response=response_text_for_metrics,
+        text_query=predict_tokenizer.batch_decode(
+            batch["predict"]["input_ids"],
+        )
+    )
 
 
 def iter_all_equal(iterable, key):
     iterator = iter(iterable)
-    first = mi.first(iterator)
+    first = mit.first(iterator)
     return all(key(x) == key(first) for x in iterator)
 
 
@@ -392,6 +386,7 @@ class Evaluator:
         predict_qty_print: int,
         output_type,
         outlines_context,
+        save_dir,
     ):
         
         self._outlines_context      = outlines_context
@@ -405,6 +400,7 @@ class Evaluator:
         self._prediction_tokenizer  = prediction_tokenizer
         self._predict_qty_print     = predict_qty_print
         self._output_type           = output_type
+        self._save_dir              = save_dir
         
         if RANK == 0:
             rich_kwargs = dict(show_lines = True, title = f"{cv_split.value} - Predictions")
@@ -434,6 +430,7 @@ class Evaluator:
         global_step: int,
         total_num_batches: int,
         wandb_key,
+        
     ):
         # Predict on Training
         lib_sft_tables.batch_table(
@@ -447,7 +444,7 @@ class Evaluator:
             num_epochs        = self._max_num_epochs,
         )
 
-        metrics_outputs = predict(
+        metrics_outputs, text_outputs = predict(
             accelerator       = self._accelerator,
             batch             = batch,
             epoch             = epoch_idx,
@@ -470,7 +467,7 @@ class Evaluator:
 
             wandb.log(dict_to_log, step=global_step)
         
-        return metrics_outputs
+        return metrics_outputs, text_outputs
         
     def evaluate(
             self, 
@@ -481,6 +478,7 @@ class Evaluator:
             model,
             stepper,
             wandb_key,
+            is_intra_epoch,
         ):
 
         losses = []
@@ -514,7 +512,7 @@ class Evaluator:
                 )
                 
                 # Call predict on the batch, 
-                metrics_outputs = self.evaluate_one(
+                metrics_outputs, text_outputs = self.evaluate_one(
                         batch             = batch,
                         batch_idx         = batch_idx,
                         epoch_idx         = epoch_idx,
@@ -571,7 +569,13 @@ OUTLINES_CLASSES = {
 def main(
     cfg: omegaconf.DictConfig,
 ):
+
+    PROC_ID = os.getpid()
+    print(f"({PROC_ID}) ({__name__}) RANK={RANK}, LOCAL_RANK={LOCAL_RANK}, WORLD_SIZE={WORLD_SIZE}")
+    assert not cfg.just_device_map
+
     cfg = hydra.utils.instantiate(cfg)
+    accelerator = accelerate.Accelerator()
 
     # We convert the enums to their values so they can be displayed in wandb.
     # for k, v in args.items():
@@ -622,15 +626,6 @@ def main(
     tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # if cfg.dataset_choice == lib_utils.Datasets.COMMONSENSE_QA:
-    #     metrics = dict(
-    #         exact_match=lib_metric.ScratchpadAnswerAccuracy(
-    #             lib_multiple_choice.MultipleChoiceRfindExtractor(
-    #                 ["(A)", "(B)", "(C)", "(D)", "(E)"]),
-    #             pad_token=tokenizer.pad_token,
-    #         ),
-    #     )
-
     if cfg.dataset_choice == lib_utils.Datasets.ARITHMETIC:
         metrics = dict(
             exact_match = lib_metric.ScratchpadAnswerAccuracy(
@@ -642,12 +637,15 @@ def main(
             )
         )
     elif cfg.dataset_choice == lib_utils.Datasets.GSM8K:
-        from with_trl.libs_extraction import lib_numerical
         metrics = dict(
             exact_match = lib_metric.ScratchpadAnswerAccuracy(
                 extractor=lib_numerical.ConvToNum(),
                 pad_token=tokenizer.pad_token,
             )
+        )
+    elif cfg.dataset_choice == lib_utils.Datasets.MATH:
+        metrics = dict(
+            exact_match = lib_metric.HendrycksMathScratchpadAnswerAccuracy()
         )
     else:
         raise NotImplementedError(cfg.dataset_choice)
@@ -678,6 +676,8 @@ def main(
         prediction_tokenizer   = prediction_tokenizer,
         trust_remote_code      = True,
         use_peft               = cfg.use_peft,
+        we_pretrained_it       = False, # This is for RL, when using a model we trained.
+        adapter_path           = None,
     ).to(LOCAL_RANK)
 
     if RANK == 0:
@@ -743,16 +743,14 @@ def main(
     ###########################################################################
     # 🏎️ Accelerator business
     ###########################################################################
-    accelerator = accelerate.Accelerator()
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
     ###########################################################################
     # 🔁 Main Loop
     ###########################################################################
-    train_evaluator = Evaluator(
+    evaluator_shared_args = dict(
         accelerator           = accelerator,
         batch_table_print_qty = cfg.batch_table_print_qty,
-        cv_split              = lib_utils.CVSets.TRAIN,
         forward_tokenizer     = forward_tokenizer,
         gen_kwargs            = cfg.gen_kwargs,
         max_num_epochs        = cfg.max_num_epochs,
@@ -761,20 +759,17 @@ def main(
         predict_qty_print     = cfg.predict_qty_print,
         output_type           = cfg.output_type.enum,
         outlines_context      = outlines_context,
+        save_dir              = save_path,
+    )
+    
+    train_evaluator = Evaluator(
+        cv_split              = lib_utils.CVSets.TRAIN,
+        **evaluator_shared_args,   
     )
 
     validation_evaluator = Evaluator(
-        accelerator           = accelerator,
-        batch_table_print_qty = cfg.batch_table_print_qty,
         cv_split              = lib_utils.CVSets.VALID,
-        forward_tokenizer     = forward_tokenizer,
-        gen_kwargs            = cfg.gen_kwargs,
-        max_num_epochs        = cfg.max_num_epochs,
-        metrics               = metrics,
-        prediction_tokenizer  = prediction_tokenizer,
-        predict_qty_print     = cfg.predict_qty_print,
-        output_type           = cfg.output_type.enum,
-        outlines_context      = outlines_context,
+        **evaluator_shared_args,
     )
     
     train_forward_logger = ForwardLogger(
@@ -860,7 +855,6 @@ def main(
                     )
 
         sizes = sorted(sizes)
-        breakpoint()
         exit(0)
 
     full_valid_wandb_key = "full_valid"
@@ -919,20 +913,20 @@ def main(
                 do_train    = True,
             )
 
-            # Eval just one batch every 10 samples:
-            if batch_idx % 10 == 0:
-                with torch.no_grad():
-                    model.eval()
-                    train_evaluator.evaluate_one(
-                        batch             = batch,
-                        batch_idx         = batch_idx,
-                        epoch_idx         = epoch_idx,
-                        global_step       = global_step,
-                        model             = model,
-                        log               = True,
-                        total_num_batches = None,
-                        wandb_key         = single_train_wandb_key,
-                    )
+            # # Eval just one batch every 10 samples:
+            # if batch_idx % cfg == 0:
+            #     with torch.no_grad():
+            #         model.eval()
+            #         train_evaluator.evaluate_one(
+            #             batch             = batch,
+            #             batch_idx         = batch_idx,
+            #             epoch_idx         = epoch_idx,
+            #             global_step       = global_step,
+            #             model             = model,
+            #             log               = True,
+            #             total_num_batches = None,
+            #             wandb_key         = single_train_wandb_key,
+            #         )
         
             # Do a small eval subset every `cfg.n_batches_predict_train` batches:
             if batch_idx % cfg.n_batches_predict_train == 0 and batch_idx >= 0:
@@ -943,23 +937,28 @@ def main(
                     stepper     = validation_stepper,
                     model       = model,
                     wandb_key   = small_valid_wandb_key,
+                    is_intra_epoch = True,
                 )
         
         ################################################################################
         # End of epoch
         ################################################################################
         if RANK == 0:
-                ckpt_path = save_path / f"ep_{epoch_idx}_model.pt"
+                ckpt_dir = save_path / str(epoch_idx)
+                ckpt_dir.mkdir(exist_ok=False)
+
                 torch.save(dict(
-                    cfg=omegaconf.OmegaConf.to_container(cfg, resolve=True),
+                    cfg=cfg,
                     optimizer=optimizer.state_dict(),
                     epoch=epoch_idx,
                     global_step=global_step,
                     wandb_run_id=wandb.run.id,
                     wandb_url=wandb.run.get_url(),
-                ), str(ckpt_path))
-                pretrained_save_dir = save_path / f"ep_{epoch_idx}_model"
-                model.module.save_pretrained(str(pretrained_save_dir))
+                ), str(ckpt_dir / "meta_info.pt"))
+                
+                forward_tokenizer.save_pretrained(ckpt_dir / "forward_tokenizer")
+                prediction_tokenizer.save_pretrained(ckpt_dir / "prediction_tokenizer")
+                model.module.save_pretrained(str(ckpt_dir / "model"))
                 
         accelerator.wait_for_everyone()
 
@@ -970,19 +969,8 @@ def main(
             model       = model, 
             stepper     = validation_stepper,
             wandb_key   = full_valid_wandb_key,
+            is_intra_epoch = False,
         )
-
-    ################################################################################
-    # End of training
-    ################################################################################
-    train_evaluator.evaluate(
-        dataloader  = dataloaders[lib_utils.CVSets.TRAIN],
-        epoch_idx   = epoch_idx,
-        global_step = global_step + 1,
-        model       = model, 
-        stepper     = training_stepper,
-        wandb_key   = full_train_wandb_key,
-    )
 
     wandb.finish()
 

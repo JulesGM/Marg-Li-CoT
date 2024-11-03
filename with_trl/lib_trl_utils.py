@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import enum
 import itertools
+import json
 import math
 import os
 import pathlib
@@ -520,8 +521,8 @@ def keep_good_one_generation(
         f"At least one good ratio: {at_least_one_good:0.2%}"
     )
 
-    if RANK == 0:
-        rich.print(table)
+    # if RANK == 0:
+    #     # rich.print(table)
 
     selections = torch.tensor(selections)
     assert selections.shape == (batch_size,), f"{selections.shape = } {batch_size = }"
@@ -675,6 +676,8 @@ def load_then_peft_ize_model(
     prediction_tokenizer: transformers.PreTrainedTokenizer,
     trust_remote_code: bool,
     use_peft: bool,
+    we_pretrained_it: bool,
+    adapter_path: Optional[str],
 ):
     
     if use_peft:
@@ -688,6 +691,7 @@ def load_then_peft_ize_model(
     ###########################################################################
     if use_peft:
         assert lora_config.task_type == peft.TaskType.CAUSAL_LM, lora_config.task_type
+        
     transformers_cls = transformers.AutoModelForCausalLM  # type: ignore
 
     ###########################################################################
@@ -699,8 +703,12 @@ def load_then_peft_ize_model(
     
     extra_args = {}
     if model_name.startswith("google/gemma-2-2b"):
-        extra_args["attn_implementation"] = "eager"
-
+        # extra_args["attn_implementation"] = "eager"
+        extra_args["attn_implementation"] = "flash_attention_2"
+    else:
+        # sanity check
+        assert not "gemma" in model_name, model_name
+    
     pretrained_model = transformers_cls.from_pretrained(
         model_name,
         device_map="auto" if just_device_map else None,
@@ -710,6 +718,14 @@ def load_then_peft_ize_model(
         trust_remote_code=trust_remote_code,
         **extra_args,
     )
+
+    if we_pretrained_it:
+        pretrained_model = peft.PeftModel.from_pretrained(
+            pretrained_model,
+            model_id=adapter_path,
+        )
+        pretrained_model.merge_and_unload()
+
     assert not just_device_map or all(
         x.device.type == "cuda" 
         for x in pretrained_model.parameters()
@@ -773,6 +789,11 @@ def load_then_peft_ize_model(
     return pretrained_model
 
 def load_tokenizers(model_name):
+    
+    if pathlib.Path(model_name).exists() and pathlib.Path(model_name).is_dir():
+        with open(pathlib.Path(model_name) / "adapter_config.json") as f:
+            model_name = json.load(f)["base_model_name_or_path"]
+
     prediction_tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_name, padding_side="left")
     forward_tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -870,6 +891,8 @@ def init_model(
     precision,
     trust_remote_code,
     use_peft: bool,
+    adapter_path: typing.Optional[str | pathlib.Path],
+    we_pretrained_it: bool,
 ) -> tuple[
     typing.Union[
         trl.models.AutoModelForCausalLMWithValueHead,
@@ -924,6 +947,8 @@ def init_model(
         prediction_tokenizer   = prediction_tokenizer,
         trust_remote_code      = trust_remote_code,
         use_peft               = use_peft,
+        we_pretrained_it       = we_pretrained_it,
+        adapter_path           = adapter_path,
     )
 
     model = trl.AutoModelForCausalLMWithValueHead.from_pretrained(
@@ -1110,8 +1135,8 @@ def _display_table_return_sequences(
                 str(val).strip(),
             )
     
-        if RANK == 0:
-            rich.print(table)
+        # if RANK == 0:
+        #     rich.print(table)
 
 
 def fix_sequence_scores(*, model_outputs, prediction_tokenizer):
@@ -1193,36 +1218,46 @@ def validate_responses(*, responses, prediction_tokenizer):
 
 def remove_prompt_and_padding(
         *,
-        outputs,
         tokenized,
         model_outputs,
         prediction_tokenizer: transformers.PreTrainedTokenizerBase,
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
         fn_fix_few_shots: Optional[typing.Callable],
-    ) -> None:
+    ) -> dict[str, list]:
+
+    outputs = collections.defaultdict(list)
 
     model_outputs = {
-        k: v.detach().cpu() 
+        k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
         for k, v in model_outputs.items() 
         if not isinstance(v, tuple)
     }
     
+    ###########################################################################
     # Remove the prompt.
+    ###########################################################################
     # They all have the same prompt, ,so we can just cut the first 
     # `query_len` tokens.
     query_len = tokenized["input_ids"].shape[1]
     raw_sequences = model_outputs["sequences"]
     model_outputs["sequences"] = model_outputs["sequences"][:, query_len:]
 
+    ###########################################################################
+    # Fix the few shots.
+    ###########################################################################
     if fn_fix_few_shots:
         model_outputs["sequences"] = fn_fix_few_shots(
+            input_ids=tokenized["input_ids"],
             raw_gen_outputs=model_outputs["sequences"],
             forward_tokenizer=forward_tokenizer,
         )
 
+    ###########################################################################
     # Remove the padding
-    assert model_outputs["sequences"], model_outputs.keys()
+    ###########################################################################
+    assert len(model_outputs["sequences"]), model_outputs.keys()
     masks = model_outputs["sequences"] == prediction_tokenizer.pad_token_id
+    
     for id_in_sub_batch in range(len(masks)):
         mask = masks[id_in_sub_batch]
         seq = model_outputs["sequences"][id_in_sub_batch]
@@ -1252,13 +1287,12 @@ def remove_prompt_and_padding(
 
         if not len(new_seq) > 1:
             decoded_new_seq = prediction_tokenizer.decode(new_seq)
-            decoded_raw_sequences = prediction_tokenizer.batch_decode(raw_sequences)
-            breakpoint()
-        else:
+            decoded_raw_sequences = prediction_tokenizer.decode(raw_sequences[id_in_sub_batch])
+
+        if len(new_seq) > 1:
             assert new_seq[-2] != prediction_tokenizer.pad_token_id, (
                 new_seq[-2], prediction_tokenizer.pad_token_id,)
     
-
         # There sould be a total of 1 eos/pad tokens at most.
         qty_eos_tokens = (
             new_seq == prediction_tokenizer.eos_token_id
@@ -1266,6 +1300,7 @@ def remove_prompt_and_padding(
 
         assert qty_eos_tokens <= 1, (new_seq, prediction_tokenizer.eos_token_id,)
 
+        # Shorten everything by how much we cut.
         for key, value in model_outputs.items():
             assert key in {"sequences", "sequences_scores", "beam_indices"}, key
             sample = value[id_in_sub_batch]
@@ -1290,6 +1325,8 @@ def remove_prompt_and_padding(
                     )
                 )
 
+    return dict(outputs)
+
 
 def batched_unroll(
     *,
@@ -1298,7 +1335,7 @@ def batched_unroll(
     ref_text: list[str],
     difficulty_levels,
     generation_kwargs: dict[str, typing.Any],
-    generation_batch_size,
+    generation_batch_size: int,
     post_process_gen_fewshots_fn,
     prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
     forward_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
@@ -1370,9 +1407,6 @@ def batched_unroll(
         #######################################################################
         # Generate the sequences
         #######################################################################
-        assert generation_batch_size == 1, (
-            f"Not tested with larger batch sizes. Likely breaks.")
-
         tokenized = prediction_tokenizer.pad(
             dict(input_ids=query_tensors[i : i + generation_batch_size]),
             return_tensors="pt",
@@ -1388,6 +1422,10 @@ def batched_unroll(
             output_scores           = True,
             pad_token_id            = prediction_tokenizer.pad_token_id,
         )
+
+        expected_num_sequences = len(tokenized["input_ids"]) * generation_kwargs["num_return_sequences"]
+        assert model_outputs["sequences"].shape[0] == expected_num_sequences, (
+            model_outputs["sequences"].shape, len(tokenized["input_ids"]), generation_kwargs["num_return_sequences"])
         
         model.train(is_training_pre_gen)
         model_outputs = dict(**model_outputs) # ?
@@ -1400,14 +1438,18 @@ def batched_unroll(
         # Remove the prompt & padding (keep an EOS token).
         #######################################################################
         # Acts in place
-        remove_prompt_and_padding(
-            outputs              = outputs,
+        partial_outputs = remove_prompt_and_padding(
+
             tokenized            = tokenized,
             model_outputs        = model_outputs,
             prediction_tokenizer = prediction_tokenizer,
             forward_tokenizer    = forward_tokenizer,
             fn_fix_few_shots     = post_process_gen_fewshots_fn if use_few_shots else None,
         )
+
+        for key, value in partial_outputs.items():
+            assert len(value) == expected_num_sequences, (key, len(value), expected_num_sequences)
+            outputs[key].extend(value)
 
     ###########################################################################
     # Place things in an array with the shape:
@@ -1458,7 +1500,6 @@ def batched_unroll(
     #     assert post_process_gen_fewshots_fn is None
     
     responses = outputs["sequences"]
-
     return_obj = lib_base_classes.BatchedUnrollReturn(
         response_tensors = responses,
         any_tokenizer    = prediction_tokenizer,

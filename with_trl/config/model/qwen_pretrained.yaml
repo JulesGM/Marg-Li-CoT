@@ -1,0 +1,6 @@
+defaults:
+  - model_config
+
+model_name: "Qwen/Qwen2.5-1.5B"
+we_pretrained_it: true
+adapter_path: "/network/scratch/g/gagnonju/marglicot_saves/sft_saves/cot_gsm8k_qwen-2024-10-15_00-22-43/ep_0_model"

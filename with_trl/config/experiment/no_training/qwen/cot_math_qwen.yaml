@@ -1,34 +1,34 @@
 # @package _global_
 defaults:
   - override /curriculum_schedule: null_schedule
-  - override /model: phi2
+  - override /model: qwen
 
 
 ################################################################################
 # Top Importance
 ################################################################################
-batch_size: 2 # mini_batch_size * gradient_accumulation_steps
-generation_batch_size: 1
-inference_batch_size: 1
-mini_batch_size: 2
+batch_size: 1 # mini_batch_size * gradient_accumulation_steps
+train_generation_batch_size: 1
+mini_batch_size: 1
+
+# Eval Generation Batch Sizes
+# These things being separate is no super necessary
+eval_batch_size: 32
+eval_generation_batch_size: 32
 
 ppo_config:
   gradient_accumulation_steps: 1
-  learning_rate: 1e-5
+  learning_rate: 1e-6
 
 tok_max_query_length: 115
 tok_max_answer_length: null
 tok_max_total_length: 290
 
-
 use_curriculum: False
+eval_subset_size: null
 answer_only_max_length: 15
-name: "acc_maintain=${acc_maintain}_model_name=${model.model_name}_num_beams=${generation_kwargs.num_beams}"
-
 eval_every: 0
-eval_subset_size: 100
-
-just_metrics: False
+just_start_metrics: True
 
 ################################################################################
 # This should never change
@@ -36,7 +36,9 @@ just_metrics: False
 use_few_shots: True
 few_shot_qty: 5
 task_name: main
-dataset_name: gsm8k
+dataset_name: math
+reward_type: hendrycks_math
 
+train_generation_kwargs: {"num_beams": 25}
 
-generation_kwargs: {"num_beams": 25}
+value_pretrain_epochs: null

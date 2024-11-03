@@ -29,11 +29,12 @@ def predict_table(
 ):
     assert RANK == 0, RANK
 
-    decoded_questions = batch["ref_qa_answer"]
+    decoded_questions = batch["ref_qa_question"]
     decoded_predictions = predict_tokenizer.batch_decode(predictions)
     assert predictions_batch_obj, predictions_batch_obj
     assert decoded_predictions, decoded_predictions
     assert decoded_questions, decoded_questions
+
     assert local_metric_outputs["exact_match"].logging_columns["gen"]
     assert local_metric_outputs["exact_match"].logging_columns["ref"]
 
@@ -56,7 +57,9 @@ def predict_table(
         # We could skip this by decoding instead of using the pre-decoded.
         # It's still weird. I feel like it should be the same.
         escaped_q = rich.markup.escape(decoded_question).strip() # type: ignore
+        
         escaped_p = rich.markup.escape(decoded_prediction).strip() # type: ignore
+        
         p_len = (len(pred_tok.response_tensor) 
             - (pred_tok.response_tensor == predict_tokenizer.pad_token_id).sum().item()
         )
@@ -153,5 +156,5 @@ def batch_table(
         )
             
 
-    if RANK == 0:
-        rich.print(table)
+    # if RANK == 0:
+    #     rich.print(table)

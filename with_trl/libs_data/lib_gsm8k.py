@@ -345,24 +345,35 @@ class GSM8K(torch.utils.data.Dataset):
 
     def post_process_gen_fewshots(
         self, 
+        input_ids,
         raw_gen_outputs: np.ndarray,
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
     ):
+
+        input_text = forward_tokenizer.batch_decode(input_ids)
+        for line in input_text:
+            assert "Question:" in line, line
 
         decoded = forward_tokenizer.batch_decode(
             raw_gen_outputs, 
             skip_special_tokens=True,
         )
         
+
+        # If we generate new questions, remove them.
         outputs = []
         for line in decoded:
             final = line.find("Question:")
-
             if final == -1:
                 final = len(line)
 
             outputs.append(line[:final].strip())
 
+        # Re-tokenize the outputs.
+        # Should be padded right.
+        assert forward_tokenizer.padding_side == "right", (
+            f"{forward_tokenizer.padding_side = }")
+        
         tokenized = forward_tokenizer(
             outputs,
             return_tensors="pt",

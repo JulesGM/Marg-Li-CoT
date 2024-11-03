@@ -1,7 +1,5 @@
 defaults:
   - model_config
 
-model_name: "mistralai/Mistral-7B-v0.1"
-inference_batch_size: 1
-mini_batch_size: 1
-generation_batch_size: 1
+model_name: "mistralai/Mistral-7B-v0.3"
+we_pretrained_it: false

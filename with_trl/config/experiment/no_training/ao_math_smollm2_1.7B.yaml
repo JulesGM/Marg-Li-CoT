@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+  - override /curriculum_schedule: null_schedule
+  - override /model: smollm2_1.7B
+
+
+################################################################################
+# Top Importance
+################################################################################
+batch_size: 1 # mini_batch_size * gradient_accumulation_steps
+train_generation_batch_size: 1
+mini_batch_size: 1
+
+# Eval Generation Batch Sizes
+# These things being separate is no super necessary
+eval_batch_size: 32
+eval_generation_batch_size: 32
+
+ppo_config:
+  gradient_accumulation_steps: 1
+  learning_rate: 1e-6
+
+tok_max_query_length: 115
+tok_max_answer_length: null
+tok_max_total_length: 290
+
+use_curriculum: false
+eval_subset_size: null
+answer_only_max_length: 15
+answer_only: true
+just_start_metrics: True
+
+eval_every: 0
+
+################################################################################
+# This should never change
+################################################################################
+use_few_shots: True
+few_shot_qty: 5
+task_name: main
+dataset_name: math
+reward_type: hendrycks_math
+
+train_generation_kwargs: {"num_beams": 25}
+
+value_pretrain_epochs: null

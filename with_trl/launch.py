@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 
 import fire
 import more_itertools as mit
@@ -34,6 +35,7 @@ import rich.table
 
 import subprocess
 import nvgpu
+import inquirer
 
 try:
     import edit_distance
@@ -46,10 +48,17 @@ SCRIPT_DIR = Path(__file__).absolute().parent
 SCRIPT_PATH = SCRIPT_DIR / "bin_main.py"
 
 
+PATH_GENERAL = SCRIPT_DIR.resolve().parent / "general"
+assert PATH_GENERAL.exists(), PATH_GENERAL
+sys.path.append(str(PATH_GENERAL))
+import find_experiment
+
+
 class MixedPrecision(enum.Enum):
     NO   = "no"
     BF16 = "bf16"
     FP16 = "fp16"
+
 
 
 def count_gpus():
@@ -67,57 +76,17 @@ def kill_wandb_servers():
         universal_newlines=True,
     ))
 
-def list_experiments(experiment_folder: str | Path) -> set[str]:
-    experiment_folder = Path(experiment_folder)
-    assert experiment_folder.exists(), experiment_folder
-    list_experiments_files = experiment_folder.glob("**/*.yaml")
-    return set(
-        str(x.relative_to(experiment_folder).parent / x.stem) 
-        for x in list_experiments_files
-    )
-
-
-def check_experiment_and_suggest(experiment: str, folder: str | Path, top_n=10) -> None:
-    assert isinstance(experiment, str), experiment
-    experiments = list_experiments(folder)
-
-    if not experiment in experiments: 
-        rich.print(f"Experiment [bold]{experiment}[/] not found.")
-
-        if edit_distance:
-            exps_with_distances = [
-                (possible_experiment, edit_distance.edit_distance(possible_experiment, experiment))
-                for possible_experiment in experiments
-            ]
-            
-            exps_with_distances.sort(key=lambda x: x[1])
-            sorted_exps, sorted_dists = mit.zip_equal(*exps_with_distances)
-
-            rich.print(f"Did you mean: [bold]{sorted_exps[0]}")
-            print(f"Options are:")
-            print("\t- " + "\n\t- ".join(sorted_exps[:top_n]))
-
-            if len(sorted_exps) > top_n:
-                print(f"\t... and {len(sorted_exps) - top_n} more")
-
-        else:
-            print("Options are:")
-            print("\n".join(experiments[:top_n]))
-            if len(experiments) > top_n:
-                print(f"\t... and {len(experiments) - top_n} more")
-
-        exit(-1)
-
 
 def main(
-    experiment,
+    experiment=None,
     *,
     debug=False,
     one=False, 
-    port=29511,
+    port=29553,
     accelerate_config_file=SCRIPT_DIR.parent / "accelerate_configs" / "accelerate_ddp_no.yaml",
     overloads=None,
     mixed_precision="bf16",
+    wandb_id=None,
     **rest,
 ):
     """
@@ -162,7 +131,8 @@ def main(
         )
     )
     
-    check_experiment_and_suggest(experiment, SCRIPT_DIR / "config" / "experiment")
+    experiment = find_experiment.check_experiment_and_suggest(
+        experiment, SCRIPT_DIR / "config" / "experiment")
 
     ###########################################################################
     # Verify and cast args.
@@ -235,6 +205,9 @@ def main(
         title_align="left",
         highlight=True,
     ))
+
+    if wandb_id:
+        os.environ["WANDB_RUN_ID"] = wandb_id
 
     # Replace the current process with the following command.
     os.execvp("accelerate", command)

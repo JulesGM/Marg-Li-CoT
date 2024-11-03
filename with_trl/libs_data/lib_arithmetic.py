@@ -99,6 +99,7 @@ class DSIterator(torch.utils.data.Dataset):
         few_show_text: Optional[str],
         few_shot_qty: Optional[int],
     ):
+        assert not use_curriculum
         self._few_shot_text = few_show_text
         self._few_shot_qty = few_shot_qty
         self._return_idx = return_idx
@@ -116,15 +117,14 @@ class DSIterator(torch.utils.data.Dataset):
             self._ds_active = ds
 
     def __len__(self):
-        return len(self._ds)
+        return len(self._ds_active)
 
     def __getitem__(self, idx):
-        value = self._ds[idx]
+        value = self._ds_active[idx]
         if self._use_few_shots:
             value["ref_qa_question"] = (
                 self.make_few_shot_toks() + "\n\n" + "Q: " + value["ref_qa_question"]
             )
-        breakpoint()
         return value
         
     def __iter__(self):
@@ -221,9 +221,9 @@ class Arithmetic(
             ignore_one_line = extractor_ignore_one_line,
         )
 
-        ##############
+        #######################################################################
         # Find all the files of the dataset.
-        ##############
+        #######################################################################
         split = lib_utils.CVSets(split)
         self._dataset_root_folder_dir = pathlib.Path(dataset_root_folder_dir)
         del dataset_root_folder_dir
@@ -235,18 +235,18 @@ class Arithmetic(
         target_files = list(folder.glob(glob_pattern))
         assert target_files, (glob_pattern, folder, list(folder.iterdir()))
 
-        ##############
+        #######################################################################
         # Curriculum config:
-        ##############
+        #######################################################################
         if use_curriculum:
             assert not sft_mode, ("sft mode is not compatible with curriculum.")
         self._use_curriculum = use_curriculum
         # Compute the maximum difficulty level
         self._max_num_digits = max(int(file.stem) for file in target_files)
         
-        ##############
+        #######################################################################
         # Few-shot settings, & construction.
-        ##############
+        #######################################################################
         self._few_shot_qty = 10 # Could be a config.
         self._use_few_shots = use_few_shots
         if use_few_shots:
@@ -462,6 +462,7 @@ class Arithmetic(
         return self._use_few_shots
 
     def make_dataset(self, difficulty_toggles, seed):
+        
         return DSIterator(
             ds                 = self._core, 
             use_curriculum     = self._use_curriculum,

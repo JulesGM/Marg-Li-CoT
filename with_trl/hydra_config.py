@@ -3,6 +3,13 @@ import typing
 import hydra
 import hydra.core.config_store
 from typing import Any, Optional, Union
+import omegaconf
+
+
+def get_hydra_experiment_choice():
+    hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
+    return omegaconf.OmegaConf.to_container(hydra_cfg.runtime.choices)["experiment"]
+
 
 @dataclasses.dataclass
 class AccMaintainHydra:
@@ -27,30 +34,31 @@ class PeftConfigHydra:
     lora_dropout: float
     lora_alpha: int
     r: int
-
     task_type: Optional[str]
 
 
 @dataclasses.dataclass
 class ModelConfigHydra:
     model_name: str
+    we_pretrained_it: bool
+    adapter_path: Optional[str]
 
 
 @dataclasses.dataclass
 class BaseConfigHydra:
-    name: str
     eval_every: int
-    eval_subset_size: int
+    eval_subset_size: Optional[int]
     task_name: str
     dataset_name: str
 
-    just_metrics: bool
+    just_start_metrics: bool
     mini_batch_size: int
-    generation_batch_size: int
-    inference_batch_size: int
+    train_generation_batch_size: int
+    eval_batch_size: int
+    eval_generation_batch_size: int
 
-    generation_kwargs: dict
-    inference_generation_kwargs: dict
+    train_generation_kwargs: dict
+    eval_generation_kwargs: dict
     model: ModelConfigHydra
     peft_config: PeftConfigHydra
     ppo_config: PPOConfigHydra
@@ -75,7 +83,10 @@ class BaseConfigHydra:
     inspect_indices: bool
     answer_only: bool
     answer_only_path: typing.Optional[str]
+
+    disable_adapter_value_pretrain: bool
     value_pretrain_epochs: typing.Optional[int]
+    value_pretrain_steps: typing.Optional[int]
 
     precision: str
     float32_precision_generation: str
@@ -83,7 +94,7 @@ class BaseConfigHydra:
     peft_do_all_lin_layers: bool
     reward_type: str
     start_eval: bool
-    
+
     arithmetic_dataset_root_folder_dir: typing.Optional[str]
 
 

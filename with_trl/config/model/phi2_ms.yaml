@@ -1,0 +1,5 @@
+defaults:
+  - model_config
+
+model_name: "microsoft/phi-2"
+we_pretrained_it: false

@@ -1,0 +1,5 @@
+defaults:
+  - model_config
+
+model_name: "microsoft/rho-math-1b-v0.1"
+we_pretrained_it: false

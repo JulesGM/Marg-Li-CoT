@@ -27,6 +27,7 @@ DETERMINISTIC = False
 if DETERMINISTIC:
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
+import contextlib
 import dataclasses
 import itertools
 import logging
@@ -60,7 +61,6 @@ import torch.utils.data.sampler
 import transformers
 import trl
 import typing
-# import trl_fork
 import accelerate.utils
 
 import lib_data
@@ -68,12 +68,10 @@ import lib_eval
 import lib_trl_utils
 import lib_utils
 import hydra_config
+import pretrainable_value_fn_ppo_trainer
 
 datasets.disable_caching()
-rich.traceback.install(
-    console=rich.console.Console(
-        force_terminal=True
-))
+rich.traceback.install(console=rich.console.Console(markup=True))
 
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
@@ -110,20 +108,22 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     precision = lib_utils.ValidPrecisions(cfg.precision)  # type: ignore
     slurm_job_id = os.environ.get("SLURM_JOB_ID", None)
     no_training = cfg.no_training
-    name = cfg.name
+    name = hydra_config.get_hydra_experiment_choice()
     use_curriculum = cfg.use_curriculum
     float32_precision_forward_backward = cfg.float32_precision_forward_backward
     use_few_shots = cfg.use_few_shots
     answer_only = cfg.answer_only
-    model_generation_batch_size = int(cfg.generation_batch_size)
     float32_precision_generation = cfg.float32_precision_generation
     eval_every = int(cfg.eval_every)
     max_epochs = int(cfg.max_epochs) if cfg.max_epochs else None
     acc_maintain = cfg.acc_maintain
     
-    assert not cfg.answer_only, "Needs to be re-examined"
-    assert not cfg.value_pretrain_epochs, "Needs to be re-examined"
+    assert not (cfg.value_pretrain_steps and cfg.value_pretrain_epochs), (
+        "value_pretrain_steps and value_pretrain_epochs are mutually exclusive"
+    )
 
+    # assert not cfg.answer_only, "Needs to be re-examined"
+    
     if acc_maintain:
         assert WORLD_SIZE == 1, WORLD_SIZE
         acc_maintainer = lib_trl_utils.MAINTAINER_NAME_TO_CLASS[
@@ -141,19 +141,18 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
 
 
     dataset_name = lib_data.DatasetChoices(cfg.dataset_name)
-    inference_batch_size: transformers.GenerationConfig = cfg.inference_batch_size
+    eval_batch_size: int = cfg.eval_batch_size
     task_name = lib_utils.Task(cfg.task_name)
 
     # Make the output shorted if we use answer_only
     if cfg.answer_only:
         assert not task_name == lib_utils.Task.SENTIMENT, task_name
-        cfg.generation_kwargs.max_new_tokens = 10
-        cfg.inference_generation_kwargs.max_new_tokens = 10
+        cfg.train_generation_kwargs.max_new_tokens = 10
+        cfg.eval_generation_kwargs.max_new_tokens = 10
 
-    generation_kwargs = omegaconf.OmegaConf.to_object(cfg.generation_kwargs)
-    inference_generation_kwargs: transformers.GenerationConfig = omegaconf.OmegaConf.to_object(
-        cfg.inference_generation_kwargs)
-    trl_library = trl
+    train_generation_kwargs = omegaconf.OmegaConf.to_object(cfg.train_generation_kwargs)
+    eval_generation_kwargs: transformers.GenerationConfig = omegaconf.OmegaConf.to_object(
+        cfg.eval_generation_kwargs)
 
     if use_curriculum:
         # We could do progressively longer sequences.
@@ -193,29 +192,19 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     ###########################################################################
     # Find the type of model we are using
     ###########################################################################
-    hf_config = transformers.AutoConfig.from_pretrained(cfg.model.model_name)
-    assert not hf_config.is_encoder_decoder
 
     peft_config_dict: hydra_config.PeftConfigHydra = omegaconf.OmegaConf.to_object(cfg.peft_config)
+    peft_config_dict.task_type = peft.TaskType.CAUSAL_LM
     assert isinstance(peft_config_dict, hydra_config.PeftConfigHydra), (
         f"Expected peft_config_dict to be of type hydra_config.PeftConfigHydra, "
         f"but got {type(peft_config_dict)}"
     )
-    
-    assert peft_config_dict.task_type is None, (
-        f"{peft_config_dict.task_type = }, {type(peft_config_dict.task_type) = }")
     ppo_config = omegaconf.OmegaConf.to_object(cfg.ppo_config)
-    if not hf_config.is_encoder_decoder:
-        peft_config_dict.task_type = peft.TaskType.CAUSAL_LM
-    elif hf_config.is_encoder_decoder:
-        peft_config_dict.task_type = peft.TaskType.SEQ_2_SEQ_LM
-    else:
-        raise ValueError(f"Unknown model type: {cfg.model.model_name}")
     assert not cfg.peft_do_all_lin_layers, cfg.peft_do_all_lin_layers
 
     accelerator_kwargs = dict(
         kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(
-                find_unused_parameters=False)])
+                find_unused_parameters=True)])
 
     ppo_config_dict = dict(
         batch_size                  = batch_size,
@@ -229,7 +218,8 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
         **vars(ppo_config),
     )
 
-    trl_config: trl.PPOConfig = lib_trl_utils.FixedPPOConfig(**ppo_config_dict)
+    trl_config: trl.PPOConfig = lib_trl_utils.FixedPPOConfig(
+        **ppo_config_dict)
     
     
     if RANK == 0:
@@ -250,11 +240,11 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
         wandb.init(
             dir       = wandb_dir,
             entity    = "julesgm",
-            name      = f"{slurm_job_id}_{cfg.name}",
+            name      = f"{slurm_job_id}_{name}",
             project   = cfg.wandb_project,
-            save_code = True,
+            # save_code = True,
             config    = dict(
-                generation_kwargs = generation_kwargs,
+                generation_kwargs = train_generation_kwargs,
                 peft_config_dict  = peft_config_dict,
                 ppo_config_args   = ppo_config_dict,
                 script_args       = args,
@@ -303,13 +293,16 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
         ),
         disable=True, # RANK != 0,
     ):
+
         output = lib_trl_utils.init_model(
-            trust_remote_code      = "microsoft/phi-2" == trl_config.model_name.strip(),
+            adapter_path           = cfg.model.adapter_path if cfg.model.we_pretrained_it else None,
+            trust_remote_code      = True,
             model_name             = trl_config.model_name,
             peft_config            = peft.LoraConfig(**vars(peft_config_dict)),
             peft_do_all_lin_layers = cfg.peft_do_all_lin_layers,
             precision              = precision,
             use_peft               = cfg.use_peft,
+            we_pretrained_it       = cfg.model.we_pretrained_it,
         )
 
         # Deal with fork vs non-fork
@@ -328,10 +321,10 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     decoding_test_output = prediction_tokenizer.decode([line_return_tok])
     assert decoding_test_output == "!", (
         f"\"{decoding_test_output}\" != \"!\"")
-    assert "eos_token_id" not in generation_kwargs, generation_kwargs
-    assert "eos_token_id" not in inference_generation_kwargs, inference_generation_kwargs
-    generation_kwargs          ["eos_token_id"] = line_return_tok
-    inference_generation_kwargs["eos_token_id"] = line_return_tok
+    assert "eos_token_id" not in train_generation_kwargs, train_generation_kwargs
+    assert "eos_token_id" not in eval_generation_kwargs, eval_generation_kwargs
+    train_generation_kwargs["eos_token_id"] = line_return_tok
+    eval_generation_kwargs ["eos_token_id"] = line_return_tok
 
     ###########################################################################
     # Load Datasets
@@ -363,14 +356,7 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
         **shared_dataset_arguments,
     )
     
-    ###########################################################################
-    # Set model name specific flags
-    ###########################################################################
-    if not hf_config.is_encoder_decoder:
-        if peft_config_dict:
-            assert peft_config_dict.task_type == peft.TaskType.CAUSAL_LM, (
-                peft_config_dict.task_type)
-
+    
     ###########################################################################
     # Prep Training
     ###########################################################################
@@ -389,12 +375,13 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     dataset_arg       = dataset
         
 
-    ds_plugin = accelerate.utils.DeepSpeedPlugin(gradient_accumulation_steps=1)
-    ds_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = cfg.mini_batch_size
-    ds_plugin.deepspeed_config["train_batch_size"] = cfg.mini_batch_size * WORLD_SIZE
-    trl_config.accelerator_kwargs["deepspeed_plugin"] = ds_plugin
+    # ds_plugin = accelerate.utils.DeepSpeedPlugin(gradient_accumulation_steps=1)
+    # ds_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = cfg.mini_batch_size
+    # ds_plugin.deepspeed_config["train_batch_size"] = cfg.mini_batch_size * WORLD_SIZE
+    # trl_config.accelerator_kwargs["deepspeed_plugin"] = ds_plugin
 
-    ppo_trainer: trl.PPOTrainer = trl_library.PPOTrainer(
+    breakpoint()
+    ppo_trainer: trl.PPOTrainer = pretrainable_value_fn_ppo_trainer.ValuePretrainablePPOTrainer(
         config        = trl_config,
         ref_model     = None,
         tokenizer     = forward_tokenizer,
@@ -420,14 +407,14 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     train_eval = lib_eval.EvalLoop(
         accelerated_model     = policy_model,
         accelerator           = ppo_trainer.accelerator,
-        batch_size            = inference_batch_size,
+        batch_size            = eval_batch_size,
         collator              = data_collator,
         dataset               = dataset,
         dataset_type          = dataset_name,
         eval_subset_size      = cfg.eval_subset_size,
         forward_tokenizer     = forward_tokenizer,
-        generation_batch_size = model_generation_batch_size,
-        inference_gen_kwargs  = inference_generation_kwargs,
+        generation_batch_size = cfg.eval_generation_batch_size,
+        inference_gen_kwargs  = eval_generation_kwargs,
         metrics               = metrics,
         prediction_tokenizer  = prediction_tokenizer,
         reward_fn             = reward_fn,
@@ -439,14 +426,14 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     eval_eval = lib_eval.EvalLoop(
         accelerated_model     = policy_model,
         accelerator           = ppo_trainer.accelerator,
-        batch_size            = inference_batch_size,
+        batch_size            = eval_batch_size,
         collator              = data_collator,
         dataset               = eval_dataset,
         dataset_type          = dataset_name,
         eval_subset_size      = cfg.eval_subset_size,
         forward_tokenizer     = forward_tokenizer,
-        generation_batch_size = model_generation_batch_size,
-        inference_gen_kwargs  = inference_generation_kwargs,
+        generation_batch_size = cfg.eval_generation_batch_size,
+        inference_gen_kwargs  = eval_generation_kwargs,
         metrics               = metrics,
         prediction_tokenizer  = prediction_tokenizer,
         reward_fn             = reward_fn,
@@ -456,11 +443,11 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     )
 
 
-    if cfg.just_metrics or cfg.start_eval:
-        train_eval(0)
+    if cfg.just_start_metrics or cfg.start_eval:
+        # train_eval(0)
         eval_eval(0)
 
-        if cfg.just_metrics:
+        if cfg.just_start_metrics:
             return
 
     ###########################################################################
@@ -469,6 +456,7 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     epoch_count = -1
 
     # if use_curriculum:
+    assert WORLD_SIZE == 1, WORLD_SIZE
     dataloader = torch.utils.data.DataLoader(
         batch_size  = batch_size,
         collate_fn  = data_collator,
@@ -481,23 +469,25 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     current_step = 0
     lib_utils.named_barrier(f"bin_main {lib_utils.get_linenumber()}")
 
-    for epoch in range(max_epochs):
+    for epoch in range(max_epochs + (cfg.value_pretrain_epochs or 0)):
         epoch_count += 1
 
         #######################################################################
         # Check the difficulty so that the first batch is 
         # the first batch is of the right difficulty
         #######################################################################
+        if isinstance(dataloader.sampler, torch.utils.data.distributed.DistributedSampler):
+            dataloader.sampler.set_epoch(epoch)
+
         train_dataloader_iterator = iter(dataloader)
         if use_curriculum:
             train_dataloader_iterator.set_difficulties(
                 curriculum_schedule(ppo_trainer.current_step).proportions
             )
-    
 
         for batch_idx, batch in enumerate(lib_utils.progress(
             description=f"Epoch {epoch_count}, Global Epoch: {epoch}",
-            disable=True,
+            disable=False,
             seq=train_dataloader_iterator,
         )):
 
@@ -519,7 +509,7 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
             #  - "ref_answer" if in GSM8K
             #  - "ref_scratchpad"
             ######################################################################
-            if eval_every and batch_idx % eval_every == 0:
+            if eval_every and batch_idx % eval_every == 0 and batch_idx > 0:
                 if RANK == 0: 
                     rich.print("[red bold]DOING EVAL: [white]TRAIN SET")
                 
@@ -554,8 +544,8 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                 answer_extractor             = dataset.get_extractor(),
                 batch                        = batch, 
                 batch_size                   = batch_size,
-                generation_batch_size        = model_generation_batch_size,
-                generation_kwargs            = generation_kwargs, 
+                generation_batch_size        = cfg.train_generation_batch_size,
+                generation_kwargs            = train_generation_kwargs, 
                 ppo_trainer                  = ppo_trainer,
                 post_process_gen_fewshots_fn = post_process_gen_fewshots,
                 prediction_tokenizer         = prediction_tokenizer,
@@ -703,12 +693,27 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
             if isinstance(batch["tok_ref_query"], torch.Tensor):
                 batch["tok_ref_query"] = list(batch["tok_ref_query"])
 
-            stats = ppo_trainer.step(
-                queries   = batch["tok_ref_query"],
-                responses = outputs.response_tensors,
-                scores    = reward_output.values,
-                **step_kwargs,
+            is_value_fn_pretraining_step = (
+                (cfg.value_pretrain_epochs and (epoch < cfg.value_pretrain_epochs)) or 
+                (cfg.value_pretrain_steps and (ppo_trainer.current_step < cfg.value_pretrain_steps))
             )
+            
+            ###################################################################
+            ctx = contextlib.nullcontext()
+            if is_value_fn_pretraining_step:
+                rich.print("[red bold]Value Function Pretraining Step")
+                if cfg.disable_adapter_value_pretrain:
+                    ctx = ppo_trainer.optional_peft_ctx()
+            ###################################################################
+
+            with ctx:
+                stats = ppo_trainer.step(
+                    queries   = batch["tok_ref_query"],
+                    responses = outputs.response_tensors,
+                    scores    = reward_output.values,
+                    only_value_function_trainable = is_value_fn_pretraining_step,
+                    **step_kwargs,
+                )
 
             if RANK == 0: 
                 print(f"{RANK} ppo_trainer.step done <<<")
@@ -757,18 +762,18 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                 current_step, ppo_trainer.current_step)
             
 
-            lib_trl_utils.print_table(
-                call_source       = "main_loop",
-                difficulty_levels = batch["difficulty_level"],
-                extra_columns     = reward_output.logging_columns,
-                generation_kwargs = generation_kwargs,
-                log_header        = f"(e{epoch}-b{batch_idx}) ",
-                name              = str(name),
-                qty               = None,
-                queries           = batch["ref_qa_question"],
-                responses         = outputs.response_text,
-                rewards           = reward_output.values,
-            )
+            # lib_trl_utils.print_table(
+            #     call_source       = "main_loop",
+            #     difficulty_levels = batch["difficulty_level"],
+            #     extra_columns     = reward_output.logging_columns,
+            #     generation_kwargs = generation_kwargs,
+            #     log_header        = f"(e{epoch}-b{batch_idx}) ",
+            #     name              = str(name),
+            #     qty               = None,
+            #     queries           = batch["ref_qa_question"],
+            #     responses         = outputs.response_text,
+            #     rewards           = reward_output.values,
+            # )
             lib_utils.named_barrier(f"{__file__}: {lib_utils.get_linenumber()}")
 
 

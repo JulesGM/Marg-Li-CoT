@@ -1,0 +1,5 @@
+defaults:
+  - model_config
+
+model_name: "HuggingFaceTB/SmolLM2-1.7B"
+we_pretrained_it: false

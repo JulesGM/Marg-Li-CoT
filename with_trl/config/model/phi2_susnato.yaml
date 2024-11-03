@@ -2,5 +2,4 @@ defaults:
   - model_config
 
 model_name: "susnato/phi-2"
-
-
+we_pretrained_it: false

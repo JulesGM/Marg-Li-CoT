@@ -9,7 +9,6 @@ defaults:
 batch_size: 16
 
 use_curriculum: False
-name: "acc_maintain=${acc_maintain}_model_name=${model.model_name}_num_beams=${generation_kwargs.num_beams}"
 answer_only_max_length: 15
 
 eval_every: 0

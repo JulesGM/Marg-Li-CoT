@@ -1,9 +1,8 @@
-import itertools as it
-import pathlib
-import os
-
 import collections
+import itertools as it
 import logging
+import os
+import pathlib
 
 import datasets
 import torch
@@ -14,13 +13,13 @@ import torch.utils.data
 import transformers
 import transformers.utils
 
-from with_trl import lib_utils
-from with_trl.libs_data import lib_arithmetic
-from with_trl.libs_data import lib_gsm8k
-
 from approach_sft import lib_sft_collators
 from approach_sft import lib_sft_constants
 from approach_sft import lib_sft_commonsense_qa
+import math_sft
+from with_trl import lib_utils
+from with_trl.libs_data import lib_arithmetic
+from with_trl.libs_data import lib_gsm8k
 
 
 RANK = int(os.environ.get("RANK", 0))
@@ -128,9 +127,16 @@ def get_dataloaders(
 
         elif dataset_choice == lib_utils.Datasets.GSM8K:
             data_collator = lib_sft_collators.GSM8KCollator(
-                output_type=output_type,
-                forward_tokenizer=forward_tokenizer,
-                prediction_tokenizer=prediction_tokenizer,
+                output_type          = output_type,
+                forward_tokenizer    = forward_tokenizer,
+                prediction_tokenizer = prediction_tokenizer,
+            )
+
+        elif dataset_choice == lib_utils.Datasets.MATH:
+            data_collator = math_sft.MATHCollator(
+                forward_tokenizer    = forward_tokenizer,
+                prediction_tokenizer = prediction_tokenizer,
+                
             )
 
         else:
@@ -181,7 +187,10 @@ def get_dataloaders(
                     use_cached_dataset        = True,
                     return_idx                = False,
                 )
-            dataset = ds_builder.make_dataset(difficulty_toggles=None, seed=seed)
+            dataset = ds_builder.make_dataset(
+                difficulty_toggles=None, 
+                seed=seed,
+            )
             
         elif dataset_choice == lib_utils.Datasets.GSM8K:
             dataset = lib_gsm8k.GSM8K(
@@ -199,7 +208,16 @@ def get_dataloaders(
                 cv_set                = cv_set,
                 use_curriculum        = False,
             )
-            
+
+        elif dataset_choice == lib_utils.Datasets.MATH:
+            dataset = math_sft.MATHDataset(
+                cv_set,
+                max_num_tokens = 1024,
+                forward_tokenizer = forward_tokenizer,
+                prediction_tokenizer = prediction_tokenizer,
+                output_type = output_type,
+            )
+
         else:
             assert False
             ds_builder = lib_sft_commonsense_qa.openai_commonsense_qa_output(

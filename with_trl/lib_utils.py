@@ -32,6 +32,7 @@ class Datasets(str, enum.Enum):
     GSM8K = "gsm8k"
     ARITHMETIC = "arithmetic"
     COMMONSENSE_QA = "commonsense_qa"
+    MATH = "math"
 
 
 class TrlLibraryMode(enum.Enum):
@@ -82,6 +83,7 @@ class MovingAverage:
 class RewardChoices(str, enum.Enum):
     EXACT_MATCH = "exact_match"
     REF_PPL = "ref_ppl"
+    HENDRYCKS_MATH = "hendrycks_math"
 
 
 class Task(str, enum.Enum):
@@ -533,7 +535,7 @@ class WandbAndRichTable:
         # )
 
     def add_row(self, *args, **kwargs):
-        self._rich_table .add_row (*args, **kwargs)
+        self._rich_table.add_row (*args, **kwargs)
         # self._wandb_table.add_data(*args, **kwargs)
     
     def get_loggable_object(self):

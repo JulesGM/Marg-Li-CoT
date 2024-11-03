@@ -31,6 +31,7 @@ import with_trl.libs_extraction.lib_multiple_choice
 import with_trl.libs_data.lib_arithmetic
 import with_trl.libs_data.lib_commonsense_qa
 import with_trl.libs_data.lib_gsm8k
+import with_trl.libs_data.lib_math
 import with_trl.libs_data.lib_sentiment
 import with_trl.libs_data.lib_asdiv
 import with_trl.libs_data.lib_base
@@ -43,26 +44,28 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", "0"))
 
 
 class DatasetChoices(str, enum.Enum):
-    ARITHMETIC       = "arithmetic"
-    ASDIV            = "asdiv"
-    COMMONSENSEQA_MC = "cqa"
-    GSM8K            = "gsm8k"
-    SENTIMENT        = "sentiment"
+    ARITHMETIC = "arithmetic"
+    GSM8K      = "gsm8k"
+    MATH       = "math"
+    # SENTIMENT        = "sentiment"
+    # COMMONSENSEQA_MC = "cqa"
+    # ASDIV            = "asdiv"
 
 
 DATASET_KEY_TO_CLASS = {
-    DatasetChoices.ASDIV:            with_trl.libs_data.lib_asdiv.ASDiv,
+    # DatasetChoices.ASDIV:            with_trl.libs_data.lib_asdiv.ASDiv,
     DatasetChoices.GSM8K:            with_trl.libs_data.lib_gsm8k.GSM8K,
-    DatasetChoices.SENTIMENT:        with_trl.libs_data.lib_sentiment.SentimentData,
-    DatasetChoices.COMMONSENSEQA_MC: with_trl.libs_data.lib_commonsense_qa.CommonSenseQAMC,
+    DatasetChoices.MATH:             with_trl.libs_data.lib_math.Math,
+    # DatasetChoices.SENTIMENT:        with_trl.libs_data.lib_sentiment.SentimentData,
+    # DatasetChoices.COMMONSENSEQA_MC: with_trl.libs_data.lib_commonsense_qa.CommonSenseQAMC,
 }
 
 
 DATASET_KEY_TO_ANSWER_EXTRACTOR = {
-    DatasetChoices.ASDIV:            with_trl.libs_extraction.lib_numerical,
+    # DatasetChoices.ASDIV:            with_trl.libs_extraction.lib_numerical,
     DatasetChoices.GSM8K:            with_trl.libs_extraction.lib_numerical,
-    DatasetChoices.SENTIMENT:        None,
-    DatasetChoices.COMMONSENSEQA_MC: with_trl.libs_extraction.lib_multiple_choice,
+    # DatasetChoices.SENTIMENT:        None,
+    # DatasetChoices.COMMONSENSEQA_MC: with_trl.libs_extraction.lib_multiple_choice,
 }
 
 
@@ -170,11 +173,6 @@ def prep_dataset_rl(
     """
 
     split = lib_utils.CVSets(split)
-    if answer_only and dataset_name not in {
-        DatasetChoices.COMMONSENSEQA_MC, 
-        DatasetChoices.ARITHMETIC,
-    }:
-        raise NotImplementedError()
 
     if dataset_name == DatasetChoices.GSM8K:
         assert isinstance(LOCAL_RANK, int), type(LOCAL_RANK)
@@ -206,32 +204,64 @@ def prep_dataset_rl(
             use_few_shots=use_few_shots,
         )
 
-    elif dataset_name == DatasetChoices.COMMONSENSEQA_MC:
-        raise NotImplementedError
-        dataset = with_trl.libs_data.lib_commonsense_qa.CommonSenseQAMC(
-            answer_only=answer_only,
-            answer_only_path=answer_only_path,
+    elif dataset_name == DatasetChoices.MATH:
+        assert isinstance(LOCAL_RANK, int), type(LOCAL_RANK)
+
+        if split == with_trl.lib_utils.CVSets.TRAIN:
+            ds = datasets.load_dataset( 
+                "hendrycks/competition_math",
+            )["train"]
+
+        elif split == with_trl.lib_utils.CVSets.VALID:
+            full_ds = datasets.load_dataset( 
+                "hendrycks/competition_math",
+            )["test"]
+            ds = full_ds[:int(0.5 * len(full_ds))]
+
+        else:
+            raise ValueError(split)
+
+        assert few_show_qty >= 1, f"few_show_qty: {few_show_qty}"
+
+        dataset = with_trl.libs_data.lib_math.Math(
             any_tokenizer=any_tokenizer,
-            split=split,
-            question_prefix=question_prefix,
-            question_suffix=question_suffix,
+            cv_set=split,
+            device=torch.device(LOCAL_RANK),
+            ds=ds,
+            few_show_qty=few_show_qty,
+            tok_max_query_length=tok_max_query_length,
+            tok_max_answer_length=tok_max_answer_length,
+            tok_max_total_length=tok_max_total_length,
+            use_curriculum=use_curriculum,
             use_few_shots=use_few_shots,
         )
 
-    elif dataset_name == DatasetChoices.ASDIV:
-        raise NotImplementedError
-        assert split is None, "split must be None for ASDiv"
-        dataset = with_trl.libs_data.lib_asdiv.ASDiv(
-            tokenizer=any_tokenizer,
-            cache_path="/tmp/asdiv",
-        )
+    # elif dataset_name == DatasetChoices.COMMONSENSEQA_MC:
+    #     raise NotImplementedError
+    #     dataset = with_trl.libs_data.lib_commonsense_qa.CommonSenseQAMC(
+    #         answer_only=answer_only,
+    #         answer_only_path=answer_only_path,
+    #         any_tokenizer=any_tokenizer,
+    #         split=split,
+    #         question_prefix=question_prefix,
+    #         question_suffix=question_suffix,
+    #         use_few_shots=use_few_shots,
+    #     )
 
-    elif dataset_name == DatasetChoices.SENTIMENT:
-        raise NotImplementedError
-        dataset = with_trl.libs_data.lib_sentiment.SentimentData(
-            any_tokenizer=any_tokenizer, 
-            split=split,
-        )
+    # elif dataset_name == DatasetChoices.ASDIV:
+    #     raise NotImplementedError
+    #     assert split is None, "split must be None for ASDiv"
+    #     dataset = with_trl.libs_data.lib_asdiv.ASDiv(
+    #         tokenizer=any_tokenizer,
+    #         cache_path="/tmp/asdiv",
+    #     )
+
+    # elif dataset_name == DatasetChoices.SENTIMENT:
+    #     raise NotImplementedError
+    #     dataset = with_trl.libs_data.lib_sentiment.SentimentData(
+    #         any_tokenizer=any_tokenizer, 
+    #         split=split,
+    #     )
             
     elif dataset_name == DatasetChoices.ARITHMETIC:
         dataset = with_trl.libs_data.lib_arithmetic.Arithmetic(

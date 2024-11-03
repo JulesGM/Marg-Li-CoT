@@ -2,7 +2,4 @@ defaults:
   - model_config
 
 model_name: "EleutherAI/pythia-70m-deduped"
-inference_batch_size: 1
-mini_batch_size: 1
-generation_batch_size: 16
-
+we_pretrained_it: false

@@ -1,0 +1,5 @@
+defaults:
+  - model_config
+
+model_name: "google/gemma-2-2b"
+we_pretrained_it: false

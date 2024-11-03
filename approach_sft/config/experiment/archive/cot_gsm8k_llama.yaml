@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - override /output_type: chain_of_thought_then_answer
+
+dataset_choice: 
+  _args_: ["gsm8k"]
+
+output_type:
+  train_batch_size:          30
+  eval_batch_size:           30
+  max_length:                350
+
+model_name_or_path: "meta-llama/Llama-3.1-8B"

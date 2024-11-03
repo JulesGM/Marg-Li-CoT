@@ -1,10 +1,13 @@
 import logging
 import os
+import pathlib
 import re
+import sys
 import typing
 from typing import Optional
 
 import more_itertools
+mit = more_itertools
 import multiset
 import numpy as np
 
@@ -12,10 +15,111 @@ from with_trl import lib_base_classes
 from with_trl import libs_extraction
 from with_trl import lib_utils
 
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+
+#####################################
+general_path = SCRIPT_DIR.parent / "general"
+assert general_path.exists(), general_path
+sys.path.append(str(general_path))
+import hendrycks_math_utils
+#####################################
+
 LOGGER = logging.getLogger(__name__)
 RANK = int(os.getenv("RANK", "0"))
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "0"))
+
+
+
+class HendrycksMathScratchpadAnswerAccuracy(lib_base_classes.Metric):
+    def _compare(
+            self, 
+            generated_texts,
+            reference_answer_texts,
+        ):
+
+        parsed = lib_utils.DictDataset(keys=["ref", "gen"])
+        scores = []
+
+        for gen, ref in mit.zip_equal(generated_texts, reference_answer_texts):
+
+            extracted_gen = hendrycks_math_utils.last_boxed_only_string(gen)
+            extracted_ref = hendrycks_math_utils.last_boxed_only_string(ref)
+            parsed.append(
+                dict(
+                    gen=extracted_gen,
+                    ref=extracted_ref,
+                )
+            )
+
+            score = float(hendrycks_math_utils.is_equiv(extracted_gen, extracted_ref))
+            scores.append(score)
+
+        return scores, parsed
+
+    def __call__(
+        self,
+        *,
+        responses: list[lib_base_classes.BatchedUnrollReturn],
+        batch: lib_base_classes.DataListContainer,
+    ) -> lib_base_classes.MetricOutput:
+        
+        #######################################################################
+        # Make checks
+        #######################################################################
+        generated_texts = responses
+        reference_answer_texts = batch["ref_qa_answer"]
+
+        assert len(reference_answer_texts) == len(generated_texts), (
+            len(reference_answer_texts),
+            len(generated_texts),
+        )
+        assert len(generated_texts) == len(reference_answer_texts), (
+            len(generated_texts),
+            len(reference_answer_texts),
+        )
+
+        #######################################################################
+        # Compare each sample one by one
+        #######################################################################
+        em_values, parsed = self._compare(
+            generated_texts=generated_texts,
+            reference_answer_texts=reference_answer_texts,
+        )
+
+        #######################################################################
+        # Compute stats, do checks and log
+        #######################################################################
+        num_nones_parsed = sum(
+            x["gen"] is None for x in parsed) # type: ignore
+        
+        if generated_texts:
+            fraction_failed = f"{num_nones_parsed / len(generated_texts):0.1%}"
+        else:
+            fraction_failed = "N/A"
+
+        LOGGER.debug(
+            f"[bold green]EM Result:[bold white] {np.mean(em_values):0.2%}\n"
+            f"[bold red on white]Fraction of no answer found: "
+            f"{fraction_failed}\n"
+        )
+
+        assert len(em_values) == len(generated_texts) == len(reference_answer_texts), (
+            "\n"
+            + f"{len(generated_texts)   = }\n"
+            + f"{len(reference_answer_texts)   = }\n"
+            + f"{len(em_values)          = }"
+        )
+
+        return lib_base_classes.MetricOutput(
+            logging_columns=parsed,
+            moving_averages=None,
+            values=em_values,
+            name="exact_match",
+            extracted_gen=[x["gen"] for x in parsed],
+            extracted_ref=[x["ref"] for x in parsed],
+        )
+
 
 
 class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
@@ -79,10 +183,12 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
             # -----------------------------------------------------------------
             if isinstance(raw_ref, str):
                 raw_ref = [raw_ref]
+            
             assert isinstance(raw_ref, list), type(raw_ref)
             assert len(raw_ref) == 1, len(raw_ref)
             assert isinstance(raw_ref[0], str), type(raw_ref[0])
             assert self._pad_token not in raw_ref[0], raw_gen
+
             extracted_ref = self._extractor(raw_ref[0])
 
             # -----------------------------------------------------------------
@@ -178,62 +284,62 @@ class ScratchpadAnswerAccuracy(lib_base_classes.Metric):
         )
 
 
-class ScratchpadNumericalSubStepAccuracy(lib_base_classes.Metric):
-    def __init__(self):
-        self._extractor = libs_extraction.lib_numerical.ConvToNum()
+# class ScratchpadNumericalSubStepAccuracy(lib_base_classes.Metric):
+#     def __init__(self):
+#         self._extractor = libs_extraction.lib_numerical.ConvToNum()
 
-    def __call__(
-        self,
-        *,
-        responses: list[lib_base_classes.BatchedUnrollReturn],
-        batch: lib_base_classes.DataListContainer,
-    ):
-        ref_scratchpads = batch.detok_ref_scratchpad
-        ref_substeps = batch.obj_ref_equations
+#     def __call__(
+#         self,
+#         *,
+#         responses: list[lib_base_classes.BatchedUnrollReturn],
+#         batch: lib_base_classes.DataListContainer,
+#     ):
+#         ref_scratchpads = batch.detok_ref_scratchpad
+#         ref_substeps = batch.obj_ref_equations
 
-        outputs = lib_utils.DictDataset(
-            ["gen_ms", "ref_ms", "intermediate_results", "gen_numbers", "metric"]
-        )
+#         outputs = lib_utils.DictDataset(
+#             ["gen_ms", "ref_ms", "intermediate_results", "gen_numbers", "metric"]
+#         )
 
-        #######################################################################
-        # We iterate per sample
-        #######################################################################
-        for response, ref_substep, ref_scratchpad in more_itertools.zip_equal(
-            responses,
-            ref_substeps,
-            ref_scratchpads
-        ):
-            # 1. Extract numbers from responses.
-            intermediate_results = []
-            for substep_dict in ref_substep[:-1]: # type: ignore
-                intermediate_results.append(substep_dict["answer"])  # type: ignore
+#         #######################################################################
+#         # We iterate per sample
+#         #######################################################################
+#         for response, ref_substep, ref_scratchpad in more_itertools.zip_equal(
+#             responses,
+#             ref_substeps,
+#             ref_scratchpads
+#         ):
+#             # 1. Extract numbers from responses.
+#             intermediate_results = []
+#             for substep_dict in ref_substep[:-1]: # type: ignore
+#                 intermediate_results.append(substep_dict["answer"])  # type: ignore
             
-            ref_ms = multiset.Multiset(intermediate_results)
+#             ref_ms = multiset.Multiset(intermediate_results)
 
-            # 2. Extract numbers from generated answers.
-            extracted_gen_numbers = self._extractor.extract_numbers(
-                response.response_text)
-            extracted_gen_numbers_not_last = []
-            if extracted_gen_numbers:
-                extracted_gen_numbers_not_last = extracted_gen_numbers[:-1]  # type: ignore
-            gen_ms = multiset.Multiset(extracted_gen_numbers_not_last)
+#             # 2. Extract numbers from generated answers.
+#             extracted_gen_numbers = self._extractor.extract_numbers(
+#                 response.response_text)
+#             extracted_gen_numbers_not_last = []
+#             if extracted_gen_numbers:
+#                 extracted_gen_numbers_not_last = extracted_gen_numbers[:-1]  # type: ignore
+#             gen_ms = multiset.Multiset(extracted_gen_numbers_not_last)
 
-            # 3. Compare
-            outputs.append(
-                dict(
-                    gen_ms=gen_ms, 
-                    ref_ms=ref_ms, 
-                    intermediate_results=intermediate_results, 
-                    gen_numbers=extracted_gen_numbers_not_last,
-                    metric=len(gen_ms & ref_ms) / len(ref_ms) if ref_ms else None,  # type: ignore
-                ))
+#             # 3. Compare
+#             outputs.append(
+#                 dict(
+#                     gen_ms=gen_ms, 
+#                     ref_ms=ref_ms, 
+#                     intermediate_results=intermediate_results, 
+#                     gen_numbers=extracted_gen_numbers_not_last,
+#                     metric=len(gen_ms & ref_ms) / len(ref_ms) if ref_ms else None,  # type: ignore
+#                 ))
             
-        return lib_base_classes.MetricOutput(
-            logging_columns=outputs,
-            moving_averages=None,
-            values=outputs["metric"], # type: ignore
-            name="substeps",
-        )
+#         return lib_base_classes.MetricOutput(
+#             logging_columns=outputs,
+#             moving_averages=None,
+#             values=outputs["metric"], # type: ignore
+#             name="substeps",
+#         )
             
 
 if __name__ == "__main__":

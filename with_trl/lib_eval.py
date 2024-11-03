@@ -42,10 +42,10 @@ def make_eval_dataloader(
     assert dataset
 
 
-    if subset_size is not None:
+    if subset_size is not None and subset_size < len(dataset):
         assert subset_size > 0, subset_size
         dataset = torch.utils.data.Subset(dataset, range(subset_size))
-
+        
     def collator_probe(lob):
         output = collator(lob)
         return output
@@ -74,13 +74,7 @@ def make_metric_and_reward_fn(
     extractor,
 ) -> typing.Tuple[typing.Callable, typing.Callable]:
     if task_name == lib_utils.Task.MAIN:
-        accuracy = lib_metric.ScratchpadAnswerAccuracy(
-            extractor=extractor,
-            pad_token=pad_token,
-        )
-        metrics = {
-            f"accuracy_{type(extractor).__name__}": accuracy   
-        }
+
 
         # if dataset_name == lib_data.DatasetChoices.ARITHMETIC:
         #     for i in range(dataset.max_num_digits):
@@ -107,8 +101,27 @@ def make_metric_and_reward_fn(
                 metric_fn=metric_accuracy,
                 tokenizer=tokenizer,
             )
+        elif reward_type == lib_utils.RewardChoices.HENDRYCKS_MATH:
+            accuracy = lib_metric.HendrycksMathScratchpadAnswerAccuracy()
+
+            metrics = {
+                f"accuracy_{type(extractor).__name__}": accuracy   
+            }
+
+            reward_fn = lib_reward_exact_match.ExactMatchReward(
+                metric_fn=accuracy,
+            )
 
         elif reward_type == lib_utils.RewardChoices.EXACT_MATCH:
+            accuracy = lib_metric.ScratchpadAnswerAccuracy(
+                extractor=extractor,
+                pad_token=pad_token,
+            )
+
+            metrics = {
+                f"accuracy_{type(extractor).__name__}": accuracy   
+            }
+
             reward_fn = lib_reward_exact_match.ExactMatchReward(
                 metric_fn=accuracy,
             )
@@ -395,13 +408,15 @@ class EvalLoop:
                 to_log = dict(
                     reward_mean = reward.mean().item(),
                     reward_std  = reward.std().item(),
-                    table       = self._wandb_table.get_loggable_object(),
+                    # table       = self._wandb_table.get_loggable_object(),
                     **metrics_mean,
                     **metrics_std,
                 )
+
                 to_log = {
                     f"{lib_constant.WANDB_NAMESPACE}_{self._split.value}/{k}": 
                     v for k, v in to_log.items()
                 }
+                
                 wandb.log(to_log, step=global_step)
 

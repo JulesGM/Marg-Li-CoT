@@ -26,28 +26,35 @@ import rich
 import rich.panel
 import rich.console
 import rich.traceback
+import sys
 from typing import Union
 
 import os
 import json
 import subprocess as sp
 
+rich.traceback.install(console=rich.console.Console(markup=True))
+
 
 def scontrol_show(job_id=None):
-  if job_id is None:
-    assert "SLURM_JOB_ID" in os.environ, (
-        "Either need a value for the argument job_id or a value for the argument $SLURM_JOB_ID"
-    )
-    job_id = os.environ["SLURM_JOB_ID"]
+    if job_id is None:
+        assert "SLURM_JOB_ID" in os.environ, (
+            "Either need a value for the argument job_id or a value for the argument $SLURM_JOB_ID"
+        )
+        job_id = os.environ["SLURM_JOB_ID"]
 
-  output = sp.check_output(["scontrol", "--json", "show", "job", str(job_id)], text=True).strip()
-  
-  parsed = mit.one(json.loads(output)["jobs"])
-  
-  return parsed
+    output = sp.check_output([
+        "scontrol", 
+        "--json", 
+        "show", 
+        "job", 
+        str(job_id)
+    ], text=True).strip()
+    
+    parsed = mit.one(json.loads(output)["jobs"])
+    
+    return parsed
 
-
-rich.traceback.install(console=rich.console.Console(force_terminal=True))
 
 def get_script_dir():
 
@@ -58,21 +65,30 @@ def get_script_dir():
     
     return pathlib.Path(__file__).absolute().parent
 
-SCRIPT_DIR = pathlib.Path(get_script_dir())
 
+# Add general to the path, & import find_experiment
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent # pathlib.Path(get_script_dir())
 TARGET_SCRIPT = SCRIPT_DIR / "bin_sft.py"
+GENERAL_DIR = SCRIPT_DIR.parent / "general"
+assert GENERAL_DIR.exists(), GENERAL_DIR
+sys.path.append(str(GENERAL_DIR))
+import find_experiment
+
 
 def main(
     experiment=os.environ.get("EXPERIMENT", None),
     one: bool = False,
     config_path: Union[str, pathlib.Path] = (
-        SCRIPT_DIR.parent / "accelerate_configs" / "accelerate_ddp_no.yaml"
+        SCRIPT_DIR.parent / "accelerate_configs" / "most_recent_ddp_bf16.yaml" # "accelerate_ddp_no.yaml" # "ddp_bf16.yaml"
     ),
     test_mode: bool = False,
+    wandb_id: str = None,
 ):
     rich.print(locals())
 
-    assert experiment
+    experiment = find_experiment.check_experiment_and_suggest(
+        experiment, SCRIPT_DIR / "config" / "experiment"
+    )
 
     config_path = pathlib.Path(config_path)
     assert config_path.exists(), config_path
@@ -88,19 +104,22 @@ def main(
     assert isinstance(one, bool), one
     num_processes = 1 if one else pynvml.nvmlDeviceGetCount()
 
+    import random
     command = [
         "accelerate",
         "launch",
         "--num_processes", num_processes,
         "--config_file", config_path,
-        "--main_process_port", 29500 + int(os.environ["SLURM_JOB_ID"]) % 2000,
+        "--num_machines", 1,
+        "--main_process_port", 
+        29500 + (int(os.environ["SLURM_JOB_ID"]) + random.randint(0, 1234)) % 2000,
         TARGET_SCRIPT,
         f"run_name={name}",
         f"experiment={experiment}",
         f"test_mode={test_mode}",
     ] 
+    command = [str(x) for x in command]
     
-    command = list(map(str, command))
     rich.print(rich.panel.Panel(
         shlex.join(command),
         title="[bold]Running Command:",
@@ -110,6 +129,9 @@ def main(
 
     if not "SLURM_TMPDIR" in os.environ:
         os.environ["SLURM_TMPDIR"] = str(SCRIPT_DIR / "outputs")
+
+    if wandb_id:
+        os.environ["WANDB_RUN_ID"] = wandb_id
 
     os.execvp("accelerate", command)
 

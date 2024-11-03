@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /output_type: answer_only
+
+dataset_choice: 
+  _args_: ["gsm8k"]
+
+output_type:
+  train_batch_size:          30
+  eval_batch_size:           30
+  max_length:                350
+
+max_num_epochs:  2
+model_name_or_path: "HuggingFaceTB/SmolLM2-1.7B"

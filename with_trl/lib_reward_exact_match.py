@@ -8,7 +8,6 @@ import lib_utils
 
 LOGGER = logging.getLogger(__name__)
 
-
 class ExactMatchReward(lib_base_classes.Reward):
     def __init__(
         self,

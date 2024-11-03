@@ -11,7 +11,7 @@ model:
   inference_batch_size: 256
   mini_batch_size: 1
   model_name: "susnato/phi-2"
-  generation_batch_size: 1
+  train_generation_batch_size: 1
 
 name: "sentiment_main"
 learning_rate: 1.41e-5
