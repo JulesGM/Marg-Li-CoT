@@ -3,7 +3,7 @@ import rich
 import edit_distance
 import inquirer
 import more_itertools as mit
-import diskcache
+# import diskcache
 import pathlib
 
 # We decrement slowly. Should probably be date based too.
@@ -50,8 +50,10 @@ def check_experiment_and_suggest(experiment: str, folder: str | pathlib.Path) ->
     assert isinstance(experiment, (str, type(None))), experiment
     experiments = sorted(list_experiments(folder))
 
-    cache = diskcache.Cache(SCRIPT_DIR / ".experiment_cache")
-    counts = cache.get(str(folder))
+    # cache = diskcache.Cache(SCRIPT_DIR / ".experiment_cache")
+    # counts = cache.get(str(folder))
+    cache = None
+    counts = None
     if counts is None:
         counts = {}
         
@@ -101,6 +103,6 @@ def check_experiment_and_suggest(experiment: str, folder: str | pathlib.Path) ->
         if counts[exp] <= 0:
             del counts[exp]
 
-    cache.set(str(folder), counts)
+    # cache.set(str(folder), counts)
 
     return experiment

@@ -1,77 +1,77 @@
 name: qwen
 
 jobs:
-  # Sft experiments
-  - experiment: ao_arithmetic_qwen
-    code_category: sft
-    overloads:
-    gpu: l40s
-    dataset: arithmetic
+  # # Sft experiments
+  # - experiment: ao_arithmetic_qwen
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: arithmetic
 
-  - experiment: cot_arithmetic_qwen
-    code_category: sft
-    overloads:
-    gpu: l40s
-    dataset: arithmetic
+  # - experiment: cot_arithmetic_qwen
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: arithmetic
 
-  - experiment: ao_gsm8k_qwen
-    code_category: sft
-    overloads:
-    gpu: l40s
-    dataset: gsm8k
+  # - experiment: ao_gsm8k_qwen
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: gsm8k
 
-  - experiment: cot_gsm8k_qwen
-    code_category: sft
-    overloads:
-    gpu: l40s
-    dataset: gsm8k
+  # - experiment: cot_gsm8k_qwen
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: gsm8k
 
-  - experiment: ao_math_qwen
-    code_category: sft
-    overloads:
-    gpu: l40s
-    dataset: math
-
-  - experiment: cot_math_qwen
+  - experiment: qwen/ao_math_qwen
     code_category: sft
     overloads:
     gpu: l40s
     dataset: math
 
-  # few-shot (aka, no_training in trl)
-  - experiment: no_training/ao_arithmetic_qwen
-    code_category: trl
-    overloads: 
-    gpu: l40s
-    dataset: arithmetic
+  # - experiment: cot_math_qwen
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: math
 
-  - experiment: no_training/cot_arithmetic_qwen
-    code_category: trl
-    overloads:
-    gpu: l40s
-    dataset: arithmetic
+  # # few-shot (aka, no_training in trl)
+  # - experiment: no_training/ao_arithmetic_qwen
+  #   code_category: trl
+  #   overloads: 
+  #   gpu: l40s
+  #   dataset: arithmetic
+
+  # - experiment: no_training/cot_arithmetic_qwen
+  #   code_category: trl
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: arithmetic
 
 
-  - experiment: no_training/ao_gsm8k_qwen
-    code_category: trl
-    overloads:
-    gpu: l40s
-    dataset: gsm8k
+  # - experiment: no_training/ao_gsm8k_qwen
+  #   code_category: trl
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: gsm8k
 
-  - experiment: no_training/cot_gsm8k_qwen
-    code_category: trl
-    overloads:
-    gpu: l40s
-    dataset: gsm8k
+  # - experiment: no_training/cot_gsm8k_qwen
+  #   code_category: trl
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: gsm8k
     
-  - experiment: no_training/ao_math_qwen
-    code_category: trl
-    overloads:
-    gpu: l40s
-    dataset: math
+  # - experiment: no_training/ao_math_qwen
+  #   code_category: trl
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: math
 
-  - experiment: no_training/cot_math_qwen
-    code_category: trl
-    overloads:
-    gpu: l40s
-    dataset: math
+  # - experiment: no_training/cot_math_qwen
+  #   code_category: trl
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: math

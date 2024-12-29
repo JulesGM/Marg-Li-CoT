@@ -85,22 +85,24 @@ def get_num_cpus():
 
 def get_dataloaders(
     *,
-    answer_only:               bool,
-    data_directory:            pathlib.Path,
-    dataset_choice:            lib_utils.Datasets,
-    eval_batch_size:           int,
-    extractor_ignore_one_line: callable,
-    filter_bads:               bool,
-    forward_tokenizer:         transformers.PreTrainedTokenizerBase,  # type: ignore
-    prediction_tokenizer:      transformers.PreTrainedTokenizerBase,  # type: ignore
-    lm_mode:                   lib_sft_constants.LMModes,
-    outlines_context:          "bin_sft.OutlinesContextABC",
-    output_type:               lib_sft_constants.OutputTypes,
-    qty_eval_small:            int,
-    train_batch_size:          int,
-    seed:                      int,
-    subset_data:               str,
-    use_workers:               bool,
+    answer_only:                bool,
+    data_directory:             pathlib.Path,
+    dataset_choice:             lib_utils.Datasets,
+    eval_batch_size:            int,
+    extractor_ignore_one_line:  callable,
+    filter_bads:                bool,
+    forward_tokenizer:          transformers.PreTrainedTokenizerBase,  # type: ignore
+    prediction_tokenizer:       transformers.PreTrainedTokenizerBase,  # type: ignore
+    lm_mode:                    lib_sft_constants.LMModes,
+    outlines_context:           "bin_sft.OutlinesContextABC",
+    output_type:                lib_sft_constants.OutputTypes,
+    qty_eval_small:             int,
+    tok_max_query_length:       int,
+    tok_max_total_length:       int,
+    train_batch_size:           int,
+    seed:                       int,
+    subset_data:                str,
+    use_workers:                bool,
 ):
     ###########################################################################
     # Datasets
@@ -194,9 +196,9 @@ def get_dataloaders(
             
         elif dataset_choice == lib_utils.Datasets.GSM8K:
             dataset = lib_gsm8k.GSM8K(
-                tok_max_query_length  = 115,
+                tok_max_query_length  = tok_max_query_length,
                 tok_max_answer_length = None,
-                tok_max_total_length  = 290,
+                tok_max_total_length  = tok_max_total_length,
                 ds                    = gsm8k_splits[cv_set],
 
                 any_tokenizer         = forward_tokenizer,
@@ -212,7 +214,7 @@ def get_dataloaders(
         elif dataset_choice == lib_utils.Datasets.MATH:
             dataset = math_sft.MATHDataset(
                 cv_set,
-                max_num_tokens = 1024,
+                max_num_tokens = tok_max_total_length,
                 forward_tokenizer = forward_tokenizer,
                 prediction_tokenizer = prediction_tokenizer,
                 output_type = output_type,

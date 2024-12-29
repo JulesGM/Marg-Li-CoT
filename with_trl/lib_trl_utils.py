@@ -307,16 +307,16 @@ def generate(
         *, 
         answer_extractor,
         batch,
-        batch_size: int,
+        forward_tokenizer: transformers.PreTrainedTokenizerBase,
         generation_batch_size: int,
         generation_kwargs,
-        ppo_trainer,
         post_process_gen_fewshots_fn,
-        prediction_tokenizer,
-        forward_tokenizer,
-        task_name,
-        use_few_shots,
+        ppo_batch_size: int,
+        ppo_trainer: trl.PPOTrainer,
+        prediction_tokenizer: transformers.PreTrainedTokenizerBase,
         step_information,
+        task_name: str,
+        use_few_shots: int,
     ):
 
     print(f"[RANK: {RANK}] lib_trl_utils.batched_unroll: ({step_information = }) >>>")
@@ -342,14 +342,14 @@ def generate(
     print(f"{RANK} lib_trl_utils.batched_unroll <<<")
     if task_name == lib_utils.Task.MAIN:
         outputs = keep_good_one_generation(
-            ref_answers          = batch["ref_qa_answer"],
+            answer_extractor     = answer_extractor,
             difficulty_levels    = batch["difficulty_level"],
+            generations          = raw_gen_outputs,
+            ppo_batch_size= ppo_batch_size,
             num_return_seq       = generation_kwargs["num_return_sequences"],
             other_rewards        = dict(scores=scores),
-            generations          = raw_gen_outputs,
-            batch_size           = batch_size,
             prediction_tokenizer = prediction_tokenizer,
-            answer_extractor     = answer_extractor,
+            ref_answers          = batch["ref_qa_answer"],
         )
 
     else:
@@ -403,14 +403,14 @@ def check_max_qty_of_token_id(
 
 def keep_good_one_generation(
     *,
-    num_return_seq: int,
-    ref_answers: Union[list[list[str]], torch.Tensor],
-    batch_size: int,
-    prediction_tokenizer: Optional[transformers.PreTrainedTokenizerBase],  # type: ignore
     answer_extractor,
-    other_rewards: Optional[torch.Tensor],
-    generations: lib_base_classes.BatchedUnrollReturn,
     difficulty_levels: list[int],
+    ppo_batch_size: int,
+    generations: lib_base_classes.BatchedUnrollReturn,
+    num_return_seq: int,
+    other_rewards: Optional[torch.Tensor],
+    prediction_tokenizer: Optional[transformers.PreTrainedTokenizerBase],  # type: ignore
+    ref_answers: Union[list[list[str]], torch.Tensor],
 ) -> lib_base_classes.BatchedUnrollReturn:
     """
 
@@ -425,14 +425,14 @@ def keep_good_one_generation(
     array_response_text = np.array(
         generations.response_text,
         dtype=object,
-    ).reshape((batch_size, num_return_seq))
+    ).reshape((ppo_batch_size, num_return_seq))
 
     device = generations.response_tensors[0].device
     response_tensors = prediction_tokenizer.pad(
             dict(input_ids=generations.response_tensors), 
             return_tensors="pt", 
             padding=True,
-    )["input_ids"].reshape(batch_size, num_return_seq, -1)
+    )["input_ids"].reshape(ppo_batch_size, num_return_seq, -1)
     assert isinstance(ref_answers[0][0], str), type(ref_answers[0][0])
     selections = []
 
@@ -447,7 +447,9 @@ def keep_good_one_generation(
     )
     ratios_good = []
 
-    for b_idx in range(batch_size):
+
+    breakpoint()
+    for b_idx in range(ppo_batch_size):
         # Extract the reference answer
         ref_comparable = answer_extractor(ref_answers[b_idx])
         assert ref_comparable is not None, ref_answers[b_idx]
@@ -525,10 +527,10 @@ def keep_good_one_generation(
     #     # rich.print(table)
 
     selections = torch.tensor(selections)
-    assert selections.shape == (batch_size,), f"{selections.shape = } {batch_size = }"
+    assert selections.shape == (ppo_batch_size,), f"{selections.shape = } {ppo_batch_size = }"
     output_generations_tensors = []
 
-    for idx in range(batch_size):
+    for idx in range(ppo_batch_size):
         output_generations_tensors.append(
             response_tensors[idx][selections[idx]].detach().clone().to(device)
         )
@@ -1332,14 +1334,14 @@ def batched_unroll(
     *,
     accelerator,
     accelerated_model,
-    ref_text: list[str],
+    forward_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
     difficulty_levels,
     generation_kwargs: dict[str, typing.Any],
     generation_batch_size: int,
     post_process_gen_fewshots_fn,
     prediction_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
-    forward_tokenizer: transformers.PreTrainedTokenizerBase,  # type: ignore
     query_tensors: list[torch.Tensor],
+    ref_text: list[str],
     task_name: lib_utils.Task,
     use_few_shots: bool,
 ) -> lib_base_classes.BatchedUnrollReturn:
@@ -1360,6 +1362,7 @@ def batched_unroll(
         - 
         
     """
+
     batch_size = len(query_tensors)
     num_seqs = generation_kwargs.get("num_return_sequences", 1)
     assert isinstance(query_tensors, list) or (isinstance(query_tensors, torch.Tensor) and query_tensors.ndim == 2), type(query_tensors)
@@ -1402,7 +1405,7 @@ def batched_unroll(
         len(query_tensors), 
         generation_batch_size, 
         desc="Batched Unroll",
-    ):
+    ):        
     
         #######################################################################
         # Generate the sequences
@@ -1415,20 +1418,36 @@ def batched_unroll(
         ).to(accelerator.device)
 
         is_training_pre_gen = model.training
+
+        assert tokenized["input_ids"].shape[0] == min(
+            generation_batch_size, len(query_tensors) - i), (
+            tokenized["input_ids"].shape[0], 
+            generation_batch_size, 
+            len(query_tensors) - i,
+        )
+        
+
         model_outputs = model.eval().generate(
             tokenized["input_ids"],
-            **generation_kwargs,
             return_dict_in_generate = True, 
             output_scores           = True,
             pad_token_id            = prediction_tokenizer.pad_token_id,
+            **generation_kwargs,
+        )
+        
+        expected_num_sequences = (
+            len(tokenized["input_ids"]) * 
+            generation_kwargs["num_return_sequences"]
         )
 
-        expected_num_sequences = len(tokenized["input_ids"]) * generation_kwargs["num_return_sequences"]
         assert model_outputs["sequences"].shape[0] == expected_num_sequences, (
-            model_outputs["sequences"].shape, len(tokenized["input_ids"]), generation_kwargs["num_return_sequences"])
+            model_outputs["sequences"].shape, 
+            len(tokenized["input_ids"]), 
+            generation_kwargs["num_return_sequences"],
+        )
         
         model.train(is_training_pre_gen)
-        model_outputs = dict(**model_outputs) # ?
+        model_outputs = dict(**model_outputs)
         model_outputs = fix_sequence_scores(
             model_outputs        = model_outputs, 
             prediction_tokenizer = prediction_tokenizer
@@ -1439,7 +1458,6 @@ def batched_unroll(
         #######################################################################
         # Acts in place
         partial_outputs = remove_prompt_and_padding(
-
             tokenized            = tokenized,
             model_outputs        = model_outputs,
             prediction_tokenizer = prediction_tokenizer,

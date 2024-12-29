@@ -74,10 +74,10 @@ def launch(
     assert len(parts) == 3, parts
     wandb_url = f"https://wandb.ai/{parts[0]}/{parts[1]}/runs/{parts[2]}"
 
-    job_name = f"{output_root.name}/{run_dir.relative_to(output_root)} || {wandb_url}"
+    job_name = f"{output_root.name}_{run_dir.relative_to(output_root)}_{wandb_url}"
 
     slurm = simple_slurm.Slurm(
-        job_name=shlex.quote(job_name),
+        job_name=job_name,
         output=run_dir / f"logs.out",
         error=run_dir / f"logs.err",
         partition="long",

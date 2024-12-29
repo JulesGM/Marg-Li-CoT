@@ -1,7 +1,0 @@
-# @package _global_
-defaults:
-  - override /output_type:  outlines
-experiment_name: outlines
-
-dataset_choice: 
-  _args_: ["gsm8k"]

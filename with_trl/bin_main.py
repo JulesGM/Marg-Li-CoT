@@ -34,6 +34,10 @@ import logging
 import pathlib
 import random
 import subprocess
+import tempfile
+
+hf_directory = tempfile.TemporaryDirectory()
+os.environ["HF_HOME"] = hf_directory.name
 
 import accelerate
 import datasets
@@ -72,7 +76,7 @@ import pretrainable_value_fn_ppo_trainer
 
 datasets.disable_caching()
 rich.traceback.install(console=rich.console.Console(markup=True))
-
+torch.set_float32_matmul_precision("high")
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
@@ -99,140 +103,17 @@ CE = lib_trl_utils.CurriculumSchedule.CE
 
 hydra_config.register_configs()
 
-@hydra.main(version_base="1.3", config_path="config", config_name="config")
-def main(cfg: hydra_config.BaseConfigHydra) -> None:
-
-    args = omegaconf.OmegaConf.to_container(cfg, resolve=True) # Convert to dict for logging purposes
-    hydra_config.BaseConfigHydra(**args)  # Check that the config is valid
-
-    precision = lib_utils.ValidPrecisions(cfg.precision)  # type: ignore
-    slurm_job_id = os.environ.get("SLURM_JOB_ID", None)
-    no_training = cfg.no_training
-    name = hydra_config.get_hydra_experiment_choice()
-    use_curriculum = cfg.use_curriculum
-    float32_precision_forward_backward = cfg.float32_precision_forward_backward
-    use_few_shots = cfg.use_few_shots
-    answer_only = cfg.answer_only
-    float32_precision_generation = cfg.float32_precision_generation
-    eval_every = int(cfg.eval_every)
-    max_epochs = int(cfg.max_epochs) if cfg.max_epochs else None
-    acc_maintain = cfg.acc_maintain
+def _wandb_init(
+        *, 
+        cfg: hydra_config.BaseConfigHydra, 
+        name: str, 
+        train_generation_kwargs: dict, 
+        peft_config_dict: dict, 
+        ppo_config_dict: dict, 
+        args: dict,
+        slurm_job_id
+    ) -> None:
     
-    assert not (cfg.value_pretrain_steps and cfg.value_pretrain_epochs), (
-        "value_pretrain_steps and value_pretrain_epochs are mutually exclusive"
-    )
-
-    # assert not cfg.answer_only, "Needs to be re-examined"
-    
-    if acc_maintain:
-        assert WORLD_SIZE == 1, WORLD_SIZE
-        acc_maintainer = lib_trl_utils.MAINTAINER_NAME_TO_CLASS[
-            cfg.acc_maintain.class_name](
-                cfg.acc_maintain.limit_to_respect
-            )
-
-    # Display command line args
-    if RANK == 0:
-        lib_utils.readable(args, "Command line args")
-
-    # Check some command line args
-    assert cfg.ppo_config.kl_penalty in {"kl", "abs", "mse", "full"}, cfg.ppo_config.kl_penalty
-    batch_size = cfg.batch_size // WORLD_SIZE
-
-
-    dataset_name = lib_data.DatasetChoices(cfg.dataset_name)
-    eval_batch_size: int = cfg.eval_batch_size
-    task_name = lib_utils.Task(cfg.task_name)
-
-    # Make the output shorted if we use answer_only
-    if cfg.answer_only:
-        assert not task_name == lib_utils.Task.SENTIMENT, task_name
-        cfg.train_generation_kwargs.max_new_tokens = 10
-        cfg.eval_generation_kwargs.max_new_tokens = 10
-
-    train_generation_kwargs = omegaconf.OmegaConf.to_object(cfg.train_generation_kwargs)
-    eval_generation_kwargs: transformers.GenerationConfig = omegaconf.OmegaConf.to_object(
-        cfg.eval_generation_kwargs)
-
-    if use_curriculum:
-        # We could do progressively longer sequences.
-        assert not task_name == lib_utils.Task.SENTIMENT, task_name
-
-        curriculum_schedule = omegaconf.OmegaConf.to_object(
-            cfg.curriculum_schedule
-        )
-        assert curriculum_schedule
-
-        if not isinstance(curriculum_schedule, CS):
-            curriculum_schedule = CS(literals=curriculum_schedule)
-        else:
-            # Only in else because CS.__init__ already calls check
-            curriculum_schedule.check()
-
-        # Just test a few
-        curriculum_schedule(0)
-        curriculum_schedule(1)
-        all_levels = sorted(set(itertools.chain.from_iterable(
-            entry.enabled_difficulties for entry in curriculum_schedule
-        )))
-
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        datefmt="%H:%M:%S",
-        handlers=[rich.logging.RichHandler(markup=True)],
-        format=f"[{RANK}/{WORLD_SIZE}] %(funcName)s:%(lineno)d - %(message)s",
-    )
-    logging.getLogger("transformers").setLevel(logging.ERROR)
-
-    if RANK != 0:
-        logging.getLogger("peft_lora").setLevel(logging.ERROR)
-        logging.getLogger("datasets").setLevel(logging.ERROR)
-
-    ###########################################################################
-    # Find the type of model we are using
-    ###########################################################################
-
-    peft_config_dict: hydra_config.PeftConfigHydra = omegaconf.OmegaConf.to_object(cfg.peft_config)
-    peft_config_dict.task_type = peft.TaskType.CAUSAL_LM
-    assert isinstance(peft_config_dict, hydra_config.PeftConfigHydra), (
-        f"Expected peft_config_dict to be of type hydra_config.PeftConfigHydra, "
-        f"but got {type(peft_config_dict)}"
-    )
-    ppo_config = omegaconf.OmegaConf.to_object(cfg.ppo_config)
-    assert not cfg.peft_do_all_lin_layers, cfg.peft_do_all_lin_layers
-
-    accelerator_kwargs = dict(
-        kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(
-                find_unused_parameters=True)])
-
-    ppo_config_dict = dict(
-        batch_size                  = batch_size,
-
-        mini_batch_size             = cfg.mini_batch_size,
-        model_name                  = cfg.model.model_name,
-        
-        accelerator_kwargs          = accelerator_kwargs,
-        log_with                    = "wandb",
-
-        **vars(ppo_config),
-    )
-
-    trl_config: trl.PPOConfig = lib_trl_utils.FixedPPOConfig(
-        **ppo_config_dict)
-    
-    
-    if RANK == 0:
-        lib_utils.readable(vars(trl_config), title="ppo_config")
-
-    if task_name == lib_utils.Task.MAIN:
-        reward_type = lib_utils.RewardChoices(cfg.reward_type)
-    else:
-        assert task_name == lib_utils.Task.SENTIMENT, task_name
-        reward_type = cfg.reward_type
-        assert reward_type is None, reward_type
-
-
     if RANK == 0:
         wandb_dir = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
         assert wandb_dir.exists(), f"Wandb directory '{wandb_dir}' does not exist."
@@ -268,11 +149,113 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
             )
         )
 
+def _maybe_curriculum_setup(
+        *, 
+        cfg: hydra_config.BaseConfigHydra,
+        use_curriculum: bool,
+        task_name: lib_utils.Task,
+    ) -> None:    
+    if use_curriculum:
+        # We could do progressively longer sequences.
+        assert not task_name == lib_utils.Task.SENTIMENT, task_name
+
+        curriculum_schedule = omegaconf.OmegaConf.to_object(
+            cfg.curriculum_schedule
+        )
+        assert curriculum_schedule
+
+        if not isinstance(curriculum_schedule, CS):
+            curriculum_schedule = CS(literals=curriculum_schedule)
+        else:
+            # Only in else because CS.__init__ already calls check
+            curriculum_schedule.check()
+
+        # Just test a few
+        curriculum_schedule(0)
+        curriculum_schedule(1)
+        all_levels = sorted(set(itertools.chain.from_iterable(
+            entry.enabled_difficulties for entry in curriculum_schedule
+        )))
+
+        return curriculum_schedule, all_levels
+    return None, None
+
+def _setup_logging():
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        datefmt="%H:%M:%S",
+        handlers=[rich.logging.RichHandler(markup=True)],
+        format=f"[{RANK}/{WORLD_SIZE}] %(funcName)s:%(lineno)d - %(message)s",
+    )
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+
+    if RANK != 0:
+        logging.getLogger("peft_lora").setLevel(logging.ERROR)
+        logging.getLogger("datasets").setLevel(logging.ERROR)
+
+
+def _peft_and_trl_config(*, cfg):
+    
+    peft_config_dict: hydra_config.PeftConfigHydra = omegaconf.OmegaConf.to_object(cfg.peft_config)
+    peft_config_dict.task_type = peft.TaskType.CAUSAL_LM
+    assert isinstance(peft_config_dict, hydra_config.PeftConfigHydra), (
+        f"Expected peft_config_dict to be of type hydra_config.PeftConfigHydra, "
+        f"but got {type(peft_config_dict)}"
+    )
+    ppo_config = omegaconf.OmegaConf.to_object(cfg.ppo_config)
+    assert not cfg.peft_do_all_lin_layers, cfg.peft_do_all_lin_layers
+
+    accelerator_kwargs = dict(
+        kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(
+                find_unused_parameters=True)])
+
+    ppo_config_dict = dict(
+        batch_size                  = cfg.ppo_batch_size,
+
+        mini_batch_size             = cfg.mini_batch_size,
+        model_name                  = cfg.model.model_name,
+        
+        accelerator_kwargs          = accelerator_kwargs,
+        log_with                    = "wandb",
+
+        **vars(ppo_config),
+    )
+
+    # trl_config: trl.PPOConfig = lib_trl_utils.FixedPPOConfig(
+    #     **ppo_config_dict)
+    trl_config: trl.PPOConfig = trl.PPOConfig(
+        **ppo_config_dict)
+
+    if RANK == 0:
+        lib_utils.readable(vars(trl_config), title="ppo_config")
+
     assert isinstance(trl_config.model_name, str), type(trl_config.model_name)
 
-    ###########################################################################
-    # Load Model
-    ###########################################################################
+    return peft_config_dict, trl_config, ppo_config_dict
+
+
+@hydra.main(version_base="1.3", config_path="config", config_name="config")
+def main(cfg: hydra_config.BaseConfigHydra) -> None:
+
+    args = omegaconf.OmegaConf.to_container(cfg, resolve=True) # Convert to dict for logging purposes
+    hydra_config.BaseConfigHydra(**args)  # Check that the config is valid
+
+    precision = lib_utils.ValidPrecisions(cfg.precision)  # type: ignore
+    slurm_job_id = os.environ.get("SLURM_JOB_ID", None)
+    no_training = cfg.no_training
+    name = hydra_config.get_hydra_experiment_choice()
+    use_curriculum = cfg.use_curriculum
+    float32_precision_forward_backward = cfg.float32_precision_forward_backward
+    use_few_shots = cfg.use_few_shots
+    answer_only = cfg.answer_only
+    float32_precision_generation = cfg.float32_precision_generation
+    eval_every = int(cfg.eval_every)
+    max_epochs = int(cfg.max_epochs) if cfg.max_epochs else None
+    acc_maintain = cfg.acc_maintain
+    task_name = lib_utils.Task(cfg.task_name)
+
+
     assert cfg.use_peft
     assert not cfg.peft_do_all_lin_layers, cfg.peft_do_all_lin_layers
     # assert precision == torch.float32, precision
@@ -285,6 +268,72 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
         float32_precision_forward_backward
     )
     
+    assert not (cfg.value_pretrain_steps and cfg.value_pretrain_epochs), (
+        "value_pretrain_steps and value_pretrain_epochs are mutually exclusive"
+    )
+    assert cfg.ppo_config.kl_penalty in {"kl", "abs", "mse", "full"}, (
+        cfg.ppo_config.kl_penalty)
+    
+    if task_name == lib_utils.Task.MAIN:
+        reward_type = lib_utils.RewardChoices(cfg.reward_type)
+    else:
+        assert task_name == lib_utils.Task.SENTIMENT, task_name
+        reward_type = cfg.reward_type
+        assert reward_type is None, reward_type
+
+    # assert not cfg.answer_only, "Needs to be re-examined"
+    
+    if use_curriculum and acc_maintain:
+        assert WORLD_SIZE == 1, WORLD_SIZE
+        acc_maintainer = lib_trl_utils.MAINTAINER_NAME_TO_CLASS[
+            cfg.acc_maintain.class_name](
+                cfg.acc_maintain.limit_to_respect
+            )
+
+    # Display command line args
+    if RANK == 0:
+        lib_utils.readable(args, "Command line args")
+
+    # Check some command line args
+    dataset_name = lib_data.DatasetChoices(cfg.dataset_name)
+    eval_batch_size: int = cfg.eval_batch_size
+
+    # Make the output shorted if we use answer_only
+    if cfg.answer_only:
+        assert not task_name == lib_utils.Task.SENTIMENT, task_name
+        cfg.train_generation_kwargs.max_new_tokens = 10
+        cfg.eval_generation_kwargs.max_new_tokens = 10
+
+    train_generation_kwargs = omegaconf.OmegaConf.to_object(cfg.train_generation_kwargs)
+    eval_generation_kwargs: transformers.GenerationConfig = omegaconf.OmegaConf.to_object(
+        cfg.eval_generation_kwargs)
+
+    curriculum_schedule, all_levels = _maybe_curriculum_setup(
+        cfg=cfg,
+        use_curriculum=use_curriculum,
+        task_name=task_name
+    )
+
+    _setup_logging()
+
+    ###########################################################################
+    # Find the type of model we are using
+    ###########################################################################
+    peft_config_dict, trl_config, ppo_config_dict = _peft_and_trl_config(cfg=cfg)
+    _wandb_init(
+        cfg=cfg,
+        name=name,
+        train_generation_kwargs=train_generation_kwargs,
+        peft_config_dict=peft_config_dict,
+        ppo_config_dict=ppo_config_dict,
+        args=args,
+        slurm_job_id=slurm_job_id,
+    )
+
+
+    ###########################################################################
+    # Load Model
+    ###########################################################################
     with lib_utils.maybe_context_manager(
         lambda: rich.status.Status(
             f"[bold green]({RANK}/{WORLD_SIZE})Loading model: "
@@ -356,7 +405,6 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
         **shared_dataset_arguments,
     )
     
-    
     ###########################################################################
     # Prep Training
     ###########################################################################
@@ -373,20 +421,23 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     # else:
     data_collator_arg = data_collator
     dataset_arg       = dataset
-        
 
     # ds_plugin = accelerate.utils.DeepSpeedPlugin(gradient_accumulation_steps=1)
     # ds_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = cfg.mini_batch_size
     # ds_plugin.deepspeed_config["train_batch_size"] = cfg.mini_batch_size * WORLD_SIZE
     # trl_config.accelerator_kwargs["deepspeed_plugin"] = ds_plugin
 
-    breakpoint()
-    ppo_trainer: trl.PPOTrainer = pretrainable_value_fn_ppo_trainer.ValuePretrainablePPOTrainer(
+    if cfg.value_pretrain_epochs or cfg.value_pretrain_steps:
+        trainer_class = pretrainable_value_fn_ppo_trainer.ValuePretrainablePPOTrainer
+    else:
+        trainer_class = trl.PPOTrainer
+
+    ppo_trainer: trl.PPOTrainer = trainer_class(
         config        = trl_config,
         ref_model     = None,
         tokenizer     = forward_tokenizer,
         data_collator = data_collator_arg,
-        dataset       = dataset_arg,
+        dataset       = dataset_arg,        
         **trainer_kwargs,
     )
     
@@ -442,7 +493,6 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
         use_few_shots         = use_few_shots,
     )
 
-
     if cfg.just_start_metrics or cfg.start_eval:
         # train_eval(0)
         eval_eval(0)
@@ -456,15 +506,16 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
     epoch_count = -1
 
     # if use_curriculum:
-    assert WORLD_SIZE == 1, WORLD_SIZE
-    dataloader = torch.utils.data.DataLoader(
-        batch_size  = batch_size,
-        collate_fn  = data_collator,
-        dataset     = dataset, 
-        num_workers = 0,
-    )
-    # else:
-        # dataloader = ppo_trainer.dataloader
+    # assert WORLD_SIZE == 1, WORLD_SIZE
+    # dataloader = torch.utils.data.DataLoader(
+    #     batch_size  = cfg.dataloader_batch_size,
+    #     collate_fn  = data_collator,
+    #     dataset     = dataset, 
+    #     num_workers = 0,
+    # )
+    # # else:
+
+    dataloader = ppo_trainer.dataloader
 
     current_step = 0
     lib_utils.named_barrier(f"bin_main {lib_utils.get_linenumber()}")
@@ -524,7 +575,6 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                     rich.print("[red bold]DONE WITH EVAL")
 
             lib_utils.named_barrier(f"bin_main {lib_utils.get_linenumber()}")
-            torch.set_float32_matmul_precision(float32_precision_generation)
 
             # We use a format string to make sure that each
             # sample are place in the same way, including the 
@@ -543,7 +593,7 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
             outputs = lib_trl_utils.generate(
                 answer_extractor             = dataset.get_extractor(),
                 batch                        = batch, 
-                batch_size                   = batch_size,
+                ppo_batch_size               = cfg.ppo_batch_size,
                 generation_batch_size        = cfg.train_generation_batch_size,
                 generation_kwargs            = train_generation_kwargs, 
                 ppo_trainer                  = ppo_trainer,
@@ -559,9 +609,7 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                 ),
             )
 
-            torch.set_float32_matmul_precision(float32_precision_forward_backward)
             lib_utils.named_barrier(f"bin_main {lib_utils.get_linenumber()}")
-
             reward_output = reward_fn(
                 batch=batch,
                 responses=outputs.response_text,
@@ -592,7 +640,6 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
             if RANK == 0: 
                 print(f"{RANK} ppo_trainer.step >>>")
 
-            step_kwargs = {}
             lib_utils.named_barrier(f"{__file__}: {lib_utils.get_linenumber()}")
             
             # Log scores per difficulty level
@@ -619,8 +666,8 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                             wandb.log(
                                 {
                                     f"reward_per_level/{k}": v.mean().item(),
-                                    f"sample_count_per_level/{k}": 
-                                    len(v) / (batch_size * ppo_trainer.accelerator.num_processes),
+                                    # f"sample_count_per_level/{k}": 
+                                    # len(v) / (batch_size * ppo_trainer.accelerator.num_processes),
                                 }, 
                                 step=ppo_trainer.current_step,
                             )
@@ -697,13 +744,25 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                 (cfg.value_pretrain_epochs and (epoch < cfg.value_pretrain_epochs)) or 
                 (cfg.value_pretrain_steps and (ppo_trainer.current_step < cfg.value_pretrain_steps))
             )
+
+            assert not is_value_fn_pretraining_step, (
+                is_value_fn_pretraining_step
+            )
+            assert not isinstance(
+                ppo_trainer, 
+                pretrainable_value_fn_ppo_trainer.ValuePretrainablePPOTrainer
+            ), type(ppo_trainer)
             
             ###################################################################
             ctx = contextlib.nullcontext()
+            step_kwargs = {}
             if is_value_fn_pretraining_step:
                 rich.print("[red bold]Value Function Pretraining Step")
                 if cfg.disable_adapter_value_pretrain:
                     ctx = ppo_trainer.optional_peft_ctx()
+            
+            if isinstance(ppo_trainer, pretrainable_value_fn_ppo_trainer.ValuePretrainablePPOTrainer):
+                step_kwargs["only_value_function_trainable"] = is_value_fn_pretraining_step
             ###################################################################
 
             with ctx:
@@ -711,7 +770,6 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                     queries   = batch["tok_ref_query"],
                     responses = outputs.response_tensors,
                     scores    = reward_output.values,
-                    only_value_function_trainable = is_value_fn_pretraining_step,
                     **step_kwargs,
                 )
 
@@ -732,7 +790,7 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                 extracted_gen    = reward_output.extracted_gen,
                 extracted_ref    = reward_output.extracted_ref,
                 epoch            = [epoch],
-                disabled_adapter = [0], #[int(should_disable_adapter)],
+                # disabled_adapter = [], #[int(should_disable_adapter)],
             )
 
             assert current_step == ppo_trainer.current_step, (
@@ -751,7 +809,7 @@ def main(cfg: hydra_config.BaseConfigHydra) -> None:
                     "difficulty_level",
                     "extracted_gen",
                     "extracted_ref",
-                    "disabled_adapter",
+                    # "disabled_adapter",
                 ],
             )
             lib_utils.named_barrier(f"{__file__}: {lib_utils.get_linenumber()}")

@@ -112,7 +112,7 @@ def data_item_collator(
     samples = []
     batch_size = len(batch["ref_qa_question"])
     first_part_format = "Question: {query}\nReasoning: "
-    few_shot_format = first_part_format + "{scratchpad}\nAnswer: {answer}\n\n"
+    few_shot_format = first_part_format + "{scratchpad}\nAnswer: {answer} !\n\n"
 
     # 1. Format the sample according to the format we just defined
     # 2. Add the few-shot examples
@@ -192,16 +192,16 @@ def prep_dataset_rl(
         assert few_show_qty >= 1, f"few_show_qty: {few_show_qty}"
 
         dataset = with_trl.libs_data.lib_gsm8k.GSM8K(
-            any_tokenizer=any_tokenizer,
-            cv_set=split,
-            device=torch.device(LOCAL_RANK),
-            ds=ds,
-            few_show_qty=few_show_qty,
-            tok_max_query_length=tok_max_query_length,
-            tok_max_answer_length=tok_max_answer_length,
-            tok_max_total_length=tok_max_total_length,
-            use_curriculum=use_curriculum,
-            use_few_shots=use_few_shots,
+            any_tokenizer         = any_tokenizer,
+            cv_set                = split,
+            device                = torch.device(LOCAL_RANK),
+            ds                    = ds,
+            few_show_qty          = few_show_qty,
+            tok_max_query_length  = tok_max_query_length,
+            tok_max_answer_length = tok_max_answer_length,
+            tok_max_total_length  = tok_max_total_length,
+            use_curriculum        = use_curriculum,
+            use_few_shots         = use_few_shots,
         )
 
     elif dataset_name == DatasetChoices.MATH:

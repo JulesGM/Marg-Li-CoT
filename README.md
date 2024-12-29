@@ -5,21 +5,21 @@
 - Uses [our QLora standalone lib](https://github.com/JulesGM/peft_qlora) for [QLora](https://arxiv.org/abs/2305.14314).
 
 
+## Sets of TRL and/or SFT jobs:
+Launch jobs with
+
+    ./job_sets/launch_sets.py <job_set_name>   
+
+Check the status with:
+
+    ./job_sets/check_status.py
+
 ## With TRL:
 Where the reinforcement learning is located.
 
+    ./with_trl/launch.py <experiment_name>
 
 ## Approach SFT:
-There, one finds the supervised baselines:
 
-- Generate, then learn, masked.
-
-Launch all SFT jobs with 
-
-```bash
-
-cd approach_sft
-./queue_all_jobs.sh
-
-```
+    ./approach_sft/launch.py <experiment_name>
 

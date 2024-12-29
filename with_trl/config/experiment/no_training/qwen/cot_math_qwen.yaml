@@ -29,6 +29,7 @@ eval_subset_size: null
 answer_only_max_length: 15
 eval_every: 0
 just_start_metrics: True
+start_eval: true
 
 ################################################################################
 # This should never change

@@ -1,4 +1,8 @@
+import ast
+import random
+import string
 import time
+
 import tqdm
 import wandb
 import uuid
@@ -6,8 +10,10 @@ import uuid
 import _constants
 import _common
 
+
 def generate_run_suffix():
-    return str(uuid.uuid4().hex[:8])
+    # We start with a letter to avoid the case where the run id is parsed as a number.
+    return random.choice(string.ascii_lowercase) + str(uuid.uuid4().hex[:8])
 
 
 def make_wandb_project_id(
@@ -42,7 +48,21 @@ def make_run_id(user_id, project):
 def generate_wandb_id(*, user_id, project):
     while True:
         run_id, run_suffix = make_run_id(user_id, project)
-        if not check_if_run_exists(run_id):
+        
+        try:
+            parsed = ast.literal_eval(run_suffix)
+            good = False
+        except ValueError as e:
+            if not "malformed node or string" in str(e):
+                raise 
+            good = True
+
+        if not good:
+            print(f"Wandb run id parses to a {type(parsed)}, generating new run id")
+        elif check_if_run_exists(run_id):
+            print(f"Run {run_id} already exists, generating new run id")
+        else:
             return run_id, run_suffix
-        print(f"Run {run_id} already exists, generating new run id")
+        
         _common.wait(1)
+        

@@ -8,7 +8,7 @@ dataset_choice:
 output_type:
   train_batch_size:          18
   eval_batch_size:           18
-  max_length:                170
+  max_length:                512
 
 model_name_or_path: "HuggingFaceTB/SmolLM2-1.7B"
 max_num_epochs: 2

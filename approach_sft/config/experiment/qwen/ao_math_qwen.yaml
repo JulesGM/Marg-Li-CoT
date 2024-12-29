@@ -7,8 +7,9 @@ dataset_choice:
 
 output_type:
   train_batch_size:          8
-  eval_batch_size:           8
-  max_length:                768
+  eval_batch_size:           16
+  max_length:                1024
 
 model_name_or_path: "Qwen/Qwen2.5-1.5B"
-max_num_epochs: 2
+max_num_epochs: 4
+learning_rate: 0.0001

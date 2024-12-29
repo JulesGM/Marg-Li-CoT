@@ -14,10 +14,15 @@ python launch.py answer_only
 python launch.py outlines
 
 """
-import subprocess as sp
-import shlex
 import os
+import json
 import pathlib
+import random
+import shlex
+import subprocess as sp
+import sys
+import re
+from typing import Union
 
 import fire
 import more_itertools as mit
@@ -26,12 +31,7 @@ import rich
 import rich.panel
 import rich.console
 import rich.traceback
-import sys
-from typing import Union
 
-import os
-import json
-import subprocess as sp
 
 rich.traceback.install(console=rich.console.Console(markup=True))
 
@@ -104,7 +104,6 @@ def main(
     assert isinstance(one, bool), one
     num_processes = 1 if one else pynvml.nvmlDeviceGetCount()
 
-    import random
     command = [
         "accelerate",
         "launch",
@@ -112,7 +111,7 @@ def main(
         "--config_file", config_path,
         "--num_machines", 1,
         "--main_process_port", 
-        29500 + (int(os.environ["SLURM_JOB_ID"]) + random.randint(0, 1234)) % 2000,
+        29500 + (int(os.environ["SLURM_JOB_ID"]) + random.randint(0, 2000)) % 2000,
         TARGET_SCRIPT,
         f"run_name={name}",
         f"experiment={experiment}",
@@ -131,6 +130,13 @@ def main(
         os.environ["SLURM_TMPDIR"] = str(SCRIPT_DIR / "outputs")
 
     if wandb_id:
+        if not isinstance(wandb_id, str):
+            assert isinstance(wandb_id, (int, float)), wandb_id
+            if isinstance(wandb_id, float):
+                assert int(wandb_id) == float(wandb_id), wandb_id
+            wandb_id = str(int(wandb_id))
+        
+        assert re.match(r"^\w+$", wandb_id), wandb_id
         os.environ["WANDB_RUN_ID"] = wandb_id
 
     os.execvp("accelerate", command)

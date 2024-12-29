@@ -1,5 +1,6 @@
 import pathlib
 import sys
+from typing import Optional
 
 import datasets
 import fire
@@ -41,7 +42,7 @@ class MATHDataset(torch.utils.data.Dataset):
     def __init__(
             self, 
             split: lib_utils.CVSets, 
-            max_num_tokens: int, 
+            max_num_tokens: Optional[int],
             forward_tokenizer, 
             prediction_tokenizer,
             output_type: lib_sft_constants.OutputTypes,
@@ -90,9 +91,13 @@ class MATHDataset(torch.utils.data.Dataset):
                 continue
 
             collated = collator([preped_sample])
-            forward = len(mit.one(collated["forward"]["input_ids"])) > max_num_tokens
-            prediction = len(mit.one(collated["predict"]["input_ids"])) > max_num_tokens
-            if not (forward or prediction):
+            
+            if max_num_tokens:
+                forward = len(mit.one(collated["forward"]["input_ids"])) > max_num_tokens
+                prediction = len(mit.one(collated["predict"]["input_ids"])) > max_num_tokens
+                if not (forward or prediction):
+                    outputs.append(raw_sample)
+            else:
                 outputs.append(raw_sample)
 
         rich.print(
@@ -134,6 +139,7 @@ class MATHDataset(torch.utils.data.Dataset):
             formatted_forward=self._apply_format(self._hf_dataset[idx], "forward"),
             formatted_prediction=self._apply_format(self._hf_dataset[idx], "prediction"),
             ref_qa_answer=self._hf_dataset[idx]["solution"],
+            ref_qa_question=self._hf_dataset[idx]["problem"],
         )
         return a
 
@@ -160,6 +166,7 @@ class MATHCollator:
         formatted_forward = [x["formatted_forward"] for x in batch]
         formatted_prediction = [x["formatted_prediction"] for x in batch]
         ref_qa_answer_batch = [x["ref_qa_answer"] for x in batch]
+        ref_qa_question_batch = [x["ref_qa_question"] for x in batch]
 
         forward_input_ids = self._forward_tokenizer(
             formatted_forward,
@@ -178,6 +185,7 @@ class MATHCollator:
             predict=predict_input_ids,
             extra_info=dict(
                 ref_qa_answer=ref_qa_answer_batch,
+                ref_qa_question=ref_qa_question_batch,
             ),
         )
 

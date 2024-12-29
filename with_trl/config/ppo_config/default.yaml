@@ -3,7 +3,9 @@ defaults:
 
 kl_penalty: "kl" # "kl", "abs", "mse", "full"
 ratio_threshold: 10
-learning_rate: ???
 adap_kl_ctrl: False
-init_kl_coef: 0.2
+init_kl_coef: 0.0001
 gradient_accumulation_steps: 1
+
+max_grad_norm: 1.0
+ppo_epochs: 2

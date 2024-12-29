@@ -193,6 +193,7 @@ class DSIterator(torch.utils.data.Dataset):
 class Arithmetic(
     # lib_base.FewShotMixin,
     # lib_base.IterableDataset,
+    torch.utils.data.Dataset,
 ):
     def __init__(
             self, 
@@ -484,6 +485,11 @@ class Arithmetic(
             for x in any_tokenizer(text_list)["input_ids"]
         ]
 
+    def __getitem__(self, idx):
+        return self._core[idx]
+
+    def __len__(self):
+        return len(self._core)
 
 class PerNumberOfDigitsAccuracy(lib_base_classes.Metric):
     """Exact match answer accuracy.

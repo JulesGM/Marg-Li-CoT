@@ -258,7 +258,7 @@ class ArithmeticCausalMaskedCollator:
         ).logical_and(forward_input_tok.attention_mask).sum(-1)
 
         if not (qty_unmasked_eos == 1).all():
-            breakpoint()
+            raise RuntimeError(forward_input_tok.input_ids)
         assert (qty_unmasked_eos == 1).all(), qty_unmasked_eos
 
         predict_input_tok = self._prediction_tokenizer.pad(

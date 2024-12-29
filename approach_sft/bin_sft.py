@@ -17,6 +17,8 @@ import tempfile
 from typing import Optional
 
 
+hf_directory = tempfile.TemporaryDirectory()
+os.environ["HF_HOME"] = hf_directory.name
 os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
 os.environ["DATASETS_VERBOSITY"] = "warning"
 # os.environ["WANDB_SILENT"] = "true"
@@ -537,6 +539,7 @@ class Evaluator:
             dict_to_log[f"{self._cv_split.value}/loss"] = np.mean(losses)
             wandb.log(dict_to_log, step=global_step)
 
+
 class ForwardLogger:
     def __init__(self, *, any_tokenizer, cv_set):
         if RANK == 0:
@@ -561,37 +564,16 @@ OUTLINES_CLASSES = {
     lib_utils.Datasets.ARITHMETIC: ArithmeticOutlinesContext,
 }
 
-@hydra.main(
-    version_base="1.3.2", 
-    config_path="config", 
-    config_name="config",
-)
-def main(
-    cfg: omegaconf.DictConfig,
-):
 
-    PROC_ID = os.getpid()
-    print(f"({PROC_ID}) ({__name__}) RANK={RANK}, LOCAL_RANK={LOCAL_RANK}, WORLD_SIZE={WORLD_SIZE}")
-    assert not cfg.just_device_map
+def all_gather_object(obj):
+    container = [None for _ in range(WORLD_SIZE)]
+    torch.distributed.all_gather_object(container, obj)
+    return container
 
-    cfg = hydra.utils.instantiate(cfg)
-    accelerator = accelerate.Accelerator()
 
-    # We convert the enums to their values so they can be displayed in wandb.
-    # for k, v in args.items():
-    #     if isinstance(v, enum.Enum):
-    #         args[k] = v.value
-
-    ###########################################################################
-    # 🔍 Checks, Wandb then Metrics
-    ###########################################################################
-    
-    is_encoder_decoder = lib_sft_utils.get_is_encoder_decoder(
-        cfg.model_name_or_path)
-    assert not is_encoder_decoder, "Encoder decoder not supported yet."
-    
+def _setup_wandb(*, cfg):
     experiment = hydra.core.hydra_config.HydraConfig.get().runtime.choices["experiment"]
-    
+
     # Assign a printable timestamp
     if RANK == 0:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -599,9 +581,7 @@ def main(
         timestamp = None
     
     if WORLD_SIZE > 1:
-        container = [None for _ in range(WORLD_SIZE)]
-        torch.distributed.all_gather_object(container, timestamp)
-        timestamp = container[0]
+        timestamp = all_gather_object(timestamp)[0]
 
     save_path = pathlib.Path(cfg.save_path) / f"{experiment}-{timestamp}"
     if RANK == 0:
@@ -623,9 +603,10 @@ def main(
             mode     = "disabled" if cfg.test_mode else "online",
         )
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.model_name_or_path)
-    tokenizer.pad_token = tokenizer.eos_token
+    return save_path
 
+
+def _setup_metrics(*, cfg, tokenizer):
     if cfg.dataset_choice == lib_utils.Datasets.ARITHMETIC:
         metrics = dict(
             exact_match = lib_metric.ScratchpadAnswerAccuracy(
@@ -649,15 +630,117 @@ def main(
         )
     else:
         raise NotImplementedError(cfg.dataset_choice)
-        
+    return metrics
+
+
+def _save_checkpoint(
+    *, 
+    save_path: pathlib.Path,
+    cfg: omegaconf.DictConfig, 
+    epoch_idx: int, 
+    global_step: int, 
+    model: peft.PeftModelForCausalLM | transformers.PreTrainedModel, 
+    optimizer: torch.optim.Optimizer,
+    forward_tokenizer: transformers.PreTrainedTokenizerBase, 
+    prediction_tokenizer: transformers.PreTrainedTokenizerBase,
+):
+    ckpt_dir = save_path / str(epoch_idx)
+    ckpt_dir.mkdir(exist_ok=False)
+
+    torch.save(dict(
+        cfg=cfg,
+        optimizer=optimizer.state_dict(),
+        epoch=epoch_idx,
+        global_step=global_step,
+        wandb_run_id=wandb.run.id,
+        wandb_url=wandb.run.get_url(),
+    ), str(ckpt_dir / "meta_info.pt"))
+    
+    forward_tokenizer.save_pretrained(ckpt_dir / "forward_tokenizer")
+    prediction_tokenizer.save_pretrained(ckpt_dir / "prediction_tokenizer")
+    model.module.save_pretrained(str(ckpt_dir / "model"))
+
+
+def _test_mode(
+    *,
+    dataloaders,
+    forward_tokenizer,
+    prediction_tokenizer,
+    small_eval_dl,
+):
+    sizes = []
+    for dataloader_name, dataloader in it.chain(
+        dataloaders.items(), 
+        dict(small_eval_dl=small_eval_dl).items(),
+    ):
+        for batch in tqdm(
+            dataloader, 
+            desc=f"Testing {dataloader_name}", 
+        ):
+            forward_ids = batch["forward"]["input_ids"]
+            predict_ids = batch["predict"]["input_ids"]
+
+            for mask in batch["forward"]["attention_mask"]:
+                sizes.append(mask.int().sum())
+
+            assert forward_ids.shape[0] == predict_ids.shape[0], (
+                f"Shapes do not match: "
+                f"forward_ids.shape={forward_ids.shape}, "
+                f"predict_ids.shape={predict_ids.shape}"
+            )
+            assert forward_ids.shape[1] > predict_ids.shape[1], (
+                f"Shape mismatch: "
+                f"forward_ids.shape={forward_ids.shape}, "
+                f"predict_ids.shape={predict_ids.shape}"
+            )
+            
+            for entry_forward, entry_predict in mit.zip_equal(forward_ids, predict_ids):
+                entry_forward = torch.tensor([
+                    x for x in entry_forward 
+                    if x != forward_tokenizer.pad_token_id
+                ])
+                entry_predict = torch.tensor([
+                    x for x in entry_predict 
+                    if x != prediction_tokenizer.pad_token_id
+                ])
+                assert (entry_forward[:len(entry_predict)] == entry_predict).all(), (
+                    entry_forward, 
+                    entry_predict, 
+                    forward_tokenizer.decode(entry_forward), 
+                    prediction_tokenizer.decode(entry_predict),
+                )
+
+    sizes = sorted(sizes)
+    exit(0)
+
+
+@hydra.main(
+    version_base="1.3.2", 
+    config_path="config", 
+    config_name="config",
+)
+def main(
+    cfg: omegaconf.DictConfig,
+):
+    print(f"({__name__}) RANK={RANK}, LOCAL_RANK={LOCAL_RANK}, WORLD_SIZE={WORLD_SIZE}")
+    assert not cfg.just_device_map
+    cfg = hydra.utils.instantiate(cfg)
+
+    accelerator = accelerate.Accelerator()
+    ###########################################################################
+    # 🔍 Wandb
+    ###########################################################################
+    save_path = _setup_wandb(cfg=cfg)
 
     ###########################################################################
     # 🏗️ Load Tokenizer and Data.
     ###########################################################################
     tmp_tokenizers       = lib_trl_utils.load_tokenizers(cfg.model_name_or_path)
-    forward_tokenizer    = tmp_tokenizers["forward_tokenizer"   ]
+    forward_tokenizer    = tmp_tokenizers["forward_tokenizer"]
     prediction_tokenizer = tmp_tokenizers["prediction_tokenizer"]
     del tmp_tokenizers
+
+    metrics = _setup_metrics(cfg=cfg, tokenizer=forward_tokenizer)
 
     ###########################################################################
     # 🏗️ Load Model and Build Optimizer.
@@ -701,7 +784,6 @@ def main(
     ###########################################################################
     # Dataloaders
     ###########################################################################
-    assert not is_encoder_decoder
     if cfg.output_type.enum == lib_sft_constants.OutputTypes.OUTLINES:
         outlines_context = OUTLINES_CLASSES[cfg.dataset_choice](
             model              = model,
@@ -728,6 +810,8 @@ def main(
         prediction_tokenizer      = prediction_tokenizer,
         qty_eval_small            = cfg.qty_eval_small,
         seed                      = 0,
+        tok_max_query_length      = cfg.tok_max_query_length,
+        tok_max_total_length      = cfg.tok_max_total_length,
         train_batch_size          = cfg.output_type.train_batch_size * WORLD_SIZE,
         subset_data               = cfg.subset_data,
         use_workers               = cfg.use_workers,
@@ -735,9 +819,9 @@ def main(
 
     total_num_steps = len(dataloaders[lib_utils.CVSets.TRAIN]) * cfg.max_num_epochs
     scheduler = transformers.get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=total_num_steps * 0.1,
-        num_training_steps=len(dataloaders[lib_utils.CVSets.TRAIN]) * cfg.max_num_epochs,
+        optimizer          = optimizer,
+        num_warmup_steps   = total_num_steps * 0.1,
+        num_training_steps = len(dataloaders[lib_utils.CVSets.TRAIN]) * cfg.max_num_epochs,
     )
 
     ###########################################################################
@@ -809,67 +893,28 @@ def main(
         predict_tokenizer = prediction_tokenizer,
     )
 
-
     if cfg.test_mode:
-        sizes = []
-
-        for dataloader_name, dataloader in it.chain(
-            dataloaders.items(), 
-            dict(small_eval_dl=small_eval_dl).items(),
-        ):
-            for batch in tqdm(
-                dataloader, 
-                desc=f"Testing {dataloader_name}", 
-            ):
-                forward_ids = batch["forward"]["input_ids"]
-                predict_ids = batch["predict"]["input_ids"]
-
-                for mask in batch["forward"]["attention_mask"]:
-                    sizes.append(mask.int().sum())
-
-                assert forward_ids.shape[0] == predict_ids.shape[0], (
-                    f"Shapes do not match: "
-                    f"forward_ids.shape={forward_ids.shape}, "
-                    f"predict_ids.shape={predict_ids.shape}"
-                )
-                assert forward_ids.shape[1] > predict_ids.shape[1], (
-                    f"Shape mismatch: "
-                    f"forward_ids.shape={forward_ids.shape}, "
-                    f"predict_ids.shape={predict_ids.shape}"
-                )
-                
-                for entry_forward, entry_predict in mit.zip_equal(forward_ids, predict_ids):
-                    entry_forward = torch.tensor([
-                        x for x in entry_forward 
-                        if x != forward_tokenizer.pad_token_id
-                    ])
-                    entry_predict = torch.tensor([
-                        x for x in entry_predict 
-                        if x != prediction_tokenizer.pad_token_id
-                    ])
-                    assert (entry_forward[:len(entry_predict)] == entry_predict).all(), (
-                        entry_forward, 
-                        entry_predict, 
-                        forward_tokenizer.decode(entry_forward), 
-                        prediction_tokenizer.decode(entry_predict),
-                    )
-
-        sizes = sorted(sizes)
-        exit(0)
+        _test_mode(
+            dataloaders       = dataloaders,
+            forward_tokenizer = forward_tokenizer,
+            prediction_tokenizer = prediction_tokenizer
+        )
 
     full_valid_wandb_key = "full_valid"
     small_valid_wandb_key = "small_valid"
     single_train_wandb_key = "single_train"
     full_train_wandb_key = "full_train"
 
-    # validation_evaluator.evaluate(
-    #     dataloader  = dataloaders[lib_utils.CVSets.VALID], 
-    #     epoch_idx   = 0, 
-    #     global_step = 0,
-    #     model       = model, 
-    #     stepper     = validation_stepper,
-    #     wandb_key   = full_valid_wandb_key,
-    # )
+    if cfg.begin_with_eval:
+        validation_evaluator.evaluate(
+            dataloader  = dataloaders[lib_utils.CVSets.VALID], 
+            epoch_idx   = 0, 
+            global_step = 0,
+            model       = model, 
+            stepper     = validation_stepper,
+            wandb_key   = full_valid_wandb_key,
+            is_intra_epoch = False,
+        )
     global_step = 0
 
     for epoch_idx in tqdm(
@@ -928,38 +973,32 @@ def main(
             #             wandb_key         = single_train_wandb_key,
             #         )
         
-            # Do a small eval subset every `cfg.n_batches_predict_train` batches:
-            if batch_idx % cfg.n_batches_predict_train == 0 and batch_idx >= 0:
-                validation_evaluator.evaluate(
-                    global_step = global_step,
-                    dataloader  = small_eval_dl, 
-                    epoch_idx   = epoch_idx,
-                    stepper     = validation_stepper,
-                    model       = model,
-                    wandb_key   = small_valid_wandb_key,
-                    is_intra_epoch = True,
-                )
+            # # Do a small eval subset every `cfg.n_batches_predict_train` batches:
+            # if batch_idx % cfg.n_batches_predict_train == 0 and batch_idx >= 0:
+            #     validation_evaluator.evaluate(
+            #         global_step = global_step,
+            #         dataloader  = small_eval_dl, 
+            #         epoch_idx   = epoch_idx,
+            #         stepper     = validation_stepper,
+            #         model       = model,
+            #         wandb_key   = small_valid_wandb_key,
+            #         is_intra_epoch = True,
+            #     )
         
         ################################################################################
         # End of epoch
         ################################################################################
         if RANK == 0:
-                ckpt_dir = save_path / str(epoch_idx)
-                ckpt_dir.mkdir(exist_ok=False)
-
-                torch.save(dict(
-                    cfg=cfg,
-                    optimizer=optimizer.state_dict(),
-                    epoch=epoch_idx,
-                    global_step=global_step,
-                    wandb_run_id=wandb.run.id,
-                    wandb_url=wandb.run.get_url(),
-                ), str(ckpt_dir / "meta_info.pt"))
-                
-                forward_tokenizer.save_pretrained(ckpt_dir / "forward_tokenizer")
-                prediction_tokenizer.save_pretrained(ckpt_dir / "prediction_tokenizer")
-                model.module.save_pretrained(str(ckpt_dir / "model"))
-                
+            _save_checkpoint(
+                cfg                  = cfg,
+                epoch_idx            = epoch_idx,
+                forward_tokenizer    = forward_tokenizer,
+                global_step          = global_step,
+                model                = model,
+                optimizer            = optimizer,
+                prediction_tokenizer = prediction_tokenizer,
+                save_path            = save_path,
+            )
         accelerator.wait_for_everyone()
 
         validation_evaluator.evaluate(

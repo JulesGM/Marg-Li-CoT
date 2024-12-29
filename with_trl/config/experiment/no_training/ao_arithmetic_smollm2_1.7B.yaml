@@ -16,13 +16,14 @@ ppo_config:
   gradient_accumulation_steps: 1
   learning_rate: 1e-6
 
-eval_batch_size: 75
-eval_generation_batch_size: 75
+eval_batch_size: 32
+eval_generation_batch_size: 32
 
 eval_subset_size: null
 use_curriculum: False
 answer_only_max_length: 15
 just_start_metrics: True
+start_eval: true
 eval_every: 0
 answer_only: true
 
@@ -33,4 +34,6 @@ use_few_shots: True
 task_name: main
 dataset_name: arithmetic
 
-train_generation_kwargs: {"num_beams": 25}
+
+train_generation_kwargs: {"num_beams": 25, "max_new_tokens": 50}
+eval_generation_kwargs: {"max_new_tokens": 50}

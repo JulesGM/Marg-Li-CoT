@@ -5,7 +5,7 @@ defaults:
   - train_generation_kwargs: default
   - eval_generation_kwargs: default
   - ppo_config: default
-  - acc_maintain: default
+  - acc_maintain: empty
   - curriculum_schedule: ???
   - experiment: ???
 
@@ -14,11 +14,11 @@ tok_max_query_length: null
 tok_max_answer_length: null
 tok_max_total_length: null
 
-batch_size: ???
+ppo_batch_size: ???
 mini_batch_size: ???
 
-wandb_project: rl_${dataset_name}
-start_eval: True # Whether to start evaluation right away.
+wandb_project: trl
+start_eval: false # Whether to start evaluation right away.
 use_few_shots: ??? # This depends on whether we are using a fine-tuned model or not
 few_shot_qty: 5
 
@@ -26,8 +26,12 @@ inspect_indices: false # Whether to use synchroneous dataloading & print the ind
 eval_subset_size: ???
 
 use_peft: True
-max_epochs: 10
+max_epochs: 8
 no_training: False
+answer_only_max_length: 15
+task_name: main
+use_curriculum: False
+just_start_metrics: False
 
 answer_only: False # Whether to train on generating the answer only.
 answer_only_path: null 
@@ -43,4 +47,4 @@ peft_do_all_lin_layers: False # Unlikely that we need to change this.
 reward_type: exact_match # Should never change
 arithmetic_dataset_root_folder_dir: "/home/mila/g/gagnonju/marglicot/mlc_datasets/arithmetic/"
 
-just_start_metrics: True
+learning_rate: 1e-6

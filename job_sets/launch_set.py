@@ -6,8 +6,10 @@ import os
 import pathlib
 import uuid
 import yaml
+from typing import Optional
 
 import fire
+import inquirer
 import jsonlines as jl
 import rich
 import rich.traceback
@@ -25,6 +27,7 @@ import _launch
 rich.traceback.install()
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 
+
 def check_experiment(experiments_folder_dir, experiment):
     assert experiments_folder_dir.exists(), f"Experiments folder {experiments_folder_dir} not found"
     attempted_path = experiments_folder_dir / f"{experiment}.yaml"
@@ -35,6 +38,7 @@ def check_experiment(experiments_folder_dir, experiment):
 def validate_experiment_sft(experiment):
     experiments_folder_dir = SCRIPT_DIR.parent / "approach_sft" / "config" / "experiment"
     check_experiment(experiments_folder_dir, experiment)
+
 
 def validate_experiment_rl(experiment):
     experiments_folder_dir = SCRIPT_DIR.parent / "with_trl" / "config" / "experiment"
@@ -69,7 +73,18 @@ def load_config(config_set):
     return config
 
 
-def main(config_set: str, user_id: str="julesgm"):
+def suggest_config(config):
+    if config is None:
+        config_sets = SCRIPT_DIR / "config_sets" 
+        sorted_by_modification_date = sorted(config_sets.glob("*.yaml"), key=lambda x: os.path.getmtime(x))
+        just_name = [x.stem for x in sorted_by_modification_date]
+        # Sort by modification date
+        config = inquirer.shortcuts.list_input("Select a config set", choices=[str(x) for x in just_name])
+
+    return config
+
+def main(config_set: Optional[str] = None, user_id: str="julesgm"):
+    config_set = suggest_config(config_set)
     assert isinstance(config_set, str), type(config_set)
     config = load_config(config_set)
     launch_set_name = f"{config_set}_{_common.file_safe_timestamp()}"

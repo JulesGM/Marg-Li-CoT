@@ -20,6 +20,8 @@ Dataset names:
 import enum
 import os
 from pathlib import Path
+import random
+import re
 import shlex
 import subprocess
 import sys
@@ -30,7 +32,6 @@ import nvgpu
 import rich
 import rich.markup
 import rich.panel
-
 import rich.table
 
 import subprocess
@@ -77,6 +78,28 @@ def kill_wandb_servers():
     ))
 
 
+def print_args(args):
+    table = rich.table.Table.grid()
+    for k, v in args.items():
+        table.add_row(
+            "[bold]" + rich.markup.escape(str(k)) + ":",
+            " " + rich.markup.escape(str(v)),
+        )
+    rich.print(
+        rich.panel.Panel(
+            table,
+            title="[bold]CLI Arguments:",
+            highlight=True,
+            title_align="left",
+        )
+    )
+
+
+def set_wandb_id(wandb_id):
+    if wandb_id:
+        os.environ["WANDB_RUN_ID"] = str(wandb_id)
+
+
 def main(
     experiment=None,
     *,
@@ -115,22 +138,7 @@ def main(
     ###########################################################################
     # Copy and log args.
     ###########################################################################
-    args = locals().copy()
-    table = rich.table.Table.grid()
-    for k, v in args.items():
-        table.add_row(
-            "[bold]" + rich.markup.escape(str(k)) + ":",
-            " " + rich.markup.escape(str(v)),
-        )
-    rich.print(
-        rich.panel.Panel(
-            table,
-            title="[bold]CLI Arguments:",
-            highlight=True,
-            title_align="left",
-        )
-    )
-    
+    print_args(locals().copy())
     experiment = find_experiment.check_experiment_and_suggest(
         experiment, SCRIPT_DIR / "config" / "experiment")
 
@@ -157,35 +165,48 @@ def main(
     # Create the command and run it.
     ###########################################################################
     num_processes = 1 if one else len(nvgpu.gpu_info())
-    if debug:
-        # Description: Debug mode is just running the script with ipdb.
-        # Difference with --one: --one doesn't seem to work with ipdb.
-        command = [
+
+    # if debug:
+    #     # Description: Debug mode is just running the script with ipdb.
+    #     # Difference with --one: --one doesn't seem to work with ipdb.
+    #     command = [
+    #         "python",
+    #         "-m",
+    #         "ipdb",
+    #         "-c",
+    #         "continue",
+    #     ]
+    # else:
+
+    assert mixed_precision == MixedPrecision.BF16, mixed_precision
+
+    port = str(
+        29500 + 
+        (
+            int(os.environ["SLURM_JOB_ID"]) + 
+            random.randint(0, 2000)
+        ) % 2000
+    )
+
+    command = [
+        "accelerate",
+        "launch",
+        "--main_process_port", port,
+        
+        "--num_processes",     num_processes,
+        "--config_file",       accelerate_config_file,
+        "--mixed_precision",   mixed_precision.value,
+    ]
+
+    if one:
+        command += [
+            "--no_python",
             "python",
             "-m",
             "ipdb",
             "-c",
             "continue",
         ]
-    else:
-        command = [
-            "accelerate",
-            "launch",
-            "--main_process_port", str(port),
-            "--num_processes",     num_processes,
-            "--config_file",       accelerate_config_file,
-            "--mixed_precision",   mixed_precision.value,
-        ]
-
-        if one:
-            command += [
-                "--no_python",
-                "python",
-                "-m",
-                "ipdb",
-                "-c",
-                "continue",
-            ]
 
     command += [
         SCRIPT_PATH,
@@ -206,8 +227,7 @@ def main(
         highlight=True,
     ))
 
-    if wandb_id:
-        os.environ["WANDB_RUN_ID"] = wandb_id
+    set_wandb_id(wandb_id)
 
     # Replace the current process with the following command.
     os.execvp("accelerate", command)

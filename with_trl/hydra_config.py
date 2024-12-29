@@ -21,12 +21,13 @@ class AccMaintainHydra:
 class PPOConfigHydra:
     kl_penalty: str
     ratio_threshold: int
-    learning_rate: float
     adap_kl_ctrl: bool
     init_kl_coef: float
     gradient_accumulation_steps: int
+    max_grad_norm: float
+    ppo_epochs: int
 
-
+    
 @dataclasses.dataclass
 class PeftConfigHydra:
     bias: str
@@ -64,6 +65,7 @@ class BaseConfigHydra:
     ppo_config: PPOConfigHydra
     acc_maintain: AccMaintainHydra
     curriculum_schedule: list
+    learning_rate: float
 
     tok_max_query_length: typing.Optional[int]
     tok_max_answer_length: typing.Optional[int]
@@ -75,7 +77,6 @@ class BaseConfigHydra:
     few_shot_qty: int
     wandb_project: str
     use_peft: bool
-    batch_size: int
     max_epochs: int
     no_training: bool
 
@@ -95,8 +96,10 @@ class BaseConfigHydra:
     reward_type: str
     start_eval: bool
 
+    sub_generation_batch_size: int
     arithmetic_dataset_root_folder_dir: typing.Optional[str]
-
+    
+    ppo_batch_size: int
 
 def register_configs() -> None:
     cs = hydra.core.config_store.ConfigStore.instance()

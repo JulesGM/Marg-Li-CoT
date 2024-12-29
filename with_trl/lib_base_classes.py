@@ -102,7 +102,7 @@ class DataListContainer:
         list_container = DataListContainer()
         for item, _ in list_items:
             if not isinstance(item, dict):
-                breakpoint()
+                raise RuntimeError(type(item))
             assert isinstance(item, dict), type(item).mro()
             for k, v in item.items():
                 list_container[k]  = v
@@ -237,4 +237,3 @@ if __name__ == "__main__":
         response_tensors="response_tensors", 
         any_tokenizer="any_tokenizer",
     )
-    breakpoint()

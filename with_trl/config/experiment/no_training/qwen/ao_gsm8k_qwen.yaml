@@ -30,6 +30,7 @@ answer_only_max_length: 15
 just_start_metrics: True
 eval_every: 0
 answer_only: true
+start_eval: true
 
 ################################################################################
 # This should never change

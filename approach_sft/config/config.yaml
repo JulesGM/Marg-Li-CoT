@@ -73,3 +73,7 @@ n_batches_predict_train:   100
 use_workers:               False
 test_mode:                 False
 subset_data:               False
+
+begin_with_eval:           true
+tok_max_query_length:      null
+tok_max_total_length:      null

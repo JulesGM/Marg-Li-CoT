@@ -9,7 +9,6 @@ defaults:
 ################################################################################
 batch_size: 2 # mini_batch_size * gradient_accumulation_steps
 train_generation_batch_size: 1
-mini_batch_size: 2
 
 # Eval Generation Batch Sizes
 # These things being separate is no super necessary
