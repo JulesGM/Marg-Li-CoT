@@ -9,6 +9,8 @@ import sys
 
 import fire
 import rich
+import rich.panel
+import subprocess
 
 
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
@@ -38,14 +40,16 @@ class NoArgV:
     pass
 
 
-def main(
-    experiment_group="gsm_direct", 
+def run(
+    dry=False,
+    experiment_group="gsm_cot", 
     use_chat_format=True,
-    model_name_or_path="/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1200",
+    model_name_or_path="/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_100",
     tokenizer_name_or_path="HuggingFaceTB/SmolLM2-1.7B-Instruct",
-    gsm_stop_at_double_newline=False,
+    gsm_stop_at_double_newline=True,
     data_dir=SCRIPT_DIR / "gsm8k_eval_data",
-    save_dir=SCRIPT_DIR / "with_open-instruct/eval_outputs/",
+    save_dir=SCRIPT_DIR / "eval_outputs",
+    max_num_examples=0,
 ):
 
     if not tokenizer_name_or_path:
@@ -62,7 +66,8 @@ def main(
     data_dir = pathlib.Path(data_dir).expanduser().resolve()
     save_dir = pathlib.Path(save_dir).expanduser().resolve()
 
-    # assert data_dir.is_dir(), f"Invalid data_dir: {data_dir}"
+    assert data_dir.is_dir(), f"Invalid data_dir: {data_dir}"
+    assert (data_dir / "test.jsonl").is_file(), f"Invalid script file: {(data_dir / 'test.jsonl')}"
     # assert save_dir.parent.is_dir(), f"Invalid save_dir: {save_dir}"
 
     #############################
@@ -74,14 +79,14 @@ def main(
         script_path = pathlib.Path("open-instruct/eval/gsm/run_eval.py")
 
         kwargs = dict(
-            chat_formatting_function="eval.templates.create_prompt_with_tulu_chat_format",
-            data_dir=data_dir,
-            max_num_examples=200,
-            model_name_or_path=model_name_or_path,
-            n_shot=8,
-            save_dir=save_dir,
-            tokenizer_name_or_path=tokenizer_name_or_path,
-            use_vllm=NoArgV,
+            chat_formatting_function = "eval.templates.create_prompt_with_tulu_chat_format",
+            data_dir                 = data_dir,
+            max_num_examples         = max_num_examples,
+            model_name_or_path       = model_name_or_path,
+            n_shot                   = 8,
+            save_dir                 = save_dir,
+            tokenizer_name_or_path   = tokenizer_name_or_path,
+            use_vllm                 = NoArgV,
         )
         
         if experiment_group == ExperimentGroup.gsm_direct:
@@ -107,7 +112,7 @@ def main(
     command = ["python", script_path]
 
     argument_pat = re.compile(r"^[\w_]+$")
-    for k, v in kwargs.items():
+    for k, v in sorted(kwargs.items()):
         assert argument_pat.match(k), f"Invalid argument name: {k}"
 
         if v is NoArgV:
@@ -115,12 +120,39 @@ def main(
         else:
             command.extend([f"--{k}", shlex.quote(str(v))])
 
-    rich.print(" ".join(map(str, command)))
+    rich.print(rich.panel.Panel(" ".join(map(str, command)).replace("--", "\n--"), highlight=True))
 
     #############################
     # Run the command
     #############################
-    os.execvp(command[0], command)
+    if not dry:
+        subprocess.check_call(command)
+
+def main(dry=False, max_num_examples=0, use_chat_format=True):
+    save_root = SCRIPT_DIR / "eval_outputs"
+    for name in [
+        "HuggingFaceTB/SmolLM2-1.7B-Instruct", 
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_100",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_200",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_300",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_400",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_500",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_600",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_700",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_800",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_900",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1000",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1100",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1200",
+    ]:
+
+        run(
+            model_name_or_path=name,
+            save_dir=str(save_root / name.replace("/", "_")),
+            dry=dry,
+            max_num_examples=max_num_examples,
+            use_chat_format=use_chat_format,
+        )
 
 if __name__ == "__main__":
     fire.Fire(main)
