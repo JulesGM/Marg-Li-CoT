@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-conda activate base || exit 1
+#SBATCH --gres=gpu:l40s:1 
+#SBATCH --cpus-per-task 8  
+#SBATCH --mem 40GB 
+#SBATCH --partition long
+
 python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
-    --dataset_mixer '{"ai2-adapt-dev/gsm8k_math_ifeval_ground_truth_mixed": 1.0}' \
+    --dataset_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
     --dataset_train_splits train \
     --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
     --dataset_eval_splits test \
@@ -27,15 +31,18 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --vllm_tensor_parallel_size 1 \
     --beta 0.05 \
     --apply_verifiable_reward true \
-    --output_dir "$SCRATCH"/open_instruct_output/"$(date +"%Y-%m-%d_%H-%M-%S")"_rlvr_8b \
+    --output_dir "$SCRATCH"/open_instruct_output/"$(date +"%Y-%m-%d_%H-%M-%S")"_rlvr_gsm8k_only_smollm2_instruct \
     --seed 3 \
     --num_evals 3 \
     --save_freq 100 \
     --reward_model_multiplier 0.0 \
     --with_tracking \
-    --num_epochs 1 \
     --wandb_project_name open_instruct_rl \
     --deepspeed_stage 3 \
     --wandb_entity julesgm
 
     # --gradient_checkpointing \
+# --dataset_mixer '{"ai2-adapt-dev/gsm8k_math_ifeval_ground_truth_mixed": 1.0}' \
+# --dataset_train_splits train \
+# --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
+# --dataset_eval_splits test \

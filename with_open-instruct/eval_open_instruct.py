@@ -6,13 +6,15 @@ import pathlib
 import re
 import shlex
 import sys
+import json
 
 import fire
 import rich
 import rich.panel
+import rich.traceback
 import subprocess
 
-
+rich.traceback.install()
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 
 def add_to_path(new_path):
@@ -50,6 +52,7 @@ def run(
     data_dir=SCRIPT_DIR / "gsm8k_eval_data",
     save_dir=SCRIPT_DIR / "eval_outputs",
     max_num_examples=0,
+    use_vllm=True,
 ):
 
     if not tokenizer_name_or_path:
@@ -86,8 +89,10 @@ def run(
             n_shot                   = 8,
             save_dir                 = save_dir,
             tokenizer_name_or_path   = tokenizer_name_or_path,
-            use_vllm                 = NoArgV,
         )
+        
+        if use_vllm:
+            kwargs["use_vllm"] = NoArgV
         
         if experiment_group == ExperimentGroup.gsm_direct:
             kwargs["no_cot"] = NoArgV
@@ -120,38 +125,69 @@ def run(
         else:
             command.extend([f"--{k}", shlex.quote(str(v))])
 
-    rich.print(rich.panel.Panel(" ".join(map(str, command)).replace("--", "\n--"), highlight=True))
+    rich.print(rich.panel.Panel(
+        " ".join(map(str, command)).replace("--", "\n--"), 
+        highlight=True, 
+        title=str(model_name_or_path).split("/")[-1],
+        title_align="[bold blue]left",
+    ))
 
     #############################
     # Run the command
     #############################
     if not dry:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        def json_handle_path(obj):
+            if isinstance(obj, pathlib.Path):
+                return str(obj)
+
+            if obj is NoArgV:
+                return True
+
+            raise TypeError(f"Object of type '{type(obj)}' is not JSON serializable")
+
+        with open(save_dir / "jules_eval_config.json", "w") as f:
+            json.dump(dict(
+                kwargs=kwargs,
+                command=command,
+            ), 
+            f, 
+            indent=4, 
+            default=json_handle_path)
         subprocess.check_call(command)
 
-def main(dry=False, max_num_examples=0, use_chat_format=True):
+def main(dry=False, max_num_examples=0, use_chat_format=True, use_vllm=True):
+    
     save_root = SCRIPT_DIR / "eval_outputs"
+    # initial_runs = [
+    #     "HuggingFaceTB/SmolLM2-1.7B-Instruct", 
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_100",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_200",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_300",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_400",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_500",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_600",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_700",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_800",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_900",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1000",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1100",
+    #     "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1200",
+    # ]
+
     for name in [
-        "HuggingFaceTB/SmolLM2-1.7B-Instruct", 
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_100",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_200",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_300",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_400",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_500",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_600",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_700",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_800",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_900",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1000",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1100",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1200",
+        # "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-30_17-51-43_rlvr_8b_checkpoints/step_400"
     ]:
+    # ] + list(pathlib.Path("/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-30_17-51-43_rlvr_8b_checkpoints/").glob("step_*")):
 
         run(
-            model_name_or_path=name,
-            save_dir=str(save_root / name.replace("/", "_")),
-            dry=dry,
-            max_num_examples=max_num_examples,
-            use_chat_format=use_chat_format,
+            dry                = dry,
+            max_num_examples   = max_num_examples,
+            model_name_or_path = name,
+            save_dir           = str(save_root / str(name).replace("/", "_")),
+            use_chat_format    = use_chat_format,
+            use_vllm           = use_vllm,
         )
 
 if __name__ == "__main__":
