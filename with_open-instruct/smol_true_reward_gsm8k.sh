@@ -18,7 +18,7 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --stop_token eos \
     --temperature 1.0 \
     --ground_truths_key ground_truth \
-    --chat_template tulu \
+    --chat_template None \
     --sft_messages_key messages \
     --learning_rate 3e-7 \
     --total_episodes 10000000 \
@@ -41,7 +41,7 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --deepspeed_stage 3 \
     --wandb_entity julesgm
 
-    # --gradient_checkpointing \
+# --gradient_checkpointing \
 # --dataset_mixer '{"ai2-adapt-dev/gsm8k_math_ifeval_ground_truth_mixed": 1.0}' \
 # --dataset_train_splits train \
 # --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
