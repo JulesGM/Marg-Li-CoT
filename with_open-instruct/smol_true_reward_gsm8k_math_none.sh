@@ -17,8 +17,8 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --non_stop_penalty \
     --stop_token eos \
     --temperature 1.0 \
+    --chat_template ORIGINAL_FORMAT \
     --ground_truths_key ground_truth \
-    --chat_template None \
     --sft_messages_key messages \
     --learning_rate 3e-7 \
     --total_episodes 10000000 \

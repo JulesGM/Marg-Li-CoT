@@ -5,6 +5,7 @@ import json
 import random
 import sys
 import pathlib
+import rich
 
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 sys.path.append(str(SCRIPT_DIR.parent.parent))
@@ -63,6 +64,7 @@ def main(args):
     ##########################
     # Prepare the few-shots
     ##########################
+
     if args.n_shot:
         if len(GSM_EXAMPLARS) > args.n_shot:
             GSM_EXAMPLARS = random.sample(GSM_EXAMPLARS, args.n_shot)
@@ -87,7 +89,7 @@ def main(args):
     if args.use_chat_format:
         chat_formatting_function = dynamic_import_function(args.chat_formatting_function)
         def apply_chat_format(example, tokenizer):
-            messages = [{"role": "user", "content": prompt_prefix + "Question: " + example["question"].strip()}]
+            messages = [{"role": "user", "content": "Question: " + example["question"].strip()}]
             prompt = chat_formatting_function(messages, tokenizer, add_bos=False)
             prompt += "Answer:" if prompt[-1] in ["\n", " "] else " Answer:"
             return prompt
@@ -124,10 +126,27 @@ def main(args):
             )
 
             if args.use_chat_format:
-                prompts = [apply_chat_format(example, tokenizer) for example in test_data]
+                messages = []
+                for example in GSM_EXAMPLARS:
+                    messages.extend([
+                        {"role": "user", "content": "Question: " + example["question"  ].strip()},
+                        {"role": "assistant", "content": "Answer: "   + example["cot_answer"].strip()}
+                    ])
+
+                chat_prompt = chat_formatting_function(messages, tokenizer, add_bos=True, add_generation_prompt=False).strip()
+                    
+                prompts = [
+                    chat_prompt + apply_chat_format(example, tokenizer).strip()
+                    for example in test_data
+                ]
+                
+
             else:
                 prompts = [prompt_prefix + "Question: " + example["question"].strip() + "\nAnswer:" for example in test_data]
                 
+            print(f"\"{prompts[0]}\"")
+            
+
             # We need to remap the outputs to the prompts because vllm might not return outputs for some prompts (e.g., if the prompt is too long)
             generations = model.generate(prompts, sampling_params)
             prompt_to_output = {

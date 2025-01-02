@@ -5,9 +5,9 @@
 #SBATCH --partition long
 
 python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
-    --dataset_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
+    --dataset_mixer '{"ai2-adapt-dev/gsm8k_ground_truth": 1.0}' \
     --dataset_train_splits train \
-    --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
+    --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_ground_truth": 1.0}' \
     --dataset_eval_splits test \
     --max_token_length 2048 \
     --max_prompt_token_length 2048 \

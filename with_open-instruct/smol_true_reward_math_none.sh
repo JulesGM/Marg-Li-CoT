@@ -5,9 +5,9 @@
 #SBATCH --partition long
 
 python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
-    --dataset_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
+    --dataset_mixer '{"ai2-adapt-dev/math_ground_truth": 1.0}' \
     --dataset_train_splits train \
-    --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
+    --dataset_eval_mixer '{"JulesGM/math_ground_truth_with_test": 1.0}' \
     --dataset_eval_splits test \
     --max_token_length 2048 \
     --max_prompt_token_length 2048 \
@@ -17,8 +17,8 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --non_stop_penalty \
     --stop_token eos \
     --temperature 1.0 \
+    --chat_template ORIGINAL_FORMAT \
     --ground_truths_key ground_truth \
-    --chat_template simple_chat \
     --sft_messages_key messages \
     --learning_rate 3e-7 \
     --total_episodes 10000000 \
@@ -31,7 +31,7 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --vllm_tensor_parallel_size 1 \
     --beta 0.05 \
     --apply_verifiable_reward true \
-    --output_dir "$SCRATCH"/open_instruct_output/"$(date +"%Y-%m-%d_%H-%M-%S")"_rlvr_gsm8k_only_smollm2_instruct_simple_chat \
+    --output_dir "$SCRATCH"/open_instruct_output/"$(date +"%Y-%m-%d_%H-%M-%S")"_rlvr_gsm8k_only_smollm2_instruct \
     --seed 3 \
     --num_evals 3 \
     --save_freq 100 \
@@ -41,4 +41,8 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --deepspeed_stage 3 \
     --wandb_entity julesgm
 
-    # --gradient_checkpointing \
+# --gradient_checkpointing \
+# --dataset_mixer '{"ai2-adapt-dev/gsm8k_math_ifeval_ground_truth_mixed": 1.0}' \
+# --dataset_train_splits train \
+# --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_math_ground_truth": 1.0}' \
+# --dataset_eval_splits test \

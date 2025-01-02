@@ -14,8 +14,10 @@ import rich.panel
 import rich.traceback
 import subprocess
 
+
 rich.traceback.install()
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
+
 
 def add_to_path(new_path):
     new_path = pathlib.Path(new_path).expanduser().resolve()
@@ -24,6 +26,7 @@ def add_to_path(new_path):
     assert new_path.is_dir(), f"Invalid path: {new_path}"
 
     sys.path.append(str(new_path))
+
 
 sys.path.append(str(SCRIPT_DIR / "open-instruct"))
 
@@ -82,13 +85,14 @@ def run(
         script_path = pathlib.Path("open-instruct/eval/gsm/run_eval.py")
 
         kwargs = dict(
-            chat_formatting_function = "eval.templates.create_prompt_with_tulu_chat_format",
+            # chat_formatting_function = "eval.templates.create_prompt_with_tulu_chat_format",
             data_dir                 = data_dir,
             max_num_examples         = max_num_examples,
             model_name_or_path       = model_name_or_path,
             n_shot                   = 8,
             save_dir                 = save_dir,
             tokenizer_name_or_path   = tokenizer_name_or_path,
+            chat_formatting_function = "eval.templates.create_prompt_with_huggingface_tokenizer_template",
         )
         
         if use_vllm:
@@ -128,8 +132,8 @@ def run(
     rich.print(rich.panel.Panel(
         " ".join(map(str, command)).replace("--", "\n--"), 
         highlight=True, 
-        title=str(model_name_or_path).split("/")[-1],
-        title_align="[bold blue]left",
+        title="[bold blue]" + str(model_name_or_path).split("/")[-1],
+        title_align="left",
     ))
 
     #############################
@@ -176,8 +180,8 @@ def main(dry=False, max_num_examples=0, use_chat_format=True, use_vllm=True):
     # ]
 
     for name in [
-        # "HuggingFaceTB/SmolLM2-1.7B-Instruct",
-        "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-30_17-51-43_rlvr_8b_checkpoints/step_400"
+        "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        # "/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-30_17-51-43_rlvr_8b_checkpoints/step_400"
     ]:
     # ] + list(pathlib.Path("/home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-30_17-51-43_rlvr_8b_checkpoints/").glob("step_*")):
 

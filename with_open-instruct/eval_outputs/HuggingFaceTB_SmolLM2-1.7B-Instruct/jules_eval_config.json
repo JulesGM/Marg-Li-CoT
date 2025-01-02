@@ -1,12 +1,12 @@
 {
     "kwargs": {
-        "chat_formatting_function": "eval.templates.create_prompt_with_tulu_chat_format",
         "data_dir": "/home/mila/g/gagnonju/marglicot/with_open-instruct/gsm8k_eval_data",
         "max_num_examples": 0,
         "model_name_or_path": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
         "n_shot": 8,
         "save_dir": "/home/mila/g/gagnonju/marglicot/with_open-instruct/eval_outputs/HuggingFaceTB_SmolLM2-1.7B-Instruct",
         "tokenizer_name_or_path": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "chat_formatting_function": "eval.templates.create_prompt_with_huggingface_tokenizer_template",
         "use_vllm": true,
         "stop_at_double_newline": true,
         "use_chat_format": true
@@ -15,7 +15,7 @@
         "python",
         "/home/mila/g/gagnonju/marglicot/with_open-instruct/open-instruct/eval/gsm/run_eval.py",
         "--chat_formatting_function",
-        "eval.templates.create_prompt_with_tulu_chat_format",
+        "eval.templates.create_prompt_with_huggingface_tokenizer_template",
         "--data_dir",
         "/home/mila/g/gagnonju/marglicot/with_open-instruct/gsm8k_eval_data",
         "--max_num_examples",
