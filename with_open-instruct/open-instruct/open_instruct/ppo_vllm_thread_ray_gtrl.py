@@ -883,7 +883,13 @@ class PolicyTrainerRayProcess(RayProcess):
                 items = param_prompt_Q.get()
                 if items is None:
                     break
+
                 unwrapped_model, g_queries_list = items
+
+                import rich
+                import rich.markup
+                rich.print("[bold red]" + rich.markup.escape(tokenizer.decode(g_queries_list[0])))
+
                 # if unwrapped_model is not None:
                 generation_start_time = time.time()
 
@@ -938,14 +944,14 @@ class PolicyTrainerRayProcess(RayProcess):
             args.num_mini_batches * args.number_samples_per_prompt,
             args.gradient_accumulation_steps,
         )
-        approxkl_stats = torch.zeros(stats_shape, device=device)
+        approxkl_stats    = torch.zeros(stats_shape, device=device)
         pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        pg_loss_stats = torch.zeros(stats_shape, device=device)
-        vf_loss_stats = torch.zeros(stats_shape, device=device)
+        pg_loss_stats     = torch.zeros(stats_shape, device=device)
+        vf_loss_stats     = torch.zeros(stats_shape, device=device)
         vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        entropy_stats = torch.zeros(stats_shape, device=device)
-        ratio_stats = torch.zeros(stats_shape, device=device)
-        local_metrics = torch.zeros((20,), device=device)
+        entropy_stats     = torch.zeros(stats_shape, device=device)
+        ratio_stats       = torch.zeros(stats_shape, device=device)
+        local_metrics     = torch.zeros((20,), device=device)
         episode = args.rollout_batch_size * (resume_training_step - 1)
 
         # training loop
@@ -1618,6 +1624,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     # create the dataset
     dataset_dict = DatasetDict()
     dataset_processor = SFTGroundTruthDatasetProcessor(tokenizer=tokenizer, config=dataset_config)
+    
     if len(args.dataset_train_splits) != len(args.dataset_mixer_dict) and len(args.dataset_train_splits) == 1:
         args.dataset_train_splits = [args.dataset_train_splits[0]] * len(args.dataset_mixer_dict)
         print(

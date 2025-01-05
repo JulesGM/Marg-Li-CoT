@@ -4,7 +4,7 @@
 #SBATCH --mem 40GB 
 #SBATCH --partition long
 
-python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
+/home/mila/g/gagnonju/.mambaforge/bin/python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --dataset_mixer '{"ai2-adapt-dev/gsm8k_ground_truth": 1.0}' \
     --dataset_train_splits train \
     --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_ground_truth": 1.0}' \
