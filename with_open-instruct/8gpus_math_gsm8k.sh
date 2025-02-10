@@ -39,6 +39,7 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --with_tracking \
     --wandb_project_name open_instruct_rl \
     --deepspeed_stage 3 \
+    --exp_name math_gsm8k_8gpus \
     --wandb_entity julesgm
 
 # --gradient_checkpointing \
