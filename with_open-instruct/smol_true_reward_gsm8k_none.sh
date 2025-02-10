@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-#SBATCH --gres=gpu:l40s:1 
-#SBATCH --cpus-per-task 8  
+#SBATCH --gres=gpu:a100l:4 
+#SBATCH --cpus-per-task 50  
 #SBATCH --mem 40GB 
 #SBATCH --partition long
 

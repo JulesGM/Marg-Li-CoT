@@ -23,3 +23,5 @@ Where the reinforcement learning is located.
 
     ./approach_sft/launch.py <experiment_name>
 
+# with_open-instruct
+The code that actually works using `open-instruct`.

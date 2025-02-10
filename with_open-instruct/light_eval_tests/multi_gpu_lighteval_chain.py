@@ -1,3 +1,4 @@
+# In real life, this should probably be done with SLURM
 import fire
 import concurrent.futures
 import pathlib
@@ -8,14 +9,6 @@ import shlex
 import re
 import os
 
-# CUDA_VISIBLE_DEVICES=3 lighteval accelerate \
-# --model_args="pretrained=${CHECKPOINT_PATH},revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=0.8,max_model_length=2048" \
-# --tasks="custom|math|5|0" \
-# --output_dir=./outputs_math/ \
-# --use_chat_template \
-# --custom_tasks "./tasks.py" \
-# --save_details
-
 
 def work(
         gpu_id: int, 
@@ -25,41 +18,42 @@ def work(
         task_key: str, 
         verbose: bool,
     ):
-    extra_args = {}
-    if not verbose:
-        extra_args = dict(
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, 
-        )
+
 
     print(f"[{gpu_id}] Starting with: {path}")
-    proc = subprocess.run([
-        "lighteval", "accelerate", 
-        "--model_args", 
-        f"pretrained={shlex.quote(str(path))},revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=0.8,max_model_length=2048", 
-        "--tasks", task_key, 
-        "--output_dir", str(output_dir), 
-        "--use_chat_template", 
-        "--custom_tasks", "./tasks.py", 
-        "--save_details"
-    ], 
-    env=dict(**os.environ, CUDA_VISIBLE_DEVICES=str(gpu_id)),
-    check=True,
-    **extra_args,
+    env_vars = os.environ.copy()
+    env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    
+    # Blocks here.
+    proc = subprocess.run(
+        [
+            "/home/mila/g/gagnonju/.mambaforge/bin/lighteval", 
+            "accelerate", 
+            "--model_args", 
+            f"pretrained={shlex.quote(str(path))},revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=0.8,max_model_length=2048", 
+            "--tasks", task_key, 
+            "--output_dir", str(output_dir), 
+            "--use_chat_template", 
+            "--custom_tasks", "./tasks.py", 
+            "--save_details"
+        ], 
+        env=env_vars,
+        # **extra_args,
     )
-
+    
     print(f"[{gpu_id}] Done with: {path}")
     gpu_queue.put(gpu_id)
 
 
 def main(
-        input_path="/network/scratch/g/gagnonju/open_instruct_output/2024-12-31_21-22-51_rlvr_gsm8k_only_smollm2_instruct_checkpoints/", 
+        input_path="/network/scratch/g/gagnonju/open_instruct_output/2024-12-31_22-56-50_rlvr_gsm8k_only_smollm2_instruct_checkpoints/", 
         task_key="custom|math|5|0",
         output_dir="./outputs_math/",
         threads_verbose=True,
+        gpu_ids=None,
     ):
-    assert len(task_key.split("|")) == 4, "Task key must have 4 parts separated by |"
 
+    assert len(task_key.split("|")) == 4, "Task key must have 4 parts separated by |"
     output_dir = pathlib.Path(output_dir).expanduser().resolve()
     assert output_dir.is_dir(), f"Output directory does not exist: {output_dir}"
 
@@ -71,17 +65,28 @@ def main(
         print(f"- {step_path}")
     print()
 
+    # Put the gpu ids in the queue
     num_gpus = len(nvgpu.gpu_info())
     print(f"Number of GPUs: {num_gpus}")
+
+    # Prepare the gpu ids
+    if not gpu_ids:
+        gpu_ids = list(range(num_gpus))
+    assert all(isinstance(i, int) for i in gpu_ids), (
+        f"All gpu ids must be integers, got {gpu_ids} {[type(i) for i in gpu_ids]}"
+    )
+    print(f"Using GPUs: {gpu_ids}")
+
+    # Queue the gpu ids
     gpu_queue = queue.Queue()
-    for i in range(num_gpus):
+    for i in gpu_ids:
         gpu_queue.put(i)
     print()
 
+    return
+    # Start the work
     with concurrent.futures.ThreadPoolExecutor(num_gpus) as executor:
         for path in input_paths:
-            print(path.name)
-
             gpu_id = gpu_queue.get()
             executor.submit(
                 work, 
@@ -92,6 +97,7 @@ def main(
                 task_key=task_key,
                 verbose=threads_verbose,
             )
+
     print("Done!")
 
 

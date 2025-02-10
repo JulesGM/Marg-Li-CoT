@@ -1,0 +1,39 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - peft_config: default
+  - generation_kwargs: sentiment
+  - inference_generation_kwargs: sentiment
+
+model:
+  batch_size: 256
+  inference_batch_size: 256
+  mini_batch_size: 1
+  model_name: "susnato/phi-2"
+  train_generation_batch_size: 1
+
+name: "sentiment_main"
+learning_rate: 1.41e-5
+
+kl_penalty_mode: kl
+use_peft: True
+precision: float32
+peft_do_all_lin_layers: False
+
+input_max_length: 115
+eval_every: 0
+eval_subset_size: 0
+
+reward_type: null
+task_name: sentiment
+dataset_name: sentiment
+wandb_project: rl_${dataset_name}
+arithmetic_dataset_root_folder_dir: "/home/mila/g/gagnonju/Marg-Li-CoT/with_trl/libs_data/arithmetic/"
+answer_only: False
+use_few_shots: False
+just_metrics: False
+answer_only_path: "/network/scratch/g/gagnonju/saved_scratchpad_gen_outputs/chatgpt-3.5-commonsenseqa-scratchpads/not-cond-on-answers/commonsenseqa.chatgpt"
+answer_only_max_length: 20
+gradient_accumulation_steps: 1
+use_curriculum: False

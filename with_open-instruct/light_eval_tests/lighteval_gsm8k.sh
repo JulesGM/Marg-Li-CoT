@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# /home/mila/g/gagnonju/scratch/open_instruct_output/2024-12-27_22-43-27_rlvr_8b_checkpoints/step_1200
-# HuggingFaceTB/SmolLM2-1.7B-Instruct
+############################################################################################################
+# Launches an individual checkpoint evaluation on the GSM8k dataset 
+############################################################################################################
 set -x
-
-# CHECKPOINT_PATH="/network/scratch/g/gagnonju/open_instruct_output/2024-12-31_21-52-49_rlvr_gsm8k_only_smollm2_instruct_checkpoints/step_800"
-# CHECKPOINT_PATH="/network/scratch/g/gagnonju/open_instruct_output/2024-12-30_17-51-43_rlvr_8b_checkpoints/step_200/"
-# CHECKPOINT_PATH="HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
 CHECKPOINT_PATH="/network/scratch/g/gagnonju/open_instruct_output/2024-12-31_21-22-51_rlvr_gsm8k_only_smollm2_instruct_checkpoints/step_1600"
 
@@ -14,5 +11,5 @@ CUDA_VISIBLE_DEVICES=3 lighteval accelerate \
 --tasks="custom|gsm8k|8|0" \
 --output_dir=./outputs_gsm8k/ \
 --use_chat_template \
---custom_tasks "./tasks.py" \
+--custom_tasks "./util_code/tasks.py" \
 --save_details

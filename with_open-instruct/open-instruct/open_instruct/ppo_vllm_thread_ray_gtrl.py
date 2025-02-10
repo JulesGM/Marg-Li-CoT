@@ -27,7 +27,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import pathlib
 import gc
 import json
 import logging
@@ -72,6 +72,8 @@ from transformers import (
 )
 from transformers.integrations import HfDeepSpeedConfig
 from vllm import SamplingParams
+import wandb
+
 
 from open_instruct.dataset_processor import (
     CHAT_TEMPLATES,
@@ -564,6 +566,17 @@ class RayProcess:
         torch.cuda.empty_cache()
 
 
+def save_args(output_dir, args_dataclass):
+    """
+    Added by julesgm; save the args to a json file in the output_dir.
+    """
+    output_dir = pathlib.Path(output_dir)
+    args_dict = asdict(args_dataclass)
+    args_dict["wandb_url"] = wandb.run.get_url() if wandb.run else None
+    with open(output_dir / "args.json", "w") as f:
+        json.dump(args_dict, f, indent=4, default=str)
+
+
 @ray.remote(num_gpus=1)
 class PolicyTrainerRayProcess(RayProcess):
     def from_pretrained(
@@ -754,6 +767,7 @@ class PolicyTrainerRayProcess(RayProcess):
         accelerator.num_processes = self.world_size
         accelerator.is_main_process = self.rank == 0
         torch.distributed.barrier()
+
         if self.rank == 0:
             master_address = ray._private.services.get_node_ip_address()
             with socket.socket() as sock:
@@ -1376,8 +1390,10 @@ class PolicyTrainerRayProcess(RayProcess):
                 os.makedirs(step_dir, exist_ok=True)
                 print(f"Saving model at step {training_step} to {step_dir}")
                 self.save_model(step_dir)
+                save_args(output_dir=step_dir, args_dataclass=args)
                 if args.try_launch_beaker_eval_jobs_on_weka:
                     self.launch_ai2_evals_on_weka(step_dir, training_step)
+
         print(f"Saving final model at step {training_step} to {args.output_dir}")
         self.save_model(args.output_dir)
         if args.try_launch_beaker_eval_jobs_on_weka:

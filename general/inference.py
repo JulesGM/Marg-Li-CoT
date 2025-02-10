@@ -1,3 +1,6 @@
+"""
+Incomplete inference script
+"""
 import enum
 import os
 import pathlib

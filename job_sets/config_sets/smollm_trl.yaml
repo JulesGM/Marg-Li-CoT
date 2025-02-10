@@ -1,0 +1,21 @@
+name: smollm2_1.7B
+
+jobs:
+
+  # - experiment: no_training/cot_arithmetic_smollm2_1.7B
+  #   code_category: trl
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: arithmetic
+
+  - experiment: gsm8k_smollm
+    code_category: trl
+    overloads:
+    gpu: l40s
+    dataset: gsm8k
+
+  - experiment: math_smollm
+    code_category: trl
+    overloads:
+    gpu: l40s
+    dataset: math
