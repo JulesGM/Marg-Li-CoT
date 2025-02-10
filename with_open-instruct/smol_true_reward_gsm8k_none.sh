@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #SBATCH --gres=gpu:a100l:4 
-#SBATCH --cpus-per-task 50  
-#SBATCH --mem 40GB 
+#SBATCH --cpus-per-task 30
+#SBATCH --mem 400GB  
 #SBATCH --partition long
 
-/home/mila/g/gagnonju/.mambaforge/bin/python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
+python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --dataset_mixer '{"ai2-adapt-dev/gsm8k_ground_truth": 1.0}' \
     --dataset_train_splits train \
     --dataset_eval_mixer '{"ai2-adapt-dev/gsm8k_ground_truth": 1.0}' \

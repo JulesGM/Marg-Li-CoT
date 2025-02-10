@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH --gres=gpu:l40s:1 
-#SBATCH --cpus-per-task 8  
-#SBATCH --mem 40GB 
+#SBATCH --gres=gpu:a100l:4 
+#SBATCH --cpus-per-task 30
+#SBATCH --mem 400GB  
 #SBATCH --partition long
 
 python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
@@ -31,7 +31,7 @@ python open-instruct/open_instruct/ppo_vllm_thread_ray_gtrl.py \
     --vllm_tensor_parallel_size 1 \
     --beta 0.05 \
     --apply_verifiable_reward true \
-    --output_dir "$SCRATCH"/open_instruct_output/"$(date +"%Y-%m-%d_%H-%M-%S")"_rlvr_gsm8k_only_smollm2_instruct \
+    --output_dir "$SCRATCH"/open_instruct_output/"$(date +"%Y-%m-%d_%H-%M-%S")"_rlvr_gsm8k_math_smollm2_instruct \
     --seed 3 \
     --num_evals 3 \
     --save_freq 100 \
