@@ -1,0 +1,33 @@
+defaults:
+  - dataset: gsm8k         # default dataset config (gsm8k or hendrycks_math)
+  - experiment: gsm8k      # default experiment config
+
+model:
+  name: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+
+training:
+  batch_size: 4
+  learning_rate: 3e-5
+  num_epochs: 3
+  max_new_tokens: 100
+
+vllm_sampling:
+  temperature: 1.0
+  num_candidates: 5
+  top_p: null            # if null, top_p will not be used
+
+accelerate:
+  seed: 42
+  gpu_ids: [1, 2, 3]
+
+vllm:
+  gpu_id: 0
+
+wandb:
+  project: "expert_iteration"
+  entity: "julesgm"
+  log_interval: 10
+
+evaluation:
+  eval_subset_size: 50   # Use an integer for a subset, or null for full eval set.
+  eval_batch_size: 64

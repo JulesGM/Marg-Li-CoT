@@ -1,0 +1,3 @@
+defaults:
+  - override /dataset: hendrycks_math
+experiment_name: "hendrycks_math_experiment"

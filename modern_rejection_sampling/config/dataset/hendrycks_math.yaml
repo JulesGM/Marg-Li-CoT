@@ -1,0 +1,4 @@
+name: "hendrycks/competition_math"
+split: "train"
+question_field: "problem"
+answer_field: "solution"
