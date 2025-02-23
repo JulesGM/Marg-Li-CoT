@@ -6,22 +6,22 @@ model:
   name: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
 training:
-  batch_size: 4
+  max_length: 768
+  batch_size: 12
   learning_rate: 3e-5
-  num_epochs: 3
-  max_new_tokens: 100
+  num_epochs: 30
 
 vllm_sampling:
-  temperature: 1.0
-  num_candidates: 5
+  temperature: 1
+  num_candidates: 48
   top_p: null            # if null, top_p will not be used
 
 accelerate:
   seed: 42
-  gpu_ids: [1, 2, 3]
+  gpu_ids: [0]
 
 vllm:
-  gpu_id: 0
+  gpu_id: 1
 
 wandb:
   project: "expert_iteration"
@@ -29,5 +29,5 @@ wandb:
   log_interval: 10
 
 evaluation:
-  eval_subset_size: 50   # Use an integer for a subset, or null for full eval set.
-  eval_batch_size: 64
+  eval_batch_size: 1500
+  eval_percentage: 0.05

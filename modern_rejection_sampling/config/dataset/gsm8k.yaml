@@ -1,4 +1,9 @@
 name: "gsm8k"
 split: "train"
+valid_split: "test"
+
+load_dataset_args:
+  - main
+
 question_field: "question"
 answer_field: "answer"

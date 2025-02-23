@@ -104,10 +104,6 @@ class WorkerWrap(Worker):
             rank=rank,
             group_name=group_name,
         )
-        print(
-            f"init_process_group: master_address={master_address}, master_port={master_port}, ",
-            f"rank={rank}, world_size={world_size}, group_name={group_name}",
-        )
 
     def update_weight(self, name, dtype, shape, empty_cache=False):
         """Broadcast weight to all vllm workers from source rank 0 (actor model)"""
@@ -163,6 +159,9 @@ class LLMRayActor:
 
     def generate(self, *args, **kwargs):
         return self.llm.generate(*args, **kwargs)
+
+    def chat(self, *args, **kwargs):
+        return self.llm.chat(*args, **kwargs)
 
     def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
         if self.use_gpu_executor:

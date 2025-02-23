@@ -1,3 +1,5 @@
+# @package _global_
+
 defaults:
   - override /dataset: gsm8k
 experiment_name: "gsm8k_experiment"

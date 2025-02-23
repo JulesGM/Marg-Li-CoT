@@ -9,8 +9,8 @@ from open_instruct.math_utils import last_boxed_only_string, remove_boxed, get_u
 from open_instruct.if_functions import IF_FUNCTIONS_MAP
 
 
-def verify_gsm8k_sample(model_output, ground_truth_answer):
-    model_output = model_output.split("<|assistant|>\n")[-1].strip()
+def verify_gsm8k_sample(model_output, ground_truth_answer, verbose=False):
+    # model_output = model_output.split("<|assistant|>\n")[-1].strip()
     # gsm is easy: extract numbers, and then just compare last number with answer.
     # matches how we do eval.
     predictions = None
@@ -21,6 +21,8 @@ def verify_gsm8k_sample(model_output, ground_truth_answer):
         predictions = numbers[-1]
     else:
         predictions = response
+    if verbose:
+        print(f"predictions: {predictions}, ground_truth_answer: {ground_truth_answer}")
     return str(predictions).lower() == str(ground_truth_answer).lower()
 
 
