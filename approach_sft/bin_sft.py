@@ -8,6 +8,7 @@ import collections
 import datetime
 import functools
 import itertools as it
+import json
 import logging
 import os
 import pathlib
@@ -33,11 +34,11 @@ import git
 import more_itertools as mit
 import numpy as np
 import omegaconf
-import outlines
-import outlines.generate
-import outlines.models
-import outlines.models.transformers
-import outlines.samplers
+# import outlines
+# import outlines.generate
+# import outlines.models
+# import outlines.models.transformers
+# import outlines.samplers
 import peft
 import rich
 import rich.console
@@ -313,6 +314,8 @@ def step(
     do_train: bool,
     output_type: lib_sft_constants.OutputTypes,
 ):
+    assert not mask_query, "not supported anymore"
+
     assert not (cv_set == lib_utils.CVSets.VALID and do_train), (
         cv_set)
 
@@ -324,18 +327,12 @@ def step(
         forward_tokenizer=forward_tokenizer,
         tensor=batch["forward"]["input_ids"],
     )
+    
+    batch["forward"] = batch["forward"].to(accelerator.local_process_index)
 
-    if mask_query: 
-        labels = batch["masked_forward"]["input_ids"]
-    else:
-        labels = batch["forward"]["input_ids"]
+    labels = batch["forward"]["input_ids"]
 
-    gpu_batch = {
-        k: v.to(accelerator.local_process_index) 
-        for k, v in batch["forward"].items()
-    }
-
-    loss = model(**gpu_batch, labels=labels).loss
+    loss = model(**batch["forward"], labels=labels).loss
     forward_logger.log(
         batch       = batch["forward"]["input_ids"], 
         epoch       = epoch,
@@ -633,6 +630,14 @@ def _setup_metrics(*, cfg, tokenizer):
     return metrics
 
 
+def json_default(obj):
+    if isinstance(obj, pathlib.Path):
+        return str(obj)
+    elif isinstance(obj, torch.dtype):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
 def _save_checkpoint(
     *, 
     save_path: pathlib.Path,
@@ -656,7 +661,18 @@ def _save_checkpoint(
         wandb_url=wandb.run.get_url(),
     ), str(ckpt_dir / "meta_info.pt"))
     
+    with open(ckpt_dir / "meta_info.json", "w") as f:
+        json.dump(dict(
+            cfg=omegaconf.OmegaConf.to_container(cfg, resolve=True),
+            epoch=epoch_idx,
+            global_step=global_step,
+            wandb_run_id=wandb.run.id,
+            wandb_url=wandb.run.get_url(),
+            save_path=save_path,
+        ), f, indent=4, sort_keys=True, default=json_default)
+
     forward_tokenizer.save_pretrained(ckpt_dir / "forward_tokenizer")
+    forward_tokenizer.save_pretrained(ckpt_dir / "model") # we save the tokenizer in the model folder for lighteval
     prediction_tokenizer.save_pretrained(ckpt_dir / "prediction_tokenizer")
     model.module.save_pretrained(str(ckpt_dir / "model"))
 
@@ -748,6 +764,8 @@ def main(
     if RANK == 0:
         print(f"Loading model {cfg.model_name_or_path}")
 
+    assert not cfg.use_peft, "PEFT is not supported for this script"
+    
     model = lib_trl_utils.load_then_peft_ize_model(
         adapter_name           = "default",
         forward_tokenizer      = forward_tokenizer,
@@ -815,6 +833,7 @@ def main(
         train_batch_size          = cfg.output_type.train_batch_size * WORLD_SIZE,
         subset_data               = cfg.subset_data,
         use_workers               = cfg.use_workers,
+        use_chat_templates        = cfg.is_instruct_model,
     )
 
     total_num_steps = len(dataloaders[lib_utils.CVSets.TRAIN]) * cfg.max_num_epochs
@@ -905,16 +924,16 @@ def main(
     single_train_wandb_key = "single_train"
     full_train_wandb_key = "full_train"
 
-    if cfg.begin_with_eval:
-        validation_evaluator.evaluate(
-            dataloader  = dataloaders[lib_utils.CVSets.VALID], 
-            epoch_idx   = 0, 
-            global_step = 0,
-            model       = model, 
-            stepper     = validation_stepper,
-            wandb_key   = full_valid_wandb_key,
-            is_intra_epoch = False,
-        )
+    # if cfg.begin_with_eval:
+    #     validation_evaluator.evaluate(
+    #         dataloader  = dataloaders[lib_utils.CVSets.VALID], 
+    #         epoch_idx   = 0, 
+    #         global_step = 0,
+    #         model       = model, 
+    #         stepper     = validation_stepper,
+    #         wandb_key   = full_valid_wandb_key,
+    #         is_intra_epoch = False,
+    #     )
     global_step = 0
 
     for epoch_idx in tqdm(
@@ -1001,15 +1020,15 @@ def main(
             )
         accelerator.wait_for_everyone()
 
-        validation_evaluator.evaluate(
-            dataloader  = dataloaders[lib_utils.CVSets.VALID], 
-            epoch_idx   = epoch_idx, 
-            global_step = global_step + 1,
-            model       = model, 
-            stepper     = validation_stepper,
-            wandb_key   = full_valid_wandb_key,
-            is_intra_epoch = False,
-        )
+        # validation_evaluator.evaluate(
+        #     dataloader  = dataloaders[lib_utils.CVSets.VALID], 
+        #     epoch_idx   = epoch_idx, 
+        #     global_step = global_step + 1,
+        #     model       = model, 
+        #     stepper     = validation_stepper,
+        #     wandb_key   = full_valid_wandb_key,
+        #     is_intra_epoch = False,
+        # )
 
     wandb.finish()
 

@@ -13,3 +13,6 @@ output_type:
 model_name_or_path: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
 use_peft: false
+
+max_num_epochs: 30
+learning_rate: 0.00001

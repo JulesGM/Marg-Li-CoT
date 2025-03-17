@@ -57,6 +57,7 @@ def verify_math_sample(model_output, ground_truth_answer):
         all_answers.append(normalize_final_answer(model_output))
     # now, compare all answers to ground truth.
     matched = False
+
     for answer in all_answers:
         if is_equiv(answer, ground_truth_answer):
             matched = True

@@ -3,13 +3,14 @@ defaults:
   - override /output_type: chain_of_thought_then_answer
 
 dataset_choice: 
-  _args_: ["gsm8k"]
+  _args_: ["arithmetic"]
 
 output_type:
-  train_batch_size:          7
-  eval_batch_size:           7
+  train_batch_size:          4
+  eval_batch_size:           4
   max_length:                512
 
 model_name_or_path: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+max_num_epochs: 2
 
 use_peft: false

@@ -103,6 +103,7 @@ def get_dataloaders(
     seed:                       int,
     subset_data:                str,
     use_workers:                bool,
+    use_chat_templates:         bool,
 ):
     ###########################################################################
     # Datasets
@@ -115,6 +116,8 @@ def get_dataloaders(
     # Collator
     ###########################################################################
     assert forward_tokenizer is not prediction_tokenizer
+
+
     if (
         lm_mode == lib_sft_constants.LMModes.CAUSAL_FULL and 
         output_type != lib_sft_constants.OutputTypes.OUTLINES
@@ -124,7 +127,8 @@ def get_dataloaders(
                 output_type          = output_type,
                 forward_tokenizer    = forward_tokenizer,
                 prediction_tokenizer = prediction_tokenizer,
-                has_choices          = False
+                has_choices          = False,
+                use_chat_templates   = use_chat_templates,
             )
 
         elif dataset_choice == lib_utils.Datasets.GSM8K:
@@ -132,13 +136,15 @@ def get_dataloaders(
                 output_type          = output_type,
                 forward_tokenizer    = forward_tokenizer,
                 prediction_tokenizer = prediction_tokenizer,
+                use_chat_templates   = use_chat_templates,
             )
 
         elif dataset_choice == lib_utils.Datasets.MATH:
             data_collator = math_sft.MATHCollator(
                 forward_tokenizer    = forward_tokenizer,
                 prediction_tokenizer = prediction_tokenizer,
-                
+                use_chat_templates   = use_chat_templates,
+                answer_only          = output_type == lib_sft_constants.OutputTypes.ANSWER_ONLY,
             )
 
         else:
@@ -218,6 +224,7 @@ def get_dataloaders(
                 forward_tokenizer = forward_tokenizer,
                 prediction_tokenizer = prediction_tokenizer,
                 output_type = output_type,
+                use_chat_templates = use_chat_templates,
             )
 
         else:

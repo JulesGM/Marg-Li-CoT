@@ -54,8 +54,8 @@ just_device_map:           False
 mask_query:                False
 
 
-max_num_epochs:            ???
-learning_rate:             0.001
+max_num_epochs:            15
+learning_rate:             0.00005
 
 
 peft_do_all_lin_layers:    False
@@ -77,3 +77,10 @@ subset_data:               False
 begin_with_eval:           true
 tok_max_query_length:      null
 tok_max_total_length:      null
+
+is_instruct_model:         true
+
+
+
+hydra:
+  output_subdir: null

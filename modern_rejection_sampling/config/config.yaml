@@ -1,15 +1,17 @@
 defaults:
-  - dataset: gsm8k         # default dataset config (gsm8k or hendrycks_math)
-  - experiment: gsm8k      # default experiment config
-
+  - _self_
+  - dataset: ???         # default dataset config (gsm8k or hendrycks_math)
+  - experiment: ???      # default experiment config
+  - override hydra/hydra_logging: disabled  
+  - override hydra/job_logging: disabled  
 model:
   name: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
 training:
-  max_length: 768
+  max_length: 1024
   batch_size: 12
-  learning_rate: 3e-5
-  num_epochs: 30
+  learning_rate: 1e-5
+  num_epochs: 100
 
 vllm_sampling:
   temperature: 1
@@ -29,5 +31,15 @@ wandb:
   log_interval: 10
 
 evaluation:
-  eval_batch_size: 1500
   eval_percentage: 0.05
+  eval_batch_size: 1500
+  eval_subset: null
+
+output_dir: ???
+
+master_port: 25123
+internal_master_port: 25124
+
+
+hydra:
+  output_subdir: null

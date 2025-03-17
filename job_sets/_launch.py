@@ -74,7 +74,7 @@ def launch(
     assert len(parts) == 3, parts
     wandb_url = f"https://wandb.ai/{parts[0]}/{parts[1]}/runs/{parts[2]}"
 
-    job_name = f"{output_root.name}_{run_dir.relative_to(output_root)}_{wandb_url}"
+    job_name = f"{output_root.name}_{run_dir.relative_to(output_root)}"
 
     slurm = simple_slurm.Slurm(
         job_name=job_name,

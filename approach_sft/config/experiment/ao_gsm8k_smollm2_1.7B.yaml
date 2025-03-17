@@ -6,9 +6,10 @@ dataset_choice:
   _args_: ["gsm8k"]
 
 output_type:
-  train_batch_size:          30
-  eval_batch_size:           30
-  max_length:                1024
+  train_batch_size:          7
+  eval_batch_size:           7
+  max_length:                512
 
-max_num_epochs:  2
-model_name_or_path: "HuggingFaceTB/SmolLM2-1.7B"
+model_name_or_path: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+
+use_peft: false

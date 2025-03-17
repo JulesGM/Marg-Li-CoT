@@ -1,3 +1,4 @@
+import os
 import pathlib
 import sys
 from typing import Optional
@@ -46,12 +47,23 @@ class MATHDataset(torch.utils.data.Dataset):
             forward_tokenizer, 
             prediction_tokenizer,
             output_type: lib_sft_constants.OutputTypes,
+            use_chat_templates: bool,
         ):
 
-        hf_dataset = datasets.load_dataset(
-            "hendrycks/competition_math", 
-            trust_remote_code=True,
-        )[SPLIT_CONVERSION_MAP[split]]
+        try:
+            hf_dataset = datasets.load_dataset(
+                "hendrycks/competition_math",
+                trust_remote_code=True,
+            )
+        except datasets.exceptions.DatasetNotFoundError:
+            hf_dataset = datasets.load_from_disk(
+                os.environ.get(
+                    "MATH_DATASET_PATH", 
+                    str(pathlib.Path("~/hendrycks_math").expanduser())
+                ),
+            )
+
+        hf_dataset = hf_dataset[SPLIT_CONVERSION_MAP[split]]
 
         assert split in [
             lib_utils.CVSets.TRAIN, 
@@ -71,6 +83,8 @@ class MATHDataset(torch.utils.data.Dataset):
         collator = MATHCollator(
             forward_tokenizer=forward_tokenizer,
             prediction_tokenizer=prediction_tokenizer,
+            use_chat_templates=use_chat_templates,
+            answer_only=output_type == lib_sft_constants.OutputTypes.ANSWER_ONLY,
         )
 
         outputs = []
@@ -150,14 +164,23 @@ class MATHDataset(torch.utils.data.Dataset):
         return len(self._hf_dataset)
 
 
+LIGHTEVAL_PROMPT_MATH = dict(
+    question="{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}.\n\n", 
+    answer="{answer}\n\n"
+)
+
 class MATHCollator:
     def __init__(
             self, 
             *,
             forward_tokenizer: transformers.PreTrainedTokenizer, 
             prediction_tokenizer: transformers.PreTrainedTokenizer,
+            use_chat_templates: bool,
+            answer_only: bool,
         ):
 
+        self._answer_only = answer_only
+        self._use_chat_templates = use_chat_templates
         self._forward_tokenizer = forward_tokenizer
         self._prediction_tokenizer = prediction_tokenizer
 
@@ -168,21 +191,74 @@ class MATHCollator:
         ref_qa_answer_batch = [x["ref_qa_answer"] for x in batch]
         ref_qa_question_batch = [x["ref_qa_question"] for x in batch]
 
-        forward_input_ids = self._forward_tokenizer(
-            formatted_forward,
-            padding=True,
-            return_tensors="pt",
-        )
 
-        predict_input_ids = self._prediction_tokenizer(
-            formatted_prediction,
-            padding=True,
-            return_tensors="pt",
-        )
+        if self._use_chat_templates:
+            messages_forward = []
+            messages_prediction = []
+            for question, answer in mit.zip_equal(ref_qa_question_batch, ref_qa_answer_batch):
+                if self._answer_only:
+                    # Extract the last boxed only string from the answer
+                    last_boxed_only_string = hendrycks_math_utils.last_boxed_only_string(answer)
+
+                    messages_forward.append(
+                        [{"role": "user", "content": question},
+                         {"role": "assistant", "content": last_boxed_only_string},
+                        ]
+                    )
+                    messages_prediction.append(
+                        [{"role": "user", "content": question},
+                        ]
+                    )
+                else:
+                    messages_forward.append(
+                        [{"role": "user", "content": question},
+                         {"role": "assistant", "content": answer},
+                        ]
+                    )
+                    messages_prediction.append(
+                        [{"role": "user", "content": question}]
+                    )
+
+            forward_tokenized_not_padded = [
+                self._forward_tokenizer.apply_chat_template(
+                    forward_messages, tokenize=True, add_generation_prompt=False
+                ) for forward_messages in messages_forward
+            ]
+
+            tokenized_forward = self._forward_tokenizer.pad(
+                dict(input_ids=forward_tokenized_not_padded), 
+                padding=True, 
+                return_tensors="pt",
+            )
+
+            prediction_tokenized_not_padded = [
+                self._prediction_tokenizer.apply_chat_template(
+                    prediction_messages, tokenize=True, add_generation_prompt=True
+                ) for prediction_messages in messages_prediction
+            ]
+
+            tokenized_prediction = self._prediction_tokenizer.pad(
+                dict(input_ids=prediction_tokenized_not_padded), 
+                padding=True, 
+                return_tensors="pt",
+            )
+                
+        else:
+            tokenized_forward = self._forward_tokenizer(
+                formatted_forward,
+                padding=True,
+                return_tensors="pt",
+            )
+
+            tokenized_prediction = self._prediction_tokenizer(
+                formatted_prediction,
+                padding=True,
+                return_tensors="pt",
+            )
 
         return dict(
-            forward=forward_input_ids,
-            predict=predict_input_ids,
+            forward=tokenized_forward,
+            predict=tokenized_prediction,
             extra_info=dict(
                 ref_qa_answer=ref_qa_answer_batch,
                 ref_qa_question=ref_qa_question_batch,

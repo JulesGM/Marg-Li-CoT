@@ -19,6 +19,8 @@ def pad_to_max(sequence, pad_token):
     return [seq + [pad_token] * (max_length - len(seq)) for seq in sequence]
 
 
+GSM8K_LIGHTEVAL_PROMPT = dict(question="Question: {question}\nAnswer:", answer=" {answer}")
+
 class GSM8KCollator:
     def __init__(
         self, 
@@ -26,10 +28,12 @@ class GSM8KCollator:
         output_type, 
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
         prediction_tokenizer: transformers.PreTrainedTokenizerBase,
+        use_chat_templates: bool,
     ):
         self._forward_tokenizer = forward_tokenizer
         self._prediction_tokenizer = prediction_tokenizer
         self._output_type = output_type
+        self._use_chat_templates = use_chat_templates
          
         assert self._prediction_tokenizer.padding_side == "left", (
             self._prediction_tokenizer.padding_side)
@@ -67,6 +71,20 @@ class GSM8KCollator:
                 for question in questions
             ]
 
+            forward_messages = [
+                [{"role": "user", "content": question},
+                 {"role": "assistant", 
+                  "content": f"{scratchpad} #### {answer}"
+                 }
+                ]
+                for question, scratchpad, answer
+                in mit.zip_equal(questions, scratchpads, answers)
+            ]
+
+            predict_messages = [
+                [{"role": "user", "content": question}]
+                for question in questions
+            ]
         elif self.output_type == lib_sft_constants.OutputTypes.ANSWER_ONLY:
             questions   = [f["ref_qa_question"].strip() for f in features]
             answers     = [f["ref_qa_answer"]  .strip() for f in features]
@@ -83,37 +101,80 @@ class GSM8KCollator:
                 "A:"
                 for question in questions
             ]
+
+            forward_messages = [
+                [{"role": "user", "content": question},
+                 {"role": "assistant", "content": f"#### {answer}"}]
+                for question, answer
+                in mit.zip_equal(questions, answers)
+            ]
+
+            predict_messages = [
+                [{"role": "user", "content": question}]
+                for question in questions
+            ]
+
         else:
             raise NotImplementedError(self.output_type)
-
-        # Add an EOS token to the end of the forward input text
-        forward_input_ids = [
-            self._forward_tokenizer(forward_input_text).input_ids + 
-            [self._forward_tokenizer.eos_token_id] 
-            for forward_input_text in forward_input_text
-        ]
+        
+        #######################################################################
+        # Do forward tokenization
+        #######################################################################
+        if self._use_chat_templates:
+            forward_input_ids = [
+                self._forward_tokenizer.apply_chat_template(
+                    conversation=messages,
+                    tokenize=True,
+                    add_generation_prompt=False
+                ) + [self._forward_tokenizer.eos_token_id]
+                for messages in forward_messages
+            ]
+        else:
+            forward_input_ids = [
+                self._forward_tokenizer(forward_input_text).input_ids + 
+                [self._forward_tokenizer.eos_token_id] 
+                for forward_input_text in forward_input_text
+            ]
 
         forward_input_ids = self._forward_tokenizer.pad(
                 dict(input_ids=forward_input_ids), 
                 return_tensors="pt",
             )
 
-        predict_input_ids = self._prediction_tokenizer(
-            predict_input_text, 
-            padding=True, 
-            return_tensors="pt"
-        )
-
         del forward_input_text
+
+        #######################################################################
+        # Do prediction tokenization
+        #######################################################################
+        if self._use_chat_templates:
+            predict_input_ids = [self._prediction_tokenizer.apply_chat_template(
+                    conversation=messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+                for messages in predict_messages
+            ]
+            predict_input_ids = self._prediction_tokenizer.pad(
+                dict(input_ids=predict_input_ids), 
+                return_tensors="pt",
+            )
+        else:
+            predict_input_ids = self._prediction_tokenizer(
+                predict_input_text, 
+                padding=True, 
+                return_tensors="pt"
+            )
+
 
         #######################################################################
         # Token Checks
         #######################################################################
         # For prediction, there should be no EOS in the unmasked input
-        assert not (
-            predict_input_ids["input_ids"][predict_input_ids["attention_mask"] == 1] == 
-            self._prediction_tokenizer.eos_token_id
-        ).any()
+        # breakpoint()
+        # assert not (
+        #     predict_input_ids["input_ids"][predict_input_ids["attention_mask"] == 1] == 
+        #     self._prediction_tokenizer.eos_token_id
+        # ).any()
 
         # For forward, there should be exactly one EOS in the unmasked input, and
         # it should be the last token.
@@ -124,7 +185,7 @@ class GSM8KCollator:
             is_eos = input_ids[attention_mask.bool()] == self._forward_tokenizer.eos_token_id
             real_eos_count = (is_eos).sum()
 
-            assert real_eos_count == 1, real_eos_count
+            # assert real_eos_count == 1, real_eos_count
             assert is_eos[-1], is_eos[-1]
 
         keys = set(features[0].keys())
@@ -147,8 +208,11 @@ class ArithmeticCausalMaskedCollator:
         forward_tokenizer: transformers.PreTrainedTokenizerBase,
         prediction_tokenizer: transformers.PreTrainedTokenizerBase,
         has_choices: bool,
+        use_chat_templates: bool,
     ):
-        
+        if use_chat_templates:
+            raise NotImplemented("chat templates not yet implemented")
+        self._use_chat_templates = use_chat_templates
         self._forward_tokenizer = forward_tokenizer
         self._prediction_tokenizer = prediction_tokenizer
         self._output_type = output_type

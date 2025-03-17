@@ -1,5 +1,7 @@
 name: "hendrycks/competition_math"
 split: "train"
+valid_split: "test"
+
 question_field: "problem"
 answer_field: "solution"
 load_dataset_args: []

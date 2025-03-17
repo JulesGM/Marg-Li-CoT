@@ -2,4 +2,14 @@
 
 defaults:
   - override /dataset: gsm8k
+
 experiment_name: "gsm8k_experiment"
+
+training:
+  max_length: 768
+  batch_size: 12
+  num_epochs: 30
+
+
+vllm_sampling:
+  num_candidates: 48

@@ -1,3 +1,4 @@
+import os
 import re
 import signal
 import logging
@@ -185,11 +186,14 @@ def is_equiv(x1: str, x2: str) -> bool:
     """
     x1 and x2 are normalized latex string
     """
+
+    backend = os.environ.get("OPENINSTRUCT_PARSE_LATEX_BACKEND", "antlr")
+
     try:
         with timeout(seconds=5):
             try:
-                parsed_x1 = parse_latex(x1)
-                parsed_x2 = parse_latex(x2)
+                parsed_x1 = parse_latex(x1, backend=backend)
+                parsed_x2 = parse_latex(x2, backend=backend)
             except (
                 sympy.parsing.latex.errors.LaTeXParsingError,
                 sympy.SympifyError,

@@ -20,11 +20,36 @@ jobs:
   #   gpu: l40s
   #   dataset: gsm8k
 
-  - experiment: cot_gsm8k_smollm2_1.7B
-    code_category: sft
-    overloads:
-    gpu: l40s
-    dataset: gsm8k
+  # - experiment: cot_gsm8k_smollm2_1.7B
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: gsm8k
+
+
+  # - experiment: cot_gsm8k_smollm2_1.7B_0_000025_30
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: gsm8k
+
+  # - experiment: cot_gsm8k_smollm2_1.7B_0_00005_5
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: gsm8k
+
+  # - experiment: cot_gsm8k_smollm2_1.7B_0_000075_30
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: gsm8k
+
+  # - experiment: cot_gsm8k_smollm2_1.7B_0_000075_5
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  # dataset: gsm8k
 
   # - experiment: ao_math_smollm2_1.7B
   #   code_category: sft
@@ -32,7 +57,31 @@ jobs:
   #   gpu: l40s
   #   dataset: math
 
-  - experiment: cot_math_smollm2_1.7B
+  # - experiment: cot_math_smollm2_1.7B
+  #   code_category: sft
+  #   overloads:
+  #   gpu: l40s
+  #   dataset: math
+
+  - experiment: cot_math_smollm2_1.7B_0_00005_15
+    code_category: sft
+    overloads:
+    gpu: l40s
+    dataset: math
+
+  - experiment: cot_math_smollm2_1.7B_0_00005_5
+    code_category: sft
+    overloads:
+    gpu: l40s
+    dataset: math
+
+  - experiment: cot_math_smollm2_1.7B_0_0005_15
+    code_category: sft
+    overloads:
+    gpu: l40s
+    dataset: math
+
+  - experiment: cot_math_smollm2_1.7B_0_0005_5
     code_category: sft
     overloads:
     gpu: l40s
