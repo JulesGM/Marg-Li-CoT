@@ -1,0 +1,24 @@
+[project]
+name = "light-eval-tests"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "vllm==0.6.3",
+    "lighteval==0.6.0",
+    "word2number>=1.1",
+    "fire>=0.7.0",
+    "more-itertools>=10.6.0",
+    "nvgpu>=0.10.0",
+    "rich>=13.9.4",
+    "torch==2.4.0",
+    "numpy<2",
+    "accelerate>=1.5.2",
+    "datasets>=3.5.0",
+    "ray>=2.44.1",
+    "ipykernel>=6.29.5",
+]
+
+[tool.uv.sources]
+lighteval = { git = "https://github.com/huggingface/lighteval.git", rev = "v0.6.0" }

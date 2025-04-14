@@ -8,7 +8,7 @@ dataset_choice:
 output_type:
   train_batch_size:          1
   eval_batch_size:           1
-  # max_length:              512
+  max_length:              512
 
 model_name_or_path: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
@@ -16,4 +16,4 @@ use_peft: false
 tok_max_total_length:      768
 
 max_num_epochs:            15
-learning_rate:             0.0005
+learning_rate:             0.01

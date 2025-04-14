@@ -1,8 +1,11 @@
 #!/usr/bin/env python
+import os
+if "SQUEUE_FORMAT" in os.environ:
+    del os.environ["SQUEUE_FORMAT"]
+
 import dataclasses
 import datetime
 import enum
-import os
 import pathlib
 import uuid
 import yaml
@@ -78,7 +81,7 @@ def suggest_config(config):
         config_sets = SCRIPT_DIR / "config_sets" 
         sorted_by_modification_date = sorted(
             config_sets.glob("*.yaml"), 
-            key=lambda x: os.path.getmtime(x),
+            key=lambda x: os.path.getmtime(x),  
         )
 
         just_name = [x.stem for x in sorted_by_modification_date]
@@ -92,7 +95,11 @@ def suggest_config(config):
     return config
 
 
-def main(config_set: Optional[str] = None, user_id: str="julesgm"):
+def main(
+        config_set: Optional[str] = None, 
+        user_id: str="julesgm", 
+        sbatch: bool = False,
+    ):
     config_set = suggest_config(config_set)
     assert isinstance(config_set, str), type(config_set)
     config = load_config(config_set)

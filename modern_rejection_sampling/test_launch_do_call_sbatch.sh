@@ -3,14 +3,17 @@
 #SBATCH --cpus-per-task 32 
 #SBATCH --mem 160GB 
 #SBATCH --partition long
-#SBATCH --job-name=config_sweep
+#SBATCH --job-name=text_config_sweep
+#SBATCH --output=output_text_config_sweep_%A_%a.out
+#SBATCH --error=error_text_config_sweep_%A_%a.err
 #SBATCH --array=0-1
 
 # Define configs array
-configs=(gsm8k_0 gsm8k_8)  
+configs=(test_gsm8k_8 test_gsm8k_0)
 
 
 LEARNING_RATE=0.0001
+
 
 # Validate experiment argument is not provided (since we're using array)
 if [ ! -z "$1" ]; then
@@ -33,6 +36,5 @@ scontrol update JobId="$SLURM_JOB_ID" JobName=config_sweep_"${config}_${LEARNING
 OUTPUT_DIR="/network/scratch/g/gagnonju/rejection_sampling_saves/${config}/$(date +%Y-%m-%d_%H-%M-%S)/"
 
 # export NCCL_DEBUG=DEBUG
-cd /home/mila/g/gagnonju/marglicot/modern_rejection_sampling;
 
 uv run ray_train.py experiment="$config" training.learning_rate="$LEARNING_RATE" output_dir="$OUTPUT_DIR"

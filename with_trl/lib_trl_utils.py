@@ -28,9 +28,9 @@ import rich.table
 import torch
 import transformers
 import transformers.tokenization_utils
-import trl
-import trl.core
-import trl.models
+# import trl
+# import trl.core
+# import trl.models
 import tqdm
 
 
@@ -47,41 +47,41 @@ LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
 
-class FixedPPOConfig(trl.PPOConfig):
-    """Fixes the serialization of the config object.
+# class FixedPPOConfig(trl.PPOConfig):
+#     """Fixes the serialization of the config object.
     
-    Out of the box, TRL tries to log it's config object as a json string, but
-    doesn't do a good job at all of serializing some of the objects.
+#     Out of the box, TRL tries to log it's config object as a json string, but
+#     doesn't do a good job at all of serializing some of the objects.
         
-    This class fixes that.
+#     This class fixes that.
 
-    """
-    def to_dict(self):
-        new_self = copy.deepcopy(self)
-        deepspeed_plugin_key = "deepspeed_plugin"
-        kwargs_handlers_key = "kwargs_handlers"
-        hf_ds_config = "hf_ds_config"
-        accelerator_kwargs = new_self.accelerator_kwargs
+#     """
+#     def to_dict(self):
+#         new_self = copy.deepcopy(self)
+#         deepspeed_plugin_key = "deepspeed_plugin"
+#         kwargs_handlers_key = "kwargs_handlers"
+#         hf_ds_config = "hf_ds_config"
+#         accelerator_kwargs = new_self.accelerator_kwargs
 
-        if deepspeed_plugin_key in accelerator_kwargs:
-            accelerator_kwargs[deepspeed_plugin_key] = vars(
-                accelerator_kwargs[deepspeed_plugin_key]) | {
-                    "__class__": accelerate.utils.DeepSpeedPlugin.__name__
-                }
-            deepspeed_plugin = accelerator_kwargs[deepspeed_plugin_key]
-            deepspeed_plugin[hf_ds_config] = vars(
-                deepspeed_plugin[hf_ds_config]) | {
-                    "__class__": deepspeed_plugin[hf_ds_config].__class__.__name__
-                }
+#         if deepspeed_plugin_key in accelerator_kwargs:
+#             accelerator_kwargs[deepspeed_plugin_key] = vars(
+#                 accelerator_kwargs[deepspeed_plugin_key]) | {
+#                     "__class__": accelerate.utils.DeepSpeedPlugin.__name__
+#                 }
+#             deepspeed_plugin = accelerator_kwargs[deepspeed_plugin_key]
+#             deepspeed_plugin[hf_ds_config] = vars(
+#                 deepspeed_plugin[hf_ds_config]) | {
+#                     "__class__": deepspeed_plugin[hf_ds_config].__class__.__name__
+#                 }
         
-        kwargs_handlers = accelerator_kwargs[kwargs_handlers_key]
-        for i, entry in enumerate(kwargs_handlers):
-            if isinstance(entry, accelerate.utils.DistributedDataParallelKwargs):
-                kwargs_handlers[i] = vars(entry) | {
-                    "__class__": accelerate.utils.DistributedDataParallelKwargs.__name__
-                }
+#         kwargs_handlers = accelerator_kwargs[kwargs_handlers_key]
+#         for i, entry in enumerate(kwargs_handlers):
+#             if isinstance(entry, accelerate.utils.DistributedDataParallelKwargs):
+#                 kwargs_handlers[i] = vars(entry) | {
+#                     "__class__": accelerate.utils.DistributedDataParallelKwargs.__name__
+#                 }
 
-        return super(FixedPPOConfig, new_self).to_dict()
+#         return super(FixedPPOConfig, new_self).to_dict()
 
 
 # @dataclasses.dataclass

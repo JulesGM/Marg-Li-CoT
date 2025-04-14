@@ -1,0 +1,20 @@
+[project]
+name = "metrics-debug"
+version = "0.1.0"
+description = "Figure out the reason why there is a discrepancy in the metrics."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "lighteval==0.6.0",
+    "vllm==0.6.3",
+    "torch>=2.4.0",
+    "datasets>=3.5.0",
+    "accelerate>=1.6.0",
+    "numpy>=1.26.4",
+    "transformers>=4.51.2",
+    "word2number>=1.1",
+]
+
+[tool.uv.sources]
+lighteval = { git = "https://github.com/huggingface/lighteval.git", rev = "v0.6.0" }
+

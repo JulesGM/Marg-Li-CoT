@@ -17,7 +17,6 @@ import rich
 import rich.table
 import torch
 from tqdm import tqdm
-import trl
 # import trl_fork
 import wandb
 
@@ -40,10 +39,13 @@ class TrlLibraryMode(enum.Enum):
     # TRL_FORK = "trl_fork"
 
 
-TRL_LIBRARIES = {
-    TrlLibraryMode.TRL: trl,
-    # TrlLibraryMode.TRL_FORK: trl_fork,
-}
+
+# import trl
+
+# TRL_LIBRARIES = {
+#     TrlLibraryMode.TRL: trl,
+#     # TrlLibraryMode.TRL_FORK: trl_fork,
+# }
 
 
 class CVSets(str, enum.Enum):

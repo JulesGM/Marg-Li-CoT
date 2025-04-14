@@ -22,17 +22,20 @@ def launch_sft(job: _constants.JobConfig, wandb_id: str, output_root):
 
     # Run with sbatch
     run_script = SCRIPT_DIR.parent / "approach_sft" / "launch.py"
+    package_dir = SCRIPT_DIR.parent / "approach_sft"
     assert run_script.exists(), f"Run script {run_script} not found"
 
     wandb_hash = wandb_id.split("/")[-1]
 
     command = [
-        "python", 
+        "uv",
+        "run",
         str(run_script), 
         f"--experiment={shlex.quote(job.experiment)}", 
         f"--wandb_id={shlex.quote(wandb_hash)}",
     ]
-    
+    command = f"cd {shlex.quote(str(package_dir))} && " + shlex.join(command)
+
     return command, _make_run_dir(middle="sft", output_dir=output_root, job=job)
 
 def launch_trl(job: _constants.JobConfig, wandb_id: str, output_root):
@@ -43,11 +46,14 @@ def launch_trl(job: _constants.JobConfig, wandb_id: str, output_root):
     wandb_hash = wandb_id.split("/")[-1]
 
     command = [
-        "python", 
+        "uv",
+        "run",
         str(run_script), 
         f"--experiment={shlex.quote(job.experiment)}", 
         f"--wandb_id={shlex.quote(wandb_hash)}",
     ]
+
+    command = f"cd {shlex.quote(str(SCRIPT_DIR.parent))} && " + shlex.join(command)
     
     return command, _make_run_dir(middle="rl", output_dir=output_root, job=job)
 
@@ -57,7 +63,7 @@ def launch(
     job: _constants.JobConfig, 
     output_root: str | pathlib.Path,
     launch_set_name: str,
-    wandb_id: str
+    wandb_id: str,
 ) -> int:
     
     output_root = pathlib.Path(output_root)
@@ -86,7 +92,7 @@ def launch(
         gres=f"gpu:{job.gpu}:1",
     )
 
-    job_id = slurm.sbatch(shlex.join(command))
+    job_id = slurm.sbatch(command)
 
     _common.to_yaml(
         dict(

@@ -1,0 +1,8 @@
+# @package _global_
+
+defaults:
+  - override /dataset: hendrycks_math
+
+experiment_name: "hendrycks_math_experiment"
+
+few_shot_qty: 0

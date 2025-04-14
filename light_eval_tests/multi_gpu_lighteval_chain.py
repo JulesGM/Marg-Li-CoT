@@ -5,6 +5,7 @@ Reads from a glob pattern, and runs lighteval on each of the paths, with SLURM (
 - Filters the input paths to only include those with the correct safetensors or pt extension (safetensors is the default).
 
 """
+
 import concurrent.futures
 import enum
 import json
@@ -22,12 +23,14 @@ import fire
 import nvgpu
 import rich
 
+
 LOGGER = logging.getLogger(__name__)
+SCRIPT_DIR = pathlib.Path(__file__).absolute().parent
+
 
 class DispatchStyle(str, enum.Enum):
     LOCAL = "local"
     SLURM = "slurm"
-
 
 
 class SafeTensorsOrPT(str, enum.Enum):
@@ -35,10 +38,18 @@ class SafeTensorsOrPT(str, enum.Enum):
     PT = "pt"
 
 
-def build_command(input_path: typing.Union[str, pathlib.Path], task_key: str, output_dir: typing.Union[str, pathlib.Path], custom_tasks: str):
+def build_command(
+        *,
+        custom_tasks: str,
+        input_path: str | pathlib.Path, 
+        output_dir: str | pathlib.Path, 
+        task_key: str, 
+    ) -> list[str]:
 
     return [
-        "/home/mila/g/gagnonju/.mambaforge/bin/lighteval", 
+        "uv",
+        "run",
+        "lighteval",
         "accelerate", 
         "--model_args", 
         f"pretrained={shlex.quote(str(input_path))},revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=0.8,max_model_length=2048", 
@@ -50,18 +61,32 @@ def build_command(input_path: typing.Union[str, pathlib.Path], task_key: str, ou
     ]
 
 
-def slurm_dispatcher(*, input_paths, output_dir, task_key, custom_tasks):
+def slurm_dispatcher(
+        *, 
+        custom_tasks: str, 
+        input_paths: typing.Sequence[str | pathlib.Path], 
+        output_dir: str | pathlib.Path, 
+        task_key: str, 
+        dry_run: bool,
+    ):
+
     # Start the work
     for input_path in input_paths:
         
-        input_path = pathlib.Path(input_path).expanduser().resolve()
+        input_path = pathlib.Path(input_path).expanduser().absolute()
         predicted_results_path = output_dir / "results" / str(input_path).replace("/", "_")
         predicted_results_path.mkdir(parents=True, exist_ok=True)
 
         # Only run if there are no results yet
         if not list(predicted_results_path.glob("results_*.json")):
             copy_meta_info_json(input_path=input_path, predicted_results_path=predicted_results_path)
-            script_command = build_command(input_path=input_path, task_key=task_key, output_dir=output_dir, custom_tasks=custom_tasks)
+            script_command = build_command(
+                custom_tasks      = custom_tasks,
+                input_path        = input_path, 
+                output_dir        = output_dir, 
+                task_key          = task_key, 
+            )
+
             slurm_command = [
                     "sbatch",
                     "--gres=gpu:l40s:1", 
@@ -73,10 +98,13 @@ def slurm_dispatcher(*, input_paths, output_dir, task_key, custom_tasks):
                     "long",
                     "--output", f"{output_dir}/slurm_logs/%j.out",
                     "--error", f"{output_dir}/slurm_logs/%j.err",
-                    f"--wrap={shlex.join(script_command)}",
+                    f"--wrap", f"cd {SCRIPT_DIR}; {shlex.join(script_command)}",
                 ]
             rich.print(f"[bold green]Submitting:[/] {shlex.join(slurm_command)}")
-            subprocess.check_output(slurm_command)
+            if not dry_run:
+                subprocess.check_output(slurm_command)
+            else:
+                rich.print(f"[bold orange1]Dry run:[/] {shlex.join(slurm_command)}")
         else:
             rich.print(f"[bold orange1]Skipping:[/] {input_path} because it already has results")
         print()
@@ -151,7 +179,7 @@ def local_dispatcher(*, input_paths, output_dir, task_key, custom_tasks, threads
 
 
 def extract_input_paths(input_path, glob_pattern, safetensors_or_pt: SafeTensorsOrPT):
-    input_path = pathlib.Path(input_path).expanduser().resolve()
+    input_path = pathlib.Path(input_path).expanduser().absolute()
     assert input_path.is_dir(), f"Path does not exist: {input_path}"
     input_paths = list(input_path.glob(glob_pattern))
 
@@ -182,7 +210,7 @@ def extract_input_paths(input_path, glob_pattern, safetensors_or_pt: SafeTensors
 
 
 def copy_meta_info_json(input_path: pathlib.Path, predicted_results_path: pathlib.Path):
-    input_path = pathlib.Path(input_path).expanduser().resolve()
+    input_path = pathlib.Path(input_path).expanduser().absolute()
     json_path = input_path.parent / "meta_info.json"
 
     target_name = "meta_info.json"
@@ -205,18 +233,19 @@ def main(
         dispatch_style: DispatchStyle = DispatchStyle.SLURM,
         safetensors_or_pt: SafeTensorsOrPT = SafeTensorsOrPT.SAFETENSORS,
         logger_level: int | str = os.environ.get("PYTHON_LOG_LEVEL", logging.DEBUG),
+        dry_run: bool = False,
     ):
 
     logging.basicConfig(level=logger_level)
 
-    custom_tasks = pathlib.Path(custom_tasks).expanduser().resolve()
+    custom_tasks = pathlib.Path(custom_tasks).expanduser().absolute()
     assert custom_tasks.is_file(), f"Custom tasks file does not exist: {custom_tasks}"
 
     safetensors_or_pt = SafeTensorsOrPT(safetensors_or_pt)
     dispatch_style = DispatchStyle(dispatch_style)
 
     assert len(task_key.split("|")) == 4, "Task key must have 4 parts separated by |"
-    output_dir = pathlib.Path(output_dir).expanduser().resolve()
+    output_dir = pathlib.Path(output_dir).expanduser().absolute()
     assert output_dir.is_dir(), f"Output directory does not exist: {output_dir}"
 
     input_paths = extract_input_paths(input_path, glob_pattern, safetensors_or_pt)
@@ -231,10 +260,11 @@ def main(
         )
     elif dispatch_style == DispatchStyle.SLURM:
         slurm_dispatcher(
-            input_paths=input_paths,
-            output_dir=output_dir,
-            task_key=task_key,
-            custom_tasks=custom_tasks,
+            custom_tasks      = custom_tasks,
+            input_paths       = input_paths,
+            output_dir        = output_dir,
+            task_key          = task_key,
+            dry_run           = dry_run,
         )
     else:
         raise ValueError(f"Unknown dispatch style: {dispatch_style}")

@@ -5,12 +5,15 @@
 
 set -euo pipefail
 
-NUM_SHOTS=0
+NUM_SHOTS=5
 OUTPUT_DIR="./all_eval_outputs_important/sft_outputs_math/${NUM_SHOTS}_shot"
 INPUT_DIR="$HOME/scratch/marglicot_saves/sft_saves/"
 mkdir -p "${OUTPUT_DIR}"
 TASK_PATH=./util_code/tasks.py
-GLOB_PATTERN='*math*/*/model/'
+GLOB_PATTERN='*math*2025-04-13*/*/model/'
+
+
+
 
 python multi_gpu_lighteval_chain.py \
 --task_key="custom|math|${NUM_SHOTS}|0" \

@@ -14,6 +14,7 @@ import os
 import pathlib
 import random
 import re
+import sys
 import tempfile
 from typing import Optional
 
@@ -53,6 +54,9 @@ from tqdm import tqdm
 import transformers
 import transformers.utils
 import wandb
+
+sys.path.append(str(pathlib.Path(__file__).parent.parent))
+sys.path.append(str(pathlib.Path(__file__).parent.parent.parent))
 
 from approach_sft import lib_sft_constants
 from approach_sft import lib_sft_dataloaders

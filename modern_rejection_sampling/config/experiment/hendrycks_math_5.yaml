@@ -5,16 +5,8 @@ defaults:
 
 experiment_name: "hendrycks_math_experiment"
 
-training:
-  max_length: 768
-  batch_size: 12
-  num_epochs: 30
-
 
 vllm_sampling:
   num_candidates: 48
 
-
-# evaluation:
-#   eval_percentage: 0.2
-#   eval_subset: 500
+few_shot_qty: 5

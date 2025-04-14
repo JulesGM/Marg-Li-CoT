@@ -5,11 +5,8 @@ defaults:
 
 experiment_name: "gsm8k_experiment"
 
+few_shot_qty: 0
+
 training:
-  max_length: 768
-  batch_size: 12
-  num_epochs: 30
-
-
-vllm_sampling:
-  num_candidates: 48
+  train_subset_mode: true
+  train_subset_size: 10

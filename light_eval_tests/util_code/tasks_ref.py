@@ -3,37 +3,9 @@ import numpy as np
 
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
-from lighteval.metrics.metrics import Metrics, SampleLevelMetric, MetricCategory, MetricUseCase, ExactMatches, gsm8k_normalizer
+from lighteval.metrics.metrics import Metrics, SampleLevelMetric, MetricCategory, MetricUseCase, ExactMatches
 import lighteval.tasks.default_prompts as prompt
 from .math_utils import parse_math_answer
-import aenum
-
-
-def jules_gsm8k_normalizer(text: str) -> str:
-    """
-    from https://github.com/openai/grade-school-math/blob/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/dataset.py#L28
-
-    Args:
-        text (str): input text
-
-    Returns:
-        str: Output text, either the number found in the text or "[invalid]" if
-        no number was found
-    """
-    response = re.sub(r"(\d),(\d)", r"\1\2", text)
-    numbers = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", response)
-    
-    if numbers:
-        predictions = numbers[-1]
-    else:
-        predictions = response
-    INVALID_ANS = "[invalid]"
-
-    if predictions:
-        return predictions.strip()
-    else:
-        return INVALID_ANS
-
 
 
 def prompt_hellaswag(line, task_name: str = None):
@@ -109,28 +81,6 @@ def prompt_math(line, task_name: str = None):
         gold_index=0,
         choices=[f"{line['solution']}\n\n"],
     )
-
-
-def jules_gsm8k(line, task_name: str = None):
-    # Has special analysis in metric for number decomposiition
-    return Doc(
-        task_name=task_name,
-        query=f"{line['question']}",
-        choices=[f"{line['answer']}"],
-        gold_index=0,
-    )
-
-
-aenum.extend_enum(Metrics, "quasi_exact_match_gsm8k_zero_shot", SampleLevelMetric(
-    metric_name="qem",
-    sample_level_fn=ExactMatches(
-        strip_strings=True, normalize_pred=jules_gsm8k_normalizer, normalize_gold=gsm8k_normalizer
-    ).compute,
-    category=MetricCategory.GENERATIVE,
-    use_case=MetricUseCase.MATH,
-    corpus_level_fn=np.mean,
-    higher_is_better=True,
-))
 
 
 TASKS_TABLE = [
@@ -230,14 +180,14 @@ TASKS_TABLE = [
     ),
     LightevalTaskConfig(
         name="gsm8k",
-        prompt_function=jules_gsm8k, # prompt.gsm8k,
+        prompt_function=prompt.gsm8k,
         suite=["custom"],
         hf_repo="openai/gsm8k",
         hf_subset="main",
         hf_revision="e53f048856ff4f594e959d75785d2c2d37b678ee",
         hf_avail_splits=["train", "test"],
         evaluation_splits=["test"],
-        metric=[Metrics.quasi_exact_match_gsm8k_zero_shot],
+        metric=[Metrics.quasi_exact_match_gsm8k],
         generation_size=256,
         stop_sequence=["Question:", "Question"],
         few_shots_select="random_sampling_from_train",

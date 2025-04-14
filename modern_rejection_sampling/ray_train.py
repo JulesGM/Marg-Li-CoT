@@ -1,6 +1,30 @@
+"""
+Online rejection sampling based training.
+
+VLLM engine on N - 1 GPUs.
+Model training on 1 GPU.
+
+This is because generation with rejection sampling takes much longer than training. 
+The weights are broadcasted from the training GPU to the VLLM engines after each batch.
+
+cfg.training.forward_max_length is the max length of the complete, formatted chat of tokens.
+cfg.training.generation_max_length is the max length of the generated tokens for VLLM.
+
+We pad forward to max length to have more predictable memory usage and fail fast, as the forward pass is so much faster than generation.
+
+We dynamically make sure that the generated candidates don't exceed forward_max_length, right at generation time, & reject candidates that exceed it.
+
+
+
+"""
+
+import sys
+
+# Standard library imports
 import concurrent.futures as cf
 import dataclasses
 import enum
+import gc
 import json
 import os
 import pathlib
@@ -8,189 +32,64 @@ import queue
 import re
 import threading
 import time
+import typing
 
-os.environ["OPENINSTRUCT_PARSE_LATEX_BACKEND"] = "lark"
+# Set environment variables
+os.environ["OPENINSTRUCT_PARSE_LATEX_BACKEND"] = "lark" # Necessary for compatibility reasons. Needs to be done before importing open_instruct
 
+# Third party imports
 import datasets
 import hydra
-import more_itertools
+import more_itertools as mit
+import numpy as np
 import omegaconf
+import ray
+import ray.exceptions
 import rich
 import rich.panel
 import rich.rule
 import rich.traceback
 import torch
 import torch.utils.data
-import tqdm
 import transformers
-from open_instruct.ground_truth_utils import verify_gsm8k_sample
-                                             
-
-import wandb
-from open_instruct import vllm_utils2
-import ray
-import vllm
 import tqdm
-import numpy as np
+import vllm
+import wandb
 
-rich.traceback.install()
-print(vllm_utils2.__file__)
 from open_instruct.math_utils import (
-    last_boxed_only_string, 
-    remove_boxed, 
-    get_unnormalized_answer, 
-    normalize_final_answer, 
-    is_equiv, 
+    last_boxed_only_string,
+    remove_boxed,
+    get_unnormalized_answer,
+    normalize_final_answer,
+    is_equiv,
     hendrycks_is_equiv
 )
+from open_instruct import vllm_utils2
+
+# Local imports
+import config
+import trainer as trainer_lib
 
 
-
-def json_default(obj):
-    if isinstance(obj, pathlib.Path):
-        return str(obj)
-    elif isinstance(obj, torch.dtype):
-        return str(obj)
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+rich.traceback.install()
 
 
-@dataclasses.dataclass(kw_only=True)
-class DatasetConfig:
-    name: str
-    split: str
-    valid_split: str
-    question_field: str
-    answer_field: str
-    load_dataset_args: list
+def verify_gsm8k_sample(model_output, ground_truth_answer, verbose=False):
+    # model_output = model_output.split("<|assistant|>\n")[-1].strip()
+    # gsm is easy: extract numbers, and then just compare last number with answer.
+    # matches how we do eval.
+    predictions = None
+    # replace numbers like `x,xxx` with `xxxx`
+    response = re.sub(r"(\d),(\d)", r"\1\2", model_output)
+    numbers = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", response)
+    if numbers:
+        predictions = numbers[-1]
+    else:
+        predictions = response
+    if verbose:
+        print(f"predictions: {predictions}, ground_truth_answer: {ground_truth_answer}")
+    return str(predictions).lower() == str(ground_truth_answer).lower(), predictions
 
-    def __post_init__(self):
-        self.name = str(self.name)
-        self.split = str(self.split)
-        self.valid_split = str(self.valid_split)
-        self.question_field = str(self.question_field)
-        self.answer_field = str(self.answer_field)
-        self.load_dataset_args = list(self.load_dataset_args)
-
-
-@dataclasses.dataclass(kw_only=True)
-class ModelConfig:
-    name: str
-
-    def __post_init__(self):
-        self.name = str(self.name)
-
-
-@dataclasses.dataclass(kw_only=True)
-class TrainingConfig:
-    batch_size: int
-    learning_rate: float
-    num_epochs: int
-    max_length: int
-
-    def __post_init__(self):
-        self.batch_size = int(self.batch_size)
-        self.learning_rate = float(self.learning_rate)
-        self.num_epochs = int(self.num_epochs)
-        self.max_length = int(self.max_length)
-
-
-@dataclasses.dataclass(kw_only=True)
-class VLLMSamplingConfig:
-    top_p: float = None
-    temperature: float
-    num_candidates: int
-
-    def __post_init__(self):
-        self.temperature = float(self.temperature)
-        self.num_candidates = int(self.num_candidates)
-        if self.top_p is not None:
-            self.top_p = float(self.top_p)
-
-
-@dataclasses.dataclass(kw_only=True)
-class WandbConfig:
-    project: str
-    entity: str
-    log_interval: int
-
-    def __post_init__(self):
-        self.project = str(self.project)
-        self.entity = str(self.entity)
-        self.log_interval = int(self.log_interval)
-
-
-@dataclasses.dataclass(kw_only=True)
-class EvaluationConfig:
-    eval_subset: int = None
-    eval_batch_size: int
-    eval_percentage: float
-
-    def __post_init__(self):
-        if self.eval_subset is not None:
-            self.eval_subset = int(self.eval_subset)
-        self.eval_batch_size = int(self.eval_batch_size)
-        self.eval_percentage = float(self.eval_percentage)
-
-
-@dataclasses.dataclass(kw_only=True)
-class AccelerateConfig:
-    seed: int
-    gpu_ids: list[int]
-
-    def __post_init__(self):
-        self.seed = int(self.seed)
-        self.gpu_ids = [int(x) for x in self.gpu_ids]
-
-
-@dataclasses.dataclass(kw_only=True)
-class VLLMConfig:
-    gpu_id: int
-
-    def __post_init__(self):
-        self.gpu_id = int(self.gpu_id)
-
-
-@dataclasses.dataclass(kw_only=True)
-class VLLMSamplingConfig:
-    temperature: float
-    num_candidates: int
-    top_p: float = None
-
-    def __post_init__(self):
-        self.temperature = float(self.temperature)
-        self.num_candidates = int(self.num_candidates)
-        if self.top_p is not None:
-            self.top_p = float(self.top_p)
-
-
-@dataclasses.dataclass(kw_only=True)
-class Config:
-    accelerate: AccelerateConfig
-    dataset: DatasetConfig
-    evaluation: EvaluationConfig
-    experiment_name: str
-    output_dir: str
-    internal_master_port: int
-    master_port: int
-    model: ModelConfig
-    training: TrainingConfig
-    vllm: VLLMConfig
-    vllm_sampling: VLLMSamplingConfig
-    wandb: WandbConfig
-
-    def __post_init__(self):
-        self.accelerate = AccelerateConfig(**self.accelerate)
-        self.dataset = DatasetConfig(**self.dataset)
-        self.evaluation = EvaluationConfig(**self.evaluation)
-        self.experiment_name = str(self.experiment_name)
-        self.output_dir = str(self.output_dir)
-        self.internal_master_port = int(self.internal_master_port)
-        self.master_port = int(self.master_port)
-        self.model = ModelConfig(**self.model)
-        self.training = TrainingConfig(**self.training)
-        self.vllm = VLLMConfig(**self.vllm)
-        self.vllm_sampling = VLLMSamplingConfig(**self.vllm_sampling)
-        self.wandb = WandbConfig(**self.wandb)
 
 
 def verify_math_sample(model_output, ground_truth_answer):
@@ -247,7 +146,7 @@ def is_correct_gsm8k(*, model_output: str, ground_truth_answer: str) -> bool:
     assert isinstance(model_output, str), "Candidate must be a string."
     assert isinstance(ground_truth_answer, str), "Ground truth must be a string."
 
-    formatted_gt = ground_truth_answer.strip().lower().rsplit("####")[-1].strip()
+    formatted_gt = ground_truth_answer.strip().lower().rsplit("####")[-1].strip().replace(",", "")
 
     return verify_gsm8k_sample(model_output=model_output, ground_truth_answer=formatted_gt)
 
@@ -258,53 +157,82 @@ IS_CORRECT = {
     "hendrycks/competition_math": verify_math_sample,
 }
 
+
+def tokenize_conversations(*, forward_tokenizer, conversations: list[dict[str, str]]) -> torch.Tensor:
+    messages = forward_tokenizer.apply_chat_template(conversations, tokenize=False)
+
+    tokenized_conversation = forward_tokenizer(
+        messages,
+        return_tensors="pt",
+    )
+
+    return tokenized_conversation.input_ids
+
+
 class ReturnState(str, enum.Enum):
     END_EPOCH = "end_epoch"
     SUCCESS = "success"
     SKIP = "skip"
 
 
+@dataclasses.dataclass(kw_only=True, frozen=True)
+class GeneratedConversation:
+    tokenized_conversation: torch.Tensor
+    question_text: str
+    generated_answer_text: str
+
+
 def generate_one(
         *, 
-        loader, 
-        loader_lock,
-        q_field, 
-        a_field, 
-        max_tokens, 
-        temperature, 
-        num_candidates,
-        model_queue,
-        is_correct,
-        top_p=None,
-    ):
-
+        loader: torch.utils.data.DataLoader, 
+        loader_lock: threading.Lock,
+        q_field: str, 
+        a_field: str, 
+        generation_max_length: int, 
+        temperature: float, 
+        num_candidates: int,
+        model_queue: queue.Queue[tuple[trainer_lib.Trainer, int]],
+        is_correct: typing.Callable[[str, str], bool],
+        use_few_shots: bool,
+        few_shot_examples: list[dict[str, str]],
+        top_p: float | None,
+        forward_tokenizer: transformers.AutoTokenizer,
+        forward_max_length: int,
+        model_name: str,
+        training_agent,
+        gather_whole_model: bool,
+        max_retries: int,
+    ) -> tuple[ReturnState, GeneratedConversation | None]:
+    """
+    Threaded worker that generates a single batch of candidates.
+    """
     try:
-        # start = time.perf_counter()
+        
         with loader_lock:
             batch = next(loader)
-        # print(f"Getting batch took {time.perf_counter() - start:.1f} seconds")
     except StopIteration:
         return ReturnState.END_EPOCH, None
     
-    # start = time.perf_counter()
     model, gpu_id = model_queue.get()
-    # print(f"Getting model took {time.perf_counter() - start:.1f} seconds")
 
-    q = more_itertools.one(batch[q_field])
-    gt = more_itertools.one(batch[a_field])
+    q: str = mit.one(batch[q_field])
+    gt: str = mit.one(batch[a_field])
 
     num_skipped = 0
-    candidate_result = None
+    candidate_result: GeneratedConversation | None = None
     num_attempts = 0
-    # rich.print(rich.rule.Rule(
-    #     f"[bold blue]New question ({len(train_batch)} / {batch_size}) " +
-    #     f"of batch ({num_batches} of ?) " + 
-    #     f"({samples_attempted} attempted of {len(train_loader)}, " + 
-    #     f"{samples_successful} successful, " + 
-    #     f"{samples_successful / samples_attempted:.1%} success rate) " +
-    #     f"epoch {epoch + 1}/{num_epochs}",
-    #     align="left",
-    # ))
+
+    if use_few_shots:
+        assert few_shot_examples, "few_shot_examples must be a non-empty list"
+
+        messages = create_few_shot_prompt(
+            question=q, 
+            few_shot_examples=few_shot_examples,
+            q_field=q_field,
+            a_field=a_field
+        )
+    else:
+        messages = [{"role": "user", "content": q}]
 
     while not candidate_result:
         num_attempts += 1
@@ -313,28 +241,47 @@ def generate_one(
             num_skipped += 1
             break
 
-        # rich.print(rich.rule.Rule(f"{header}Attempt # {num_attempts}", align="left"))
-        # rich.print(rich.panel.Panel(q, title=f"{header}[bold]Question:", title_align="left"))
-
         gen_kwargs = vllm.SamplingParams(**{
-            "max_tokens": max_tokens, 
+            "max_tokens": generation_max_length,  # This is max_new_tokens not max_tokens. Important.
             "temperature": temperature, 
             "n": num_candidates,
         })
         if top_p is not None:
             gen_kwargs["top_p"] = top_p
         
-        start = time.perf_counter()
-        outputs = ray.get(
-            model.chat.remote(
-                [{"role": "user", "content": q}], 
-                sampling_params=gen_kwargs,
-                use_tqdm=False,
-            )
-            )[0].outputs
-        results = [output.text for output in outputs]
-        # rich.print(f"{header}Generation took {time.perf_counter() - start:.1f} seconds for {len(results)} candidates")
+        outputs = None
+        for _ in range(max_retries):
+            try:
+                outputs = ray.get(
+                    model.chat.remote(
+                        messages, 
+                        sampling_params=gen_kwargs,
+                        use_tqdm=False,
+                    )
+                )[0].outputs
 
+                break
+            except ray.exceptions.RayActorError as e:
+                rich.print(f"Error: {e}")
+                rich.print(f"Retrying...")
+                model = vllm_utils2.create_vllm_engines(
+                    num_engines=1,
+                    tensor_parallel_size=1,
+                    pretrain=model_name,
+                    revision=None,
+                    seed=0,
+                    enable_prefix_caching=True,
+                    max_model_len=forward_max_length, # Might cause issues .. but this is the logical way to do it
+                )[0]
+                training_agent.broadcast_to_vllm.remote(
+                    vllm_engines=[model],
+                    gather_whole_model=gather_whole_model,
+                )
+                continue
+        if not outputs:
+            raise ValueError(f"Failed to generate any outputs after {max_retries} retries")
+
+        results = [output.text for output in outputs]
         # Loop over candidates and pick the first correct one.
         are_good = []
         
@@ -346,14 +293,28 @@ def generate_one(
 
         for candidate_text in results:
             if is_correct(model_output=candidate_text, ground_truth_answer=gt):
-                candidate_result = candidate_text
+                candidate_messages = [
+                    {"role": "user", "content": q}, 
+                    {"role": "assistant", "content": candidate_text}
+                ]
+                tokenized_conversation = tokenize_conversations(
+                    forward_tokenizer=forward_tokenizer,
+                    conversations=[candidate_messages]
+                )
+                assert isinstance(tokenized_conversation, torch.Tensor), f"{type(tokenized_conversation).mro() = }"
+                if tokenized_conversation.shape[1] > forward_max_length:
+                    rich.print(f"Candidate text is too long: {tokenized_conversation.shape[1]} > {forward_max_length}")
+                    continue
+                
+                candidate_result = GeneratedConversation(
+                    tokenized_conversation=tokenized_conversation,
+                    question_text=q,
+                    generated_answer_text=candidate_text, # The last generated candidate_text
+                )
                 break
     
-    # start = time.perf_counter()
     model_queue.put((model, gpu_id))
-    # print(f"Putting model back took {time.perf_counter() - start:.1f} seconds")
 
-    # Broadcast the candidate result from rank 0 to all processes.
     if candidate_result: 
         return ReturnState.SUCCESS, candidate_result
     
@@ -362,22 +323,30 @@ def generate_one(
 
 def generate_train_batch(
         *,
-        loader,
-        loader_lock,
-        q_field,
-        a_field,
-        max_tokens,
-        temperature,
-        num_candidates,
-        top_p,
-        model_queue,
-        pool,
-        batch_size,
-        samples_attempted,
-        samples_successful,
-        finished_epoch,
-        is_correct,
-    ):
+        a_field: str,
+        batch_size: int,
+        few_shot_examples: list[dict[str, str]],
+        finished_epoch: bool,
+        generation_max_length: int,
+        is_correct: typing.Callable[[str, str], bool],
+        loader: torch.utils.data.DataLoader,
+        loader_lock: threading.Lock,
+        model_queue: queue.Queue,
+        num_candidates: int,
+        pool: cf.ThreadPoolExecutor,
+        q_field: str,
+        samples_attempted: int,
+        samples_successful: int,
+        temperature: float,
+        top_p: float | None,
+        use_few_shots: bool,
+        forward_tokenizer: transformers.AutoTokenizer,
+        forward_max_length: int,
+        model_name: str,
+        training_agent: trainer_lib.Trainer,
+        gather_whole_model: bool,
+        max_retries: int,
+    ) -> tuple[list[GeneratedConversation], int, int, bool]:
 
     train_batch = []
     futures = set()
@@ -388,15 +357,23 @@ def generate_train_batch(
         loader_lock=loader_lock,
         q_field=q_field,
         a_field=a_field,
-        max_tokens=max_tokens,
         temperature=temperature,
         num_candidates=num_candidates,
         top_p=top_p,
         model_queue=model_queue,
         is_correct=is_correct,
+        use_few_shots=use_few_shots,
+        few_shot_examples=few_shot_examples,
+        forward_tokenizer=forward_tokenizer,
+        forward_max_length=forward_max_length,
+        model_name=model_name,
+        training_agent=training_agent,
+        gather_whole_model=gather_whole_model,
+        generation_max_length=generation_max_length,
+        max_retries=max_retries,
     )
 
-    for _ in range(batch_size):
+    for i in range(batch_size):
         futures.add(pool.submit(*submit_args, **submit_kwargs))
 
     # As futures complete:
@@ -411,12 +388,12 @@ def generate_train_batch(
             print(f"len(futures): {len(futures)}")
             done, futures = cf.wait(futures, return_when=cf.FIRST_COMPLETED)
             for f in done:
-                status, candidate = f.result()
+                status, generated_conversation = f.result()
                 if status == ReturnState.END_EPOCH:
                     finished_epoch = True
                     # Finished the epoch, don't resubmit
                 elif status == ReturnState.SUCCESS:
-                    train_batch.append(candidate)
+                    train_batch.append(generated_conversation)
                     samples_successful += 1
                     samples_attempted += 1
                 elif status == ReturnState.SKIP:
@@ -439,145 +416,46 @@ def generate_train_batch(
     return train_batch, samples_attempted, samples_successful, finished_epoch
 
 
-@ray.remote(num_gpus=1)
-class Trainer:
-    def __init__(self, *, model_name, learning_rate, num_warmup_steps, total_steps, init_method_internal, model_max_length):
-        num_gpus = torch.cuda.device_count()
-        print(f"Number of available GPUs: {num_gpus}")
-        
-        self.model = transformers.AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16).to(0)
-        self.forward_tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_name, model_max_length=model_max_length)
-        
-        # --- Set up optimizer and scheduler ---
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
-        self.scheduler = transformers.get_linear_schedule_with_warmup(
-            self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps
-        )
-        self.model_update_group = None
-        torch.distributed.init_process_group(
-            backend="nccl", 
-            init_method=init_method_internal, 
-            world_size=1, 
-            rank=0
-        )
-
-    def init_process_group(self, *args, **kwargs):
-        self.model_update_group = vllm_utils2.init_process_group(*args, **kwargs)
-
-    def train(self, text_list):
-        torch.cuda.empty_cache()
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            data = self.forward_tokenizer(
-                text_list, 
-                return_tensors="pt", 
-                padding="max_length", 
-            ).to(self.model.device)
-            
-            rich.print(f"[blue]Tokenized, now calling forward: {data.input_ids.shape = }")
-            loss = self.model(**data, labels=data.input_ids).loss
-            loss.backward()
-            self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad()
-
-        return loss.item()
+def create_few_shot_prompt(
+        *, 
+        question: str, 
+        few_shot_examples: list[dict[str, str]], 
+        q_field: str, 
+        a_field: str,
+    ) -> list[dict[str, str]]:
+    """
+    Creates a few-shot prompt using chat format by prepending examples to the question.
     
-    def broadcast_to_vllm(self, *, vllm_engines, gather_whole_model):
-        assert self.model_update_group
-
-        # avoid OOM
-        torch.cuda.empty_cache()
-        model = self.model
-        count, num_params = 0, len(list(model.named_parameters()))
-        refss = []
-        if gather_whole_model:
-            for name, param in model.named_parameters():
-                count += 1  # empty_cache at last param
-                # Fire all vllm engines for broadcast
-                if torch.distributed.get_rank() == 0:
-                    shape = param.shape 
-                    refs = [
-                        engine.update_weight.remote(
-                            name, 
-                            dtype=param.dtype, 
-                            shape=shape, 
-                            empty_cache=count == num_params,
-                        )
-                        for engine in vllm_engines
-                    ]
-                    refss.extend(refs)
-                assert torch.distributed.get_rank() == 0
-                torch.distributed.broadcast(param.data, 0, group=self.model_update_group)
-        else:  # broadcast each parameter independently
-            for name, param in model.named_parameters():
-                assert torch.distributed.get_rank() == 0
-                count += 1
-                shape = param.shape
-                refs = [
-                    engine.update_weight.remote(
-                        name, dtype=torch.bfloat16, shape=shape, empty_cache=count == num_params
-                    )
-                    for engine in vllm_engines
-                ]
-                assert torch.distributed.get_rank() == 0
-                torch.distributed.broadcast(param.data.bfloat16(), 0, group=self.model_update_group)
-        assert torch.distributed.get_rank() == 0
-        ray.get(refss)
-
-    def save_pretrained(self, *, output_dir, cfg_container, wandb_run_id, wandb_url):
-        self.model.save_pretrained(output_dir)
-        with open(os.path.join(output_dir, "hydra_config.json"), "w") as f:
-            json.dump(cfg_container, f, indent=4, sort_keys=True, default=json_default)
-        with open(os.path.join(output_dir, "wandb_info.json"), "w") as f:
-            json.dump({"run_id": wandb_run_id, "url": wandb_url}, f, indent=4, sort_keys=True, default=json_default)
-        self.forward_tokenizer.save_pretrained(output_dir)
+    Args:
+        question: The current question to answer
+        few_shot_examples: List of example data points (dict with q_field and a_field)
+        q_field: Field name for questions
+        a_field: Field name for answers
         
-def run_eval(
-        *,
-        epoch,
-        eval_loader,
-        q_field,
-        a_field,
-        vllm_engine,
-        in_epoch,
-        is_correct,
-):
+    Returns:
+        List of message dictionaries in chat format
+    """
+    if not few_shot_examples:
+        raise ValueError("create_few_shot_prompt: Few shot examples are required")
     
-    total_correct = 0
-    total_seen = 0
-    lengths_char = []
+    messages = []
+    
+    # Add example conversations
+    for example in few_shot_examples:
+        messages.append({"role": "user", "content": example[q_field]})
+        messages.append({"role": "assistant", "content": example[a_field]})
+    
+    # Add the current question
+    messages.append({"role": "user", "content": question})
+    return messages
 
-    for eval_batch in tqdm.tqdm(eval_loader, desc="Evaluating"):
-        gt = eval_batch[a_field]
-
-        gen_kwargs = vllm.SamplingParams(**{
-            "max_tokens": 2048,
-            "temperature": 0,
-            "n": 1,
-        })
-        
-        # results_raw = ray.get(vllm_engines[0].generate.remote(preped, sampling_params=gen_kwargs))
-        results_raw = ray.get(
-            vllm_engine.chat.remote(
-                [[{"role": "user", "content": q}] for q in eval_batch[q_field]], 
-                sampling_params=gen_kwargs
-            )
-        )
-        results_text = [output.outputs[0].text for output in results_raw]
-        lengths_char.extend([len(result) for result in results_text])
-
-        for candidate_result, gt_indiv in more_itertools.zip_equal(
-            tqdm.tqdm(results_text, desc="Eval, Comparing"), gt
-        ):
-            total_correct += is_correct(model_output=candidate_result, ground_truth_answer=gt_indiv)
-        total_seen += len(gt)
-
-    eval_accuracy = total_correct / total_seen if total_seen > 0 else 0.0
-    print("\n\n")
-    rich.print(rich.panel.Panel(f"Evaluation Accuracy after Epoch {epoch + 1}: {eval_accuracy:.1%}"))
-    wandb.log({("eval_in_epoch/accuracy" if in_epoch else f"eval/accuracy"): eval_accuracy,})
-    wandb.log({("eval_in_epoch/lengths" if in_epoch else f"eval/lengths"): np.mean(lengths_char),})
+def save_pretrained(*, trainer: trainer_lib.Trainer, cfg_container: dict, epoch: int, output_dir: str):
+    ray.get([trainer.save_pretrained.remote(
+        output_dir=f"{output_dir}/epoch_{epoch}", 
+        cfg_container=cfg_container, 
+        wandb_run_id=wandb.run.id, 
+        wandb_url=wandb.run.url
+    )])
 
 
 @hydra.main(config_path="config", config_name="config", version_base="1.3.2")
@@ -596,15 +474,13 @@ def main(cfg: omegaconf.DictConfig) -> None:
         dir=os.environ.get("SLURM_TMPDIR", os.environ.get("TMPDIR", "/tmp")),
     )
 
-    cfg = Config(**cfg)
-
+    cfg = config.Config(**cfg)
 
     # Unpack configuration parameters.
     model_name = cfg.model.name
     batch_size = cfg.training.batch_size
     learning_rate = cfg.training.learning_rate
     num_epochs = cfg.training.num_epochs
-    max_tokens = cfg.training.max_length
     gather_whole_model = False
 
     temperature = cfg.vllm_sampling.temperature
@@ -613,19 +489,47 @@ def main(cfg: omegaconf.DictConfig) -> None:
 
     dataset_name = cfg.dataset.name
     dataset_split = cfg.dataset.split
-    valid_dataset_split = cfg.dataset.valid_split
+    # valid_dataset_split = cfg.dataset.valid_split
     q_field = cfg.dataset.question_field
     a_field = cfg.dataset.answer_field
     load_dataset_args = cfg.dataset.load_dataset_args
-    evaluation_subset_size = cfg.evaluation.eval_subset
+    # evaluation_subset_size = cfg.evaluation.eval_subset
 
     is_correct = IS_CORRECT[dataset_name]
+
+    forward_tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_name,
+        max_length=cfg.training.forward_max_length,
+    )
 
     # --- Load training dataset ---
     viz_load_dataset_args = (dataset_name, *load_dataset_args), dict(split=dataset_split)
     print(f"Loading dataset {dataset_name} with args {viz_load_dataset_args}")
     train_dataset = datasets.load_dataset(dataset_name, *load_dataset_args, split=dataset_split)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
+
+
+    if cfg.few_shot_qty > 0:
+        few_shot_examples = train_dataset.select(range(cfg.few_shot_qty))
+    else:
+        few_shot_examples = None
+
+
+
+    if cfg.training.train_subset_mode:
+        assert isinstance(cfg.training.train_subset_size, int), (
+            f"{cfg.training.train_subset_size = } {type(cfg.training.train_subset_size).mro() = }")
+        rich.print(f"[red bold]Training on subset of {cfg.training.train_subset_size} examples")
+        train_dataset = torch.utils.data.Subset(
+            train_dataset, 
+            range(cfg.training.train_subset_size)
+        )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, 
+        batch_size=1, 
+        shuffle=True, 
+    )
+
 
     total_steps = num_epochs * len(train_loader)
     num_warmup_steps = int(0.1 * total_steps)
@@ -642,13 +546,13 @@ def main(cfg: omegaconf.DictConfig) -> None:
 
     init_method_internal = f"tcp://localhost:{int(cfg.internal_master_port)}" # This is for the trainer's (eventual) internal DDP
 
-    trainer = Trainer.remote(
+    trainer = trainer_lib.Trainer.remote(
         model_name=model_name,
         learning_rate=learning_rate,
         num_warmup_steps=num_warmup_steps,
         total_steps=total_steps,
         init_method_internal=init_method_internal,
-        model_max_length=max_tokens,
+        model_max_length=cfg.training.forward_max_length,
     )
     
     init_proc_group_refs.append(trainer.init_process_group.remote(
@@ -666,7 +570,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
         revision=None,
         seed=0,
         enable_prefix_caching=True,
-        max_model_len=cfg.training.max_length,
+        max_model_len=cfg.training.forward_max_length, # Might cause issues .. but this is the logical way to do it
     )
 
     for i, engine in enumerate(vllm_engines):
@@ -679,7 +583,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
             group_name=group_name,
         ))
 
-    rich.print("[blue]Initializing process groups")
+    rich.print("[blue bold]Initializing process groups")
     ray.get(init_proc_group_refs)
     rich.print("[bold green]Initialized process groups")
 
@@ -687,48 +591,23 @@ def main(cfg: omegaconf.DictConfig) -> None:
     for gpu_id, engine in enumerate(vllm_engines, start=1):
         model_queue.put((engine, gpu_id))
 
-    
-    # --- Load evaluation dataset (once, outside the loop) ---
-    eval_dataset_full = datasets.load_dataset(
-        dataset_name, *load_dataset_args, split=valid_dataset_split
-    )
-    eval_batch_size = cfg.evaluation.eval_batch_size
-
-    eval_loader_full = torch.utils.data.DataLoader(
-        eval_dataset_full, 
-        batch_size=eval_batch_size, 
-        shuffle=False,
-    )
-
-    if evaluation_subset_size is None:
-        small_eval = eval_dataset_full
-    else:
-        small_eval = eval_dataset_full.select(range(evaluation_subset_size))
-
+    rich.print("[blue bold]Initializing model queue")
     global_step = 0
     pool = cf.ThreadPoolExecutor(max_workers=num_gpus)
 
-    # run_eval(
-    #     epoch=0,
-    #     eval_loader=eval_loader_full,
-    #     q_field=q_field,
-    #     a_field=a_field,
-    #     vllm_engine=vllm_engines[0],
-    #     in_epoch=False,
-    #     is_correct=is_correct,
-    # )
 
-    def save_pretrained(epoch):
-        ray.get([trainer.save_pretrained.remote(
-            output_dir=f"{cfg.output_dir}/epoch_{epoch}", 
-            cfg_container=cfg_container, 
-            wandb_run_id=wandb.run.id, 
-            wandb_url=wandb.run.url
-        )])
+
 
 
     # Save the initial model, mostly to fail fast if something is wrong
-    save_pretrained(0)
+    rich.print("[blue bold]Saving initial model")
+    save_pretrained(
+        trainer=trainer,
+        cfg_container=cfg_container,
+        epoch=0,
+        output_dir=cfg.output_dir
+    )
+    rich.print("[blue bold]Saved initial model")
 
     for epoch in range(num_epochs):
         print(f"Starting epoch {epoch + 1} / {num_epochs}")
@@ -741,40 +620,63 @@ def main(cfg: omegaconf.DictConfig) -> None:
         samples_attempted = 0
         samples_successful = 0
 
+        rich.print("[blue bold]Starting epoch")
         while not finished_epoch:
-            rich.print(f"[bold]Syncing model weights.")
+            gc.collect()
+            if cfg.training.train_subset_mode:
+                rich.print(f"[red bold]Training on subset of {cfg.training.train_subset_size} examples")
+
             ray.get(trainer.broadcast_to_vllm.remote(
                 vllm_engines=vllm_engines,
                 gather_whole_model=gather_whole_model,
             ))
-            rich.print(f"[bold]Begin creating batch")
+            
             start = time.perf_counter()
 
             train_batch, samples_attempted, samples_successful, finished_epoch = generate_train_batch(
+                a_field=a_field,
+                batch_size=batch_size,
+                few_shot_examples=few_shot_examples,
+                finished_epoch=finished_epoch,
+                forward_max_length=cfg.training.forward_max_length,
+                forward_tokenizer=forward_tokenizer,
+                is_correct=is_correct,
                 loader=loader,
                 loader_lock=loader_lock,
-                q_field=q_field,
-                a_field=a_field,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                num_candidates=num_candidates,
-                top_p=top_p,
+                generation_max_length=cfg.training.generation_max_length,
                 model_queue=model_queue,
+                num_candidates=num_candidates,
                 pool=pool,
-                batch_size=batch_size,
+                q_field=q_field,
                 samples_attempted=samples_attempted,
                 samples_successful=samples_successful,
-                finished_epoch=finished_epoch,
-                is_correct=is_correct
+                temperature=temperature,
+                top_p=top_p,
+                use_few_shots=cfg.few_shot_qty > 0,
+                training_agent=trainer,
+                gather_whole_model=gather_whole_model,
+                model_name=model_name,
+                max_retries=cfg.max_retries_vllm_crash,
             )
             torch.cuda.empty_cache()
 
-            rich.print(rich.rule.Rule(
-                f"[green bold]Done creating batch. Took {time.perf_counter() - start:0.1f} seconds.",
-                align="left"
+            # Make a few sanity checks about the batch. 
+            batch_of_conversations = [mit.one(entry.tokenized_conversation) for entry in train_batch]
+            if not batch_of_conversations:
+                assert finished_epoch, "Batch is empty. This should only happen at the end of the epoch."
+                rich.print("[bold orange2]Got an empty batch, but it was the end of the epoch, which makes this ok.")
+                continue
+
+            assert batch_of_conversations, "Batch is empty."
+            print(f"{[len(x) for x in batch_of_conversations] = }", flush=True)
+            assert all(isinstance(x, torch.Tensor) for x in batch_of_conversations), f"Each tokenized conversation must be a tensor. {[type(x) for x in batch_of_conversations] = }"
+            assert all(x.ndim == 1 for x in batch_of_conversations), f"Each tensor must be 1D. {[x.ndim for x in batch_of_conversations] = }"
+            assert all(x.dtype == torch.int64 for x in batch_of_conversations), f"Each tensor must be of type int64. {[x.dtype for x in batch_of_conversations] = }"
+            
+            loss = ray.get(trainer.train.remote(
+                tokenized_batch_of_conversations=batch_of_conversations
             ))
             
-            loss = ray.get(trainer.train.remote(train_batch))
             rich.print(rich.rule.Rule(
                 f"[green bold]Done with step. Loss: {loss :.1e}", 
                 align="left"
@@ -785,23 +687,15 @@ def main(cfg: omegaconf.DictConfig) -> None:
             num_batches += 1
 
             # Eval Every 10%
-            separator = int(cfg.evaluation.eval_percentage * (len(train_loader) // batch_size))
-            eval_test = num_batches % separator == 0
-            print(
-                f"Num Batches: {num_batches}, " +
-                f"Separator: {separator}, " + 
-                f"{num_batches % separator}, " +
-                f"Eval Test: {eval_test}"
-            )
-            # if eval_test:
-            #     run_eval(
-            #         epoch=epoch,
-            #         eval_loader=small_eval,
-            #         q_field=q_field,
-            #         a_field=a_field,
-            #         vllm_engine=vllm_engines[0],
-            #         in_epoch=True,
-            #     )
+            # separator = int(cfg.evaluation.eval_percentage * (len(train_loader) // batch_size))
+            # eval_test = num_batches % separator == 0
+            # print(
+            #     f"Num Batches: {num_batches}, " +
+            #     f"Separator: {separator}, " + 
+            #     f"{num_batches % separator}, " +
+            #     f"Eval Test: {eval_test}"
+            # )
+ 
 
             if global_step % cfg.wandb.log_interval == 0:
                 wandb.log({
@@ -812,24 +706,12 @@ def main(cfg: omegaconf.DictConfig) -> None:
                 })
 
         rich.print(f"[red bold]FINISHED EPOCH {epoch} ##################################")
-        
-        ray.get([trainer.save_pretrained.remote(
-            output_dir=f"{cfg.output_dir}/epoch_{epoch}", 
-            cfg_container=cfg_container, 
-            wandb_run_id=wandb.run.id, 
-            wandb_url=wandb.run.url
-        )])
-
-        # run_eval(
-        #     epoch=epoch + 1,
-        #     eval_loader=eval_loader_full,
-        #     q_field=q_field,
-        #     a_field=a_field,
-        #     vllm_engine=vllm_engines[0],
-        #     in_epoch=False,
-        # )
-
-        save_pretrained(epoch + 1)
+        save_pretrained(
+            trainer=trainer,
+            cfg_container=cfg_container,
+            epoch=epoch + 1,
+            output_dir=cfg.output_dir
+        )
     print("Training complete.")
 
 

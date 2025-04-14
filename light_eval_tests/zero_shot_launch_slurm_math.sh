@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
+#SBATCH --gres=gpu:l40s:1 
+#SBATCH --cpus-per-task 8 
+#SBATCH --mem 40GB 
+#SBATCH --partition long 
+#SBATCH --output "./all_eval_outputs_important/zero_shot_outputs_math/slurm_logs/%j.out" 
+#SBATCH --error "./all_eval_outputs_important/zero_shot_outputs_math/slurm_logs/%j.err" 
 
 MODEL_NAME="HuggingFaceTB/SmolLM2-1.7B-Instruct"
 OUTPUT_DIR=./all_eval_outputs_important/zero_shot_outputs_math/
-TASK_PATH=./util_code/tasks.py
+TASK_PATH=./util_code/tasks_ref.py
 mkdir -p "${OUTPUT_DIR}"
 
-sbatch \
---gres=gpu:l40s:1 \
---cpus-per-task 8 \
---mem 40GB \
---partition long \
---output "${OUTPUT_DIR}/slurm_logs/%j.out" \
---error "${OUTPUT_DIR}/slurm_logs/%j.err" \
---wrap="/home/mila/g/gagnonju/.mambaforge/bin/lighteval \
+ACTIVE_PATH="/home/mila/g/gagnonju/marglicot/light_eval_tests/"
+
+
+TEMPERATURE=0.8
+MAX_SEQ_LENGTH=2048
+NUM_SHOTS=0
+
+
+cd "${ACTIVE_PATH}" && uv run lighteval \
 accelerate \
 --model_args \
-pretrained=${MODEL_NAME},revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=0.8,max_model_length=2048 \
---tasks 'custom|math|0|0' \
---output_dir ${OUTPUT_DIR} \
+pretrained="${MODEL_NAME},revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=${TEMPERATURE},max_model_length=${MAX_SEQ_LENGTH}" \
+--tasks "custom|math|${NUM_SHOTS}|0" \
+--output_dir "${OUTPUT_DIR}" \
 --use_chat_template \
---custom_tasks $(realpath ${TASK_PATH}) \
---save_details"
+--custom_tasks "$(realpath ${TASK_PATH})" \
+--save_details

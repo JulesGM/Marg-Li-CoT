@@ -33,6 +33,11 @@ import rich.console
 import rich.traceback
 
 
+sys.path.append(str(pathlib.Path(__file__).parent.parent))
+sys.path.append(str(pathlib.Path(__file__).parent.parent.parent))
+import approach_sft
+import with_trl
+
 rich.traceback.install(console=rich.console.Console(markup=True))
 
 

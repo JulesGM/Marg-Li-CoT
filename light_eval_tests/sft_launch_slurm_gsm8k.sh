@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-NUM_SHOTS=0
+NUM_SHOTS=8
 OUTPUT_DIR="./all_eval_outputs_important/sft_outputs_gsm8k/${NUM_SHOTS}_shot"
 INPUT_DIR="$HOME/scratch/marglicot_saves/sft_saves/"
 mkdir -p "${OUTPUT_DIR}"

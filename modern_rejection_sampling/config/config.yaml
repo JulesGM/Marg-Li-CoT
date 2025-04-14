@@ -4,13 +4,15 @@ defaults:
   - experiment: ???      # default experiment config
   - override hydra/hydra_logging: disabled  
   - override hydra/job_logging: disabled  
+
 model:
   name: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
 training:
-  max_length: 1024
-  batch_size: 12
-  learning_rate: 1e-5
+  batch_size: 6
+  learning_rate: 0.0001
+  generation_max_length: 1024
+  forward_max_length: 2048
   num_epochs: 100
 
 vllm_sampling:
@@ -24,6 +26,7 @@ accelerate:
 
 vllm:
   gpu_id: 1
+
 
 wandb:
   project: "expert_iteration"
@@ -40,6 +43,10 @@ output_dir: ???
 master_port: 25123
 internal_master_port: 25124
 
+
+max_retries_vllm_crash: 5
+
+few_shot_qty: ???
 
 hydra:
   output_subdir: null
