@@ -250,3 +250,85 @@ def compute_score(path, mode: Mode, time_spent: FractionTimeSpent, compute_score
         predictions_output = None
 
     return main_output, predictions_output
+
+
+
+def compute_score_for_rejection_sampling(path, mode: Mode, time_spent: FractionTimeSpent, compute_score: bool, subset_qty: int | None = None):
+
+    if mode == Mode.gsm8k:
+        verify = verify_gsm8k_sample
+        extract = extract_answer_gold
+    elif mode == Mode.math:
+        verify = verify_math_sample
+        extract = lambda x: x
+    else:
+        raise ValueError(f"Invalid mode: {MODE}")
+
+    with time_spent.time_block(key="read_parquet"):
+        ds = load_parquet(path)
+
+    with time_spent.time_block("convert_to_series"):
+        parsed_predictions = pl.Series([
+            more_itertools.one(get_of_expected(more_itertools.one(literal_eval(pred)), 0, 2)) 
+            for pred in ds["predictions"]
+        ])
+        gold = pl.Series([more_itertools.one(literal_eval(pred)) for pred in ds["gold"]])
+        original_score = pl.Series([literal_eval(x)["qem"] for x in ds["metrics"]])
+
+
+    results_root = path.parent.parent.parent.parent / "results" 
+    assert results_root.exists(), results_root
+    second_part = results_root / path.relative_to(results_root.parent / "details").parent.parent
+    assert second_part.exists(), second_part
+    assert (second_part / "hydra_config.json").exists(), second_part / "hydra_config.json"
+    meta_info = json.loads((second_part / "hydra_config.json").read_text())
+
+    if compute_score:
+        with time_spent.time_block("verify"):
+            ongoing = []
+            extracted_predictions = []  
+            extracted_golds = []
+            is_equal = []
+
+            for i, (generated, gold_individual) in enumerate(more_itertools.zip_equal(parsed_predictions, gold)):
+                if subset_qty is not None and i >= subset_qty:
+                    break
+                if i % 1000 == 0:
+                    print(f"i: {i / len(parsed_predictions):0.1%}")
+                extracted_gold_i = extract(gold_individual).replace(",", "")
+                
+                # Check if we get the same answer for the gold from the verify function 
+                # and from the reference gold. If not, this is a bug.
+                # is_equal_golds, test_extracted_gold_as_pred = verify(
+                #     model_output=extracted_gold_i, 
+                #     ground_truth_answer=extracted_gold_i
+                # )
+                
+                # if extracted_gold_i != test_extracted_gold_as_pred:
+                #     print(f"extracted_gold_i: {extracted_gold_i}, test_extracted_gold_as_pred: {test_extracted_gold_as_pred}, is_equal: {is_equal_golds}")
+
+                # Actually verify the prediction.
+                verify_output, extracted_prediction_i = verify(model_output=generated, ground_truth_answer=extracted_gold_i)
+                # print(extracted_prediction_i, extracted_gold_i, verify_output)
+                ongoing.append(extracted_prediction_i is not None and extracted_gold_i is not None and verify_output)
+                extracted_predictions.append(extracted_prediction_i)
+                extracted_golds.append(extracted_gold_i)
+                is_equal.append(verify_output)
+            score = np.mean(ongoing)
+    
+        print(path.parent.parent.name)
+        main_output = pl.DataFrame(
+            {
+                "epoch": int(path.parent.parent.name.split("_")[-1]), 
+                "learning_rate": meta_info["training"]["learning_rate"],
+                "score": score, 
+                "original_score": original_score.mean(),
+                "path": str(path), 
+            }
+        )
+        predictions_output = pl.DataFrame({"predictions": parsed_predictions[:subset_qty], "gold": gold[:subset_qty], "extracted_predictions": extracted_predictions[:subset_qty], "extracted_golds": extracted_golds[:subset_qty], "is_equal": is_equal[:subset_qty]})
+    else:
+        main_output = pl.DataFrame({"original_score": original_score.mean(), "learning_rate": meta_info["cfg"]["learning_rate"], "epoch": meta_info["epoch"], "path": str(path)})
+        predictions_output = None
+
+    return main_output, predictions_output

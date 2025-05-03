@@ -5,4 +5,4 @@ defaults:
 
 experiment_name: "gsm8k_experiment"
 
-few_shot_qty: 8
+few_shot_qty: 5

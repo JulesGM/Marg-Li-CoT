@@ -180,6 +180,7 @@ class GeneratedConversation:
     tokenized_conversation: torch.Tensor
     question_text: str
     generated_answer_text: str
+    reference_answer_text: str
 
 
 def generate_one(
@@ -202,6 +203,11 @@ def generate_one(
         training_agent,
         gather_whole_model: bool,
         max_retries: int,
+        num_gpus: int,
+        master_address: str,
+        master_port: int,
+        group_name: str,
+        backend: str,
     ) -> tuple[ReturnState, GeneratedConversation | None]:
     """
     Threaded worker that generates a single batch of candidates.
@@ -264,7 +270,7 @@ def generate_one(
             except ray.exceptions.RayActorError as e:
                 rich.print(f"Error: {e}")
                 rich.print(f"Retrying...")
-                model = vllm_utils2.create_vllm_engines(
+                model = mit.one(vllm_utils2.create_vllm_engines(
                     num_engines=1,
                     tensor_parallel_size=1,
                     pretrain=model_name,
@@ -272,11 +278,22 @@ def generate_one(
                     seed=0,
                     enable_prefix_caching=True,
                     max_model_len=forward_max_length, # Might cause issues .. but this is the logical way to do it
-                )[0]
-                training_agent.broadcast_to_vllm.remote(
+                ))
+            
+                ray.get(model.init_process_group.remote(
+                    backend=backend,
+                    world_size=num_gpus,
+                    master_address=master_address,
+                    master_port=master_port,
+                    rank_offset=gpu_id,
+                    group_name=group_name,
+                ))
+
+                ray.get(training_agent.broadcast_to_vllm.remote(
                     vllm_engines=[model],
                     gather_whole_model=gather_whole_model,
-                )
+                ))
+
                 continue
         if not outputs:
             raise ValueError(f"Failed to generate any outputs after {max_retries} retries")
@@ -309,6 +326,7 @@ def generate_one(
                 candidate_result = GeneratedConversation(
                     tokenized_conversation=tokenized_conversation,
                     question_text=q,
+                    reference_answer_text=gt,
                     generated_answer_text=candidate_text, # The last generated candidate_text
                 )
                 break
@@ -346,6 +364,11 @@ def generate_train_batch(
         training_agent: trainer_lib.Trainer,
         gather_whole_model: bool,
         max_retries: int,
+        num_gpus: int,
+        master_address: str,
+        master_port: int,
+        group_name: str,
+        backend: str,
     ) -> tuple[list[GeneratedConversation], int, int, bool]:
 
     train_batch = []
@@ -371,6 +394,11 @@ def generate_train_batch(
         gather_whole_model=gather_whole_model,
         generation_max_length=generation_max_length,
         max_retries=max_retries,
+        num_gpus=num_gpus,
+        master_address=master_address,
+        master_port=master_port,
+        group_name=group_name,
+        backend=backend,
     )
 
     for i in range(batch_size):
@@ -465,6 +493,9 @@ def main(cfg: omegaconf.DictConfig) -> None:
     # Set GPU IDs for accelerate from config.
     # Initialize Accelerator using the module name.
 
+    num_gpus = torch.cuda.device_count()
+    rich.print(f"Number of GPUs: {num_gpus}")
+
     cfg_container = omegaconf.OmegaConf.to_container(cfg, resolve=True)
 
     wandb.init(
@@ -507,13 +538,10 @@ def main(cfg: omegaconf.DictConfig) -> None:
     print(f"Loading dataset {dataset_name} with args {viz_load_dataset_args}")
     train_dataset = datasets.load_dataset(dataset_name, *load_dataset_args, split=dataset_split)
 
-
     if cfg.few_shot_qty > 0:
         few_shot_examples = train_dataset.select(range(cfg.few_shot_qty))
     else:
         few_shot_examples = None
-
-
 
     if cfg.training.train_subset_mode:
         assert isinstance(cfg.training.train_subset_size, int), (
@@ -546,6 +574,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
 
     init_method_internal = f"tcp://localhost:{int(cfg.internal_master_port)}" # This is for the trainer's (eventual) internal DDP
 
+
     trainer = trainer_lib.Trainer.remote(
         model_name=model_name,
         learning_rate=learning_rate,
@@ -553,6 +582,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
         total_steps=total_steps,
         init_method_internal=init_method_internal,
         model_max_length=cfg.training.forward_max_length,
+        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
     )
     
     init_proc_group_refs.append(trainer.init_process_group.remote(
@@ -594,9 +624,6 @@ def main(cfg: omegaconf.DictConfig) -> None:
     rich.print("[blue bold]Initializing model queue")
     global_step = 0
     pool = cf.ThreadPoolExecutor(max_workers=num_gpus)
-
-
-
 
 
     # Save the initial model, mostly to fail fast if something is wrong
@@ -657,11 +684,34 @@ def main(cfg: omegaconf.DictConfig) -> None:
                 gather_whole_model=gather_whole_model,
                 model_name=model_name,
                 max_retries=cfg.max_retries_vllm_crash,
+                
+                num_gpus=num_gpus,
+                master_address=master_address,
+                master_port=master_port,
+                group_name=group_name,
+                backend=backend,
             )
             torch.cuda.empty_cache()
 
+            table = rich.table.Table(
+                "Text", 
+                "Lenght in Tokens",
+                "Reference Answer Text",
+                title="Train Batch", 
+                title_style="bold green", 
+                show_lines=True
+            )
+            for entry in train_batch:
+                tokenized_entry = mit.one(entry.tokenized_conversation)
+                decoded_text = forward_tokenizer.decode(tokenized_entry, skip_special_tokens=False)
+                table.add_row(f"'{rich.markup.escape(decoded_text)}'", f"{len(tokenized_entry)}", f"{entry.reference_answer_text}")
+            rich.print(table)
+            
+
             # Make a few sanity checks about the batch. 
             batch_of_conversations = [mit.one(entry.tokenized_conversation) for entry in train_batch]
+            breakpoint()
+
             if not batch_of_conversations:
                 assert finished_epoch, "Batch is empty. This should only happen at the end of the epoch."
                 rich.print("[bold orange2]Got an empty batch, but it was the end of the epoch, which makes this ok.")

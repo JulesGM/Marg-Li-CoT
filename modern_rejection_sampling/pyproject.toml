@@ -18,6 +18,8 @@ dependencies = [
     "setuptools>=78.1.0",
     "wandb>=0.19.8",
     "datasets>=3",
+    "ipdb>=0.13.13",
+    "ipykernel>=6.29.5",
 ]
 
 

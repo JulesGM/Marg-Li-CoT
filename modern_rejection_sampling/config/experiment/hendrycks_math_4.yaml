@@ -5,8 +5,4 @@ defaults:
 
 experiment_name: "hendrycks_math_experiment"
 
-
-vllm_sampling:
-  num_candidates: 48
-
-few_shot_qty: 5
+few_shot_qty: 4

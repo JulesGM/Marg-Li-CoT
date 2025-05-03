@@ -15,7 +15,7 @@ TASK_PATH=./util_code/tasks.py
 GLOB_PATTERN='*/*/'
 
 python multi_gpu_lighteval_chain.py \
---task_key="custom|math|${NUM_SHOTS_EVAL}|0" \
+--task_key="custom|math|${NUM_SHOTS_EVAL}|1" \
 --input_path="${INPUT_DIR}" \
 --output_dir="${OUTPUT_DIR}" \
 --glob_pattern="${GLOB_PATTERN}" \

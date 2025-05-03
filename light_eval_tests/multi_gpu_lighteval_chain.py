@@ -43,7 +43,8 @@ def build_command(
         custom_tasks: str,
         input_path: str | pathlib.Path, 
         output_dir: str | pathlib.Path, 
-        task_key: str, 
+        task_key: str,
+        max_model_length: int = 2048,
     ) -> list[str]:
 
     return [
@@ -52,7 +53,7 @@ def build_command(
         "lighteval",
         "accelerate", 
         "--model_args", 
-        f"pretrained={shlex.quote(str(input_path))},revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=0.8,max_model_length=2048", 
+        f"pretrained={shlex.quote(str(input_path))},revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=0.8,max_model_length={max_model_length}", 
         "--tasks", task_key, 
         "--output_dir", str(output_dir), 
         "--use_chat_template", 
@@ -68,6 +69,8 @@ def slurm_dispatcher(
         output_dir: str | pathlib.Path, 
         task_key: str, 
         dry_run: bool,
+        max_model_length: int,
+        duration: None | str,
     ):
 
     # Start the work
@@ -85,6 +88,7 @@ def slurm_dispatcher(
                 input_path        = input_path, 
                 output_dir        = output_dir, 
                 task_key          = task_key, 
+                max_model_length  = max_model_length,
             )
 
             slurm_command = [
@@ -100,6 +104,10 @@ def slurm_dispatcher(
                     "--error", f"{output_dir}/slurm_logs/%j.err",
                     f"--wrap", f"cd {SCRIPT_DIR}; {shlex.join(script_command)}",
                 ]
+            
+            if duration:
+                slurm_command.insert(1, f"--time={duration}")
+
             rich.print(f"[bold green]Submitting:[/] {shlex.join(slurm_command)}")
             if not dry_run:
                 subprocess.check_output(slurm_command)
@@ -111,71 +119,6 @@ def slurm_dispatcher(
 
     print("Done!")
 
-
-def local_worker(
-        gpu_id: int, 
-        gpu_queue: queue.Queue[int], 
-        output_dir: str | pathlib.Path,
-        path: str | pathlib.Path, 
-        task_key: str, 
-        verbose: bool,
-        custom_tasks: str,
-    ):
-    raise NotImplementedError("Deprecated; not tested in a while.")
-
-    print(f"[{gpu_id}] Starting with: {path}")
-    env_vars = os.environ.copy()
-    env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    
-    # Blocks here.
-    subprocess.run(
-        command = build_command(path=path, task_key=task_key, output_dir=output_dir, custom_tasks=custom_tasks), 
-        env=env_vars,
-        # **extra_args,
-    )
-    
-    print(f"[{gpu_id}] Done with: {path}")
-    gpu_queue.put(gpu_id)
-
-
-def local_dispatcher(*, input_paths, output_dir, task_key, custom_tasks, threads_verbose):
-    raise NotImplementedError("Deprecated; not tested in a while.")
-    # Put the gpu ids in the queue
-    num_gpus = len(nvgpu.gpu_info())
-    print(f"Number of GPUs: {num_gpus}")
-
-    # Prepare the gpu ids
-    if not gpu_ids:
-        gpu_ids = list(range(num_gpus))
-
-    assert all(isinstance(i, int) for i in gpu_ids), (
-        f"All gpu ids must be integers, got {gpu_ids} {[type(i) for i in gpu_ids]}"
-    )
-    print(f"Using GPUs: {gpu_ids}")
-
-    # Queue the gpu ids
-    gpu_queue = queue.Queue()
-    for i in gpu_ids:
-        gpu_queue.put(i)
-    print()
-
-
-    # Start the work
-    with concurrent.futures.ThreadPoolExecutor(num_gpus) as executor:
-        for path in input_paths:
-            gpu_id = gpu_queue.get()
-            executor.submit(
-                local_worker,
-                gpu_id=gpu_id, 
-                gpu_queue=gpu_queue, 
-                output_dir=output_dir,
-                path=path, 
-                task_key=task_key,
-                custom_tasks=custom_tasks,
-                verbose=threads_verbose,
-            )
-
-    print("Done!")
 
 
 def extract_input_paths(input_path, glob_pattern, safetensors_or_pt: SafeTensorsOrPT):
@@ -228,12 +171,13 @@ def main(
         task_key,
         output_dir,
         custom_tasks,
-        glob_pattern="step_*",
-        threads_verbose=True,
+        max_model_length: int,
+        glob_pattern,
         dispatch_style: DispatchStyle = DispatchStyle.SLURM,
         safetensors_or_pt: SafeTensorsOrPT = SafeTensorsOrPT.SAFETENSORS,
         logger_level: int | str = os.environ.get("PYTHON_LOG_LEVEL", logging.DEBUG),
         dry_run: bool = False,
+        duration: None | str = None,
     ):
 
     logging.basicConfig(level=logger_level)
@@ -242,7 +186,6 @@ def main(
     assert custom_tasks.is_file(), f"Custom tasks file does not exist: {custom_tasks}"
 
     safetensors_or_pt = SafeTensorsOrPT(safetensors_or_pt)
-    dispatch_style = DispatchStyle(dispatch_style)
 
     assert len(task_key.split("|")) == 4, "Task key must have 4 parts separated by |"
     output_dir = pathlib.Path(output_dir).expanduser().absolute()
@@ -250,24 +193,15 @@ def main(
 
     input_paths = extract_input_paths(input_path, glob_pattern, safetensors_or_pt)
 
-    if dispatch_style == DispatchStyle.LOCAL:
-        local_dispatcher(
-            input_paths=input_paths,
-            output_dir=output_dir,
-            task_key=task_key,
-            custom_tasks=custom_tasks,
-            threads_verbose=threads_verbose,
-        )
-    elif dispatch_style == DispatchStyle.SLURM:
-        slurm_dispatcher(
-            custom_tasks      = custom_tasks,
-            input_paths       = input_paths,
-            output_dir        = output_dir,
-            task_key          = task_key,
-            dry_run           = dry_run,
-        )
-    else:
-        raise ValueError(f"Unknown dispatch style: {dispatch_style}")
+    slurm_dispatcher(
+        custom_tasks      = custom_tasks,
+        input_paths       = input_paths,
+        output_dir        = output_dir,
+        task_key          = task_key,
+        dry_run           = dry_run,
+        max_model_length  = max_model_length,
+        duration          = duration,
+    )
 
 
 if __name__ == "__main__":

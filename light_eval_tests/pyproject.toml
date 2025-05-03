@@ -18,6 +18,10 @@ dependencies = [
     "datasets>=3.5.0",
     "ray>=2.44.1",
     "ipykernel>=6.29.5",
+    "matplotlib>=3.10.1",
+    "polars>=1.27.1",
+    "pawk>=0.8.1",
+    "nbconvert>=7.16.6",
 ]
 
 [tool.uv.sources]

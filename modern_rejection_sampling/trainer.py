@@ -5,6 +5,7 @@ import os
 import pathlib
 
 # Third party imports
+import accelerate
 import ray
 import rich
 import torch
@@ -26,7 +27,9 @@ def json_default(obj):
 
 @ray.remote(num_gpus=1)
 class Trainer:
-    def __init__(self, *, model_name: str | pathlib.Path, learning_rate: float, num_warmup_steps: int, total_steps: int, init_method_internal: str, model_max_length: int):
+    def __init__(self, *, model_name: str | pathlib.Path, learning_rate: float, num_warmup_steps: int, total_steps: int, init_method_internal: str, model_max_length: int, gradient_accumulation_steps: int):
+        self._gradient_accumulation_steps = gradient_accumulation_steps
+        
         num_gpus = torch.cuda.device_count()
         print(f"Number of available GPUs: {num_gpus}, {learning_rate = }, {num_warmup_steps = }, {total_steps = }, {init_method_internal = }, {model_max_length = }")
         
@@ -44,6 +47,11 @@ class Trainer:
         self.scheduler = transformers.get_linear_schedule_with_warmup(
             self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps
         )
+
+        assert all(param.device.type == "cuda" for param in self.model.parameters()), (
+            f"Not all model parameters are on the GPU."
+        )
+
         self.model_update_group = None
         torch.distributed.init_process_group(
             backend="nccl", 
@@ -51,6 +59,7 @@ class Trainer:
             world_size=1, 
             rank=0
         )
+        self._step_idx = 0
 
     def init_process_group(self, *args, **kwargs):
         self.model_update_group = vllm_utils2.init_process_group(*args, **kwargs)
@@ -64,7 +73,7 @@ class Trainer:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             data = self.forward_tokenizer.pad(
                 dict(input_ids=tokenized_batch_of_conversations), # The inputs are not padded, so we don't need to provide an attention mask
-                padding="max_length",
+                padding=True, # "max_length",
                 return_tensors="pt",
             )
 
@@ -76,15 +85,17 @@ class Trainer:
                     f"{type(data).mro() = }\n{data = }"
                 )
 
-            data = data.to(self.model.device)
             print(f"{data.input_ids.shape = }", flush=True)
-
             rich.print(f"[blue]Tokenized, now calling forward: {data.input_ids.shape = }")
-            self.optimizer.zero_grad()
+            data = data.to(self.model.device)
             loss = self.model(**data, labels=data.input_ids).loss
             loss.backward()
-            self.optimizer.step()
-            self.scheduler.step()
+            if (self._step_idx + 1) % self._gradient_accumulation_steps == 0:
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+            self._step_idx += 1
+
         torch.cuda.empty_cache()
         gc.collect()
 

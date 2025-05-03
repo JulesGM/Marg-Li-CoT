@@ -21,22 +21,18 @@
 
 set -euo pipefail
 
-GLOB_PATTERN='*/*/'
+NUM_SHOTS_TRAINED=5
+NUM_SHOTS_EVAL=5
+MODEL_MAX_LENGTH=4096
+ALLOW_FEW_SHOT_TRUNCATION=1
+TASK="gsm8k"
+DURATION=3:00:00
 
-if [ $# -eq 1 ]; then
-    NUM_SHOTS_TRAINED=$1
-    NUM_SHOTS_EVAL=$1
-elif [ $# -eq 2 ]; then
-    NUM_SHOTS_TRAINED=$1
-    NUM_SHOTS_EVAL=$2
-else
-    echo "Usage: $0 <num_shots_trained> [num_shots_eval]"
-    echo "If num_shots_eval is not provided, it will use the same value as num_shots_trained"
-    exit 1
-fi
-
+# Not likely to change ------------------------------------------------------------
+GLOB_PATTERN='*/'
 OUTPUT_DIR="./all_eval_outputs_important/rejection_sampling_outputs_gsm8k_${NUM_SHOTS_TRAINED}/${NUM_SHOTS_EVAL}_shot"
-INPUT_DIR="$HOME/scratch/rejection_sampling_saves/gsm8k_${NUM_SHOTS_TRAINED}/"
+INPUT_DIR="$HOME/scratch/rejection_sampling_saves/gsm8k_${NUM_SHOTS_TRAINED}/2025-04-18_18-58-10"
+TASK_PATH=./util_code/tasks.py
 
 # Check if input directory exists
 if [ ! -d "${INPUT_DIR}" ]; then
@@ -50,19 +46,15 @@ if ! ls -d "${INPUT_DIR}/"${GLOB_PATTERN} 1> /dev/null 2>&1; then
     exit 1
 fi
 
-
 mkdir -p "${OUTPUT_DIR}"
-TASK_PATH=./util_code/tasks.py
+
 
 uv run multi_gpu_lighteval_chain.py \
---task_key="custom|gsm8k|${NUM_SHOTS_EVAL}|0" \
+--task_key="custom|${TASK}|${NUM_SHOTS_EVAL}|${ALLOW_FEW_SHOT_TRUNCATION}" \
 --input_path="${INPUT_DIR}" \
 --output_dir="${OUTPUT_DIR}" \
 --glob_pattern="${GLOB_PATTERN}" \
 --dispatch_style=slurm \
---custom_tasks "$(realpath ${TASK_PATH})" 
-
-# uv run lighteval accelerate --model_args pretrained=/home/mila/g/gagnonju/scratch/rejection_sampling_saves/gsm8k_0/2025-03-24_01-32-35/epoch_3,revision=main,dtype=bfloat16,vllm,gpu_memory_utilisation=0.8,max_model_length=2048 
-# --tasks 'custom|gsm8k|0|0' 
-# --output_dir /home/mila/g/gagnonju/marglicot/light_eval_tests/all_eval_outputs_important/rejection_sampling_outputs_gsm8k_0/0_shot 
-# --use_chat_template --custom_tasks /home/mila/g/gagnonju/marglicot/light_eval_tests/util_code/tasks.py --save_details
+--max_model_length="${MODEL_MAX_LENGTH}" \
+--custom_tasks "$(realpath ${TASK_PATH})" \
+--duration="${DURATION}"

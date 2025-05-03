@@ -1,6 +1,6 @@
 
 import dataclasses
-
+import pathlib
 
 @dataclasses.dataclass(kw_only=True)
 class DatasetConfig:
@@ -37,6 +37,7 @@ class TrainingConfig:
     generation_max_length: int
     train_subset_mode: bool = False
     train_subset_size: int | None = None
+    gradient_accumulation_steps: int
 
     def __post_init__(self):
         self.batch_size = int(self.batch_size)
@@ -47,7 +48,7 @@ class TrainingConfig:
         if self.train_subset_mode:
             assert isinstance(self.train_subset_size, int), (
                 f"{self.train_subset_size = } {type(self.train_subset_size).mro() = }")
-
+        self.gradient_accumulation_steps = int(self.gradient_accumulation_steps)
 
 @dataclasses.dataclass(kw_only=True)
 class VLLMSamplingConfig:
@@ -133,6 +134,7 @@ class Config:
     vllm_sampling: VLLMSamplingConfig
     wandb: WandbConfig
     few_shot_qty: int
+    max_retries_vllm_crash: int
     
 
     def __post_init__(self):
@@ -148,3 +150,4 @@ class Config:
         self.vllm = VLLMConfig(**self.vllm)
         self.vllm_sampling = VLLMSamplingConfig(**self.vllm_sampling)
         self.wandb = WandbConfig(**self.wandb)
+        self.max_retries_vllm_crash = int(self.max_retries_vllm_crash)
